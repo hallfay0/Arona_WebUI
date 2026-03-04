@@ -3,10 +3,21 @@ const state = {
   modelsHash: "",
   modelProvidersDraft: {},
   providerModalOpen: false,
+  skillModalOpen: false,
   providerEditor: {
     mode: "create",
     originalKey: "",
     dirty: false
+  },
+  confirmDialog: {
+    open: false,
+    resolver: null,
+    lastActiveElement: null
+  },
+  modalFocus: {
+    modalId: null,
+    keydownHandler: null,
+    lastActiveElement: null
   },
   logsCursor: null,
   logsTimer: null,
@@ -20,6 +31,9 @@ const state = {
 
 const REDACTED_API_KEY_TOKEN = "__OPENCLAW_REDACTED__";
 
+// Skills 缓存，供配置弹窗读取
+let _skillsCache = [];
+
 // =========================================
 // Spotlight 交互与全局光照
 // =========================================
@@ -30,8 +44,35 @@ const spotlightPointer = {
 };
 
 let spotlightRefreshPending = false;
+const reducedMotionMedia = typeof window.matchMedia === "function"
+  ? window.matchMedia("(prefers-reduced-motion: reduce)")
+  : null;
+let prefersReducedMotion = reducedMotionMedia?.matches === true;
+
+function clearSpotlightLenses() {
+  document.querySelectorAll(".spotlight-lens").forEach((lens) => {
+    lens.remove();
+  });
+}
+
+function handleReducedMotionChange(event) {
+  prefersReducedMotion = event.matches === true;
+  if (!prefersReducedMotion) return;
+  spotlightPointer.active = false;
+  spotlightRefreshPending = false;
+  clearSpotlightLenses();
+}
+
+if (reducedMotionMedia) {
+  reducedMotionMedia.addEventListener("change", handleReducedMotionChange);
+}
+
+if (prefersReducedMotion) {
+  clearSpotlightLenses();
+}
 
 function updateSpotlights(pointerX, pointerY) {
+  if (prefersReducedMotion) return;
   const spotlights = document.querySelectorAll("[data-spotlight]");
   for (const el of spotlights) {
     const rect = el.getBoundingClientRect();
@@ -44,12 +85,15 @@ function updateSpotlights(pointerX, pointerY) {
       lens.className = "spotlight-lens";
       el.appendChild(lens);
     }
-    lens.style.background = `radial-gradient(220px circle at ${x}px ${y}px, rgba(255, 255, 255, 0.075) 0%, rgba(255, 255, 255, 0.03) 40%, transparent 78%)`;
+    const isLight = document.documentElement.getAttribute("data-theme") === "light";
+    const c1 = isLight ? "rgba(79, 70, 229, 0.08)" : "rgba(255, 255, 255, 0.075)";
+    const c2 = isLight ? "rgba(79, 70, 229, 0.02)" : "rgba(255, 255, 255, 0.03)";
+    lens.style.background = `radial-gradient(220px circle at ${x}px ${y}px, ${c1} 0%, ${c2} 40%, transparent 78%)`;
   }
 }
 
 function refreshSpotlightsAfterLayout() {
-  if (!spotlightPointer.active || spotlightRefreshPending) return;
+  if (prefersReducedMotion || !spotlightPointer.active || spotlightRefreshPending) return;
   spotlightRefreshPending = true;
   requestAnimationFrame(() => {
     spotlightRefreshPending = false;
@@ -58,6 +102,7 @@ function refreshSpotlightsAfterLayout() {
 }
 
 document.addEventListener("mousemove", (e) => {
+  if (prefersReducedMotion) return;
   spotlightPointer.active = true;
   spotlightPointer.x = e.clientX;
   spotlightPointer.y = e.clientY;
@@ -167,6 +212,181 @@ function removeToast(toast) {
   });
 }
 
+function applyConfirmAcceptVariant(button, variant = "primary") {
+  if (!button) return;
+  button.classList.remove("btn-primary", "btn-primary-strong", "panel-action-btn", "btn-secondary", "btn-danger");
+  if (variant === "danger") {
+    button.classList.add("panel-action-btn", "btn-secondary", "btn-danger");
+  } else {
+    button.classList.add("btn-primary", "btn-primary-strong");
+  }
+}
+
+function getSkillModalInitialSelector() {
+  const apiKeyVisible = !$("skill-config-apikey-section")?.classList.contains("is-hidden");
+  return apiKeyVisible ? "#skill-config-apikey" : "#skill-config-env-add";
+}
+
+function settleConfirmDialog(confirmed) {
+  const modal = $("global-confirm-modal");
+  if (modal) {
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+  }
+  document.body.classList.remove("confirm-modal-open");
+
+  const resolver = state.confirmDialog.resolver;
+  const lastActiveElement = state.confirmDialog.lastActiveElement;
+  state.confirmDialog.open = false;
+  state.confirmDialog.resolver = null;
+  state.confirmDialog.lastActiveElement = null;
+
+  if (typeof resolver === "function") {
+    resolver(confirmed === true);
+  }
+
+  if (lastActiveElement && typeof lastActiveElement.focus === "function") {
+    try {
+      lastActiveElement.focus({ preventScroll: true });
+    } catch {
+      lastActiveElement.focus();
+    }
+  }
+}
+
+function requestConfirmDialog({
+  title = "请确认操作",
+  message = "确认继续执行该操作吗？",
+  confirmText = "确认",
+  cancelText = "取消",
+  variant = "primary"
+} = {}) {
+  const modal = $("global-confirm-modal");
+  const titleEl = $("confirm-modal-title");
+  const messageEl = $("confirm-modal-message");
+  const confirmBtn = $("confirm-modal-accept");
+  const cancelBtn = modal?.querySelector(".confirm-modal-cancel-btn");
+
+  if (!modal || !titleEl || !messageEl || !confirmBtn || !cancelBtn) {
+    return Promise.resolve(window.confirm(message));
+  }
+
+  if (state.confirmDialog.open) {
+    return Promise.resolve(false);
+  }
+
+  titleEl.textContent = String(title || "请确认操作");
+  messageEl.textContent = String(message || "确认继续执行该操作吗？");
+  confirmBtn.textContent = String(confirmText || "确认");
+  cancelBtn.textContent = String(cancelText || "取消");
+  applyConfirmAcceptVariant(confirmBtn, variant === "danger" ? "danger" : "primary");
+
+  return new Promise((resolve) => {
+    state.confirmDialog.open = true;
+    state.confirmDialog.resolver = resolve;
+    state.confirmDialog.lastActiveElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    document.body.classList.add("confirm-modal-open");
+
+    requestAnimationFrame(() => {
+      confirmBtn.focus();
+    });
+  });
+}
+
+const MODAL_FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "[href]",
+  "input:not([disabled]):not([type='hidden'])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])"
+].join(",");
+
+function getModalFocusableElements(modal) {
+  if (!modal) return [];
+  return Array.from(modal.querySelectorAll(MODAL_FOCUSABLE_SELECTOR))
+    .filter((el) => el instanceof HTMLElement)
+    .filter((el) => !el.hasAttribute("hidden"))
+    .filter((el) => {
+      const style = window.getComputedStyle(el);
+      return style.display !== "none" && style.visibility !== "hidden";
+    });
+}
+
+function focusElementSafely(element) {
+  if (!element || typeof element.focus !== "function") return;
+  try {
+    element.focus({ preventScroll: true });
+  } catch {
+    element.focus();
+  }
+}
+
+function captureModalFocus(modalId, { initialSelector } = {}) {
+  const modal = $(modalId);
+  if (!modal) return;
+
+  if (state.modalFocus.modalId && state.modalFocus.modalId !== modalId) {
+    releaseModalFocus(state.modalFocus.modalId, { restoreFocus: false });
+  }
+
+  if (state.modalFocus.modalId !== modalId) {
+    const handler = (event) => {
+      if (event.key !== "Tab") return;
+      const focusables = getModalFocusableElements(modal);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        focusElementSafely(last);
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        focusElementSafely(first);
+      }
+    };
+
+    state.modalFocus.modalId = modalId;
+    state.modalFocus.keydownHandler = handler;
+    state.modalFocus.lastActiveElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    modal.addEventListener("keydown", handler);
+  }
+
+  requestAnimationFrame(() => {
+    if (modal.contains(document.activeElement)) return;
+    const target = initialSelector ? modal.querySelector(initialSelector) : null;
+    if (target instanceof HTMLElement) {
+      focusElementSafely(target);
+      return;
+    }
+    const [first] = getModalFocusableElements(modal);
+    if (first) focusElementSafely(first);
+  });
+}
+
+function releaseModalFocus(modalId, { restoreFocus = true } = {}) {
+  if (state.modalFocus.modalId !== modalId) return;
+  const modal = $(modalId);
+  if (modal && state.modalFocus.keydownHandler) {
+    modal.removeEventListener("keydown", state.modalFocus.keydownHandler);
+  }
+
+  const lastActiveElement = state.modalFocus.lastActiveElement;
+  state.modalFocus.modalId = null;
+  state.modalFocus.keydownHandler = null;
+  state.modalFocus.lastActiveElement = null;
+
+  if (restoreFocus && lastActiveElement instanceof HTMLElement) {
+    focusElementSafely(lastActiveElement);
+  }
+}
+
 function showError(targetId, err) {
   const el = $(targetId);
   if (!el) return;
@@ -242,9 +462,20 @@ function renderLogLine(line, keyword) {
   return `<span class="log-line log-${level}">${highlightLogKeyword(line, keyword)}</span>`;
 }
 
+function setLogsOutputPlaceholder(message = "等待日志输出...") {
+  const output = $("logs-output");
+  if (!output) return;
+  output.classList.add("log-output-empty");
+  output.textContent = String(message || "等待日志输出...");
+}
+
 function appendLogLines(lines, keyword) {
   const output = $("logs-output");
   if (!output || lines.length === 0) return;
+  if (output.classList.contains("log-output-empty")) {
+    output.classList.remove("log-output-empty");
+    output.innerHTML = "";
+  }
   const html = lines.map((line) => renderLogLine(line, keyword)).join("\n");
   if (output.innerHTML) output.insertAdjacentText("beforeend", "\n");
   output.insertAdjacentHTML("beforeend", html);
@@ -414,18 +645,20 @@ function renderEmpty(icon, title, subtitle) {
   return `
     <div class="empty-placeholder">
       <div class="empty-icon"><i class="${icon}"></i></div>
-      <div style="font-size: 1.1rem; color: var(--text-secondary); font-weight: 500;">${title}</div>
-      <div style="font-size: 0.9rem; margin-top: 8px;">${subtitle}</div>
+      <div class="empty-title">${title}</div>
+      <div class="empty-subtitle">${subtitle}</div>
     </div>
   `;
 }
 
 function renderSkeleton(rows = 3) {
   let lines = "";
+  const widthClasses = ["skeleton-w-96", "skeleton-w-90", "skeleton-w-84", "skeleton-w-78"];
   for (let i = 0; i < rows; i++) {
-    lines += `<div class="skeleton-text" style="width: ${80 + Math.random() * 20}%"></div>`;
+    const widthClass = widthClasses[Math.floor(Math.random() * widthClasses.length)];
+    lines += `<div class="skeleton-text ${widthClass}"></div>`;
   }
-  return `<div style="padding: 20px;">${lines}</div>`;
+  return `<div class="skeleton-stack">${lines}</div>`;
 }
 
 async function loadOverview() {
@@ -440,8 +673,6 @@ async function loadOverview() {
       container.innerHTML = renderEmpty("fa-solid fa-wind", "暂无活跃数据", "阿洛娜还没发现任何会话或频道记录呢～");
       return;
     }
-    const connectedChannels = channelValues.filter((entry) => entry?.connected).length;
-
     const sessions = data.sessions?.sessions || [];
     const cronJobs = data.cronList?.jobs || [];
     const nodeList = data.nodes?.nodes || [];
@@ -449,33 +680,33 @@ async function loadOverview() {
     const errors = (data.logs?.lines || []).filter((line) => /error|failed|denied/i.test(line));
 
     const metrics = [
-      { label: "活跃会话", value: sessions.length, icon: "fa-regular fa-comments", color: "#64b5f6" },
-      { label: "计划任务", value: cronJobs.filter((j) => j.enabled).length, icon: "fa-regular fa-clock", color: "#81c784" },
-      { label: "在线节点", value: `${nodeOnline}/${nodeList.length}`, icon: "fa-solid fa-server", color: "#fff176" },
-      { label: "最近异常", value: errors.length, icon: "fa-solid fa-triangle-exclamation", color: "#e57373" }
+      { label: "活跃会话", value: sessions.length, icon: "fa-regular fa-comments", toneClass: "stat-icon-info" },
+      { label: "计划任务", value: cronJobs.filter((j) => j.enabled).length, icon: "fa-regular fa-clock", toneClass: "stat-icon-success" },
+      { label: "在线节点", value: `${nodeOnline}/${nodeList.length}`, icon: "fa-solid fa-server", toneClass: "stat-icon-warning" },
+      { label: "最近异常", value: errors.length, icon: "fa-solid fa-triangle-exclamation", toneClass: "stat-icon-danger" }
     ];
 
     const statsHtml = metrics.map(m => `
-      <div class="stat-card" style="display: flex; align-items: center; justify-content: flex-start; gap: 16px; padding: 20px 24px;">
-      <div style="width: 48px; height: 48px; border-radius: 14px; background: rgba(128, 128, 128, 0.15); display: flex; align-items: center; justify-content: center;">
-          <i class="${m.icon}" style="color: ${m.color}; font-size: 1.6rem;"></i>
+      <div class="stat-card stat-card-shell">
+      <div class="stat-card-icon-wrap">
+          <i class="${m.icon} stat-card-icon ${m.toneClass}"></i>
         </div>
-        <div style="display: flex; flex-direction: column; align-items: flex-start;">
-          <div class="stat-label" style="font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 4px;">${m.label}</div>
-          <div class="stat-value" style="font-size: 1.8rem; font-weight: 600; line-height: 1; color: var(--text-primary);">${m.value}</div>
+        <div class="stat-card-info">
+          <div class="stat-label stat-label-compact">${m.label}</div>
+          <div class="stat-value stat-value-hero">${m.value}</div>
         </div>
       </div>
     `).join("");
 
     const sessionsHtml = sessions.slice(0, 10).map((r) => {
       return `
-        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border-default); display: flex; flex-direction: column; gap: 8px;">
-          <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-            <strong style="word-break: break-all; font-size: 0.95rem; color: var(--foreground); font-weight: 500;">${escapeHtml(r.label || r.displayName || r.key)}</strong>
-            <span style="color: var(--foreground-muted); white-space: nowrap; font-size: 0.8rem;"><i class="fa-regular fa-clock" style="margin-right: 4px;"></i>${r.updatedAt ? new Date(r.updatedAt).toLocaleTimeString() : "-"}</span>
+        <div class="panel-row">
+          <div class="panel-row-head">
+            <strong class="panel-row-title panel-row-title-break">${escapeHtml(r.label || r.displayName || r.key)}</strong>
+            <span class="panel-row-meta"><i class="fa-regular fa-clock icon-prefix-sm"></i>${r.updatedAt ? new Date(r.updatedAt).toLocaleTimeString() : "-"}</span>
           </div>
           <div>
-            <span class="status-badge" style="background: rgba(94, 106, 210, 0.15); border: 1px solid rgba(94, 106, 210, 0.3); color: var(--accent); white-space: nowrap; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem;"><i class="fa-solid fa-microchip" style="margin-right: 6px;"></i>${escapeHtml(r.model || "-")}</span>
+            <span class="status-badge accent status-badge-tight"><i class="fa-solid fa-microchip status-badge-icon"></i>${escapeHtml(r.model || "-")}</span>
           </div>
         </div>
       `;
@@ -489,40 +720,32 @@ async function loadOverview() {
       const configured = ch?.configured === true;
 
       let stateLabel = "离线";
-      let statusColor = "var(--warning)";
-      let statusBg = "rgba(251, 191, 36, 0.15)";
-      let statusBorder = "rgba(251, 191, 36, 0.3)";
+      let statusClass = "warn";
 
       if (!configured) {
         stateLabel = "未配置";
-        statusColor = "var(--danger)";
-        statusBg = "rgba(239, 68, 68, 0.15)";
-        statusBorder = "rgba(239, 68, 68, 0.3)";
+        statusClass = "bad";
       } else if (hasConnected) {
         stateLabel = "已连接";
-        statusColor = "var(--success)";
-        statusBg = "rgba(16, 185, 129, 0.15)";
-        statusBorder = "rgba(16, 185, 129, 0.3)";
+        statusClass = "ok";
       } else if (hasRunning) {
         stateLabel = "运行中";
-        statusColor = "var(--success)";
-        statusBg = "rgba(16, 185, 129, 0.15)";
-        statusBorder = "rgba(16, 185, 129, 0.3)";
+        statusClass = "ok";
       }
 
       const detail = ch?.lastError || ch?.mode || (hasRunning ? "服务已启动" : "等待启动");
-      return { name, detail, stateLabel, statusColor, statusBg, statusBorder };
+      return { name, detail, stateLabel, statusClass };
     });
 
     const channelHtml = channelRows.map((r) => {
       return `
-        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border-default); display: flex; flex-direction: column; gap: 8px;">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <strong style="white-space: nowrap; font-size: 0.95rem; color: var(--foreground); font-weight: 500;">${escapeHtml(r.name)}</strong>
-            <span style="color: ${r.statusColor}; background: ${r.statusBg}; border: 1px solid ${r.statusBorder}; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">${r.stateLabel}</span>
+        <div class="panel-row">
+          <div class="panel-row-head panel-row-head-center">
+            <strong class="panel-row-title panel-row-title-nowrap">${escapeHtml(r.name)}</strong>
+            <span class="status-badge status-badge-tight ${r.statusClass}">${r.stateLabel}</span>
           </div>
           <div>
-            <span style="color: var(--foreground-muted); font-size: 0.85rem; word-break: break-all;">${escapeHtml(r.detail || "-")}</span>
+            <span class="panel-row-detail">${escapeHtml(r.detail || "-")}</span>
           </div>
         </div>
       `;
@@ -530,26 +753,26 @@ async function loadOverview() {
 
     container.innerHTML = `
 
-      <div class="dashboard-grid" style="gap: 24px; margin-bottom: 35px;">${statsHtml}</div>
+      <div class="dashboard-grid dashboard-grid-lg">${statsHtml}</div>
       
-      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 24px;">
-        <div class="glass-panel" data-spotlight style="margin-bottom: 0; display: flex; flex-direction: column;">
-          <div class="panel-header" style="border-bottom: 1px solid var(--border-default);"><span class="panel-title" style="color: var(--foreground);"><i class="fa-solid fa-list-ul" style="color: var(--accent); margin-right: 10px;"></i>最近活跃会话</span></div>
-          <div style="flex: 1; overflow-y: auto;">
-             ${sessionsHtml || '<div style="padding: 24px; text-align: center; color: var(--foreground-muted); font-size: 0.9rem;">暂无活跃会话</div>'}
+      <div class="panel-grid-split">
+        <div class="glass-panel glass-panel-shell" data-spotlight>
+          <div class="panel-header"><span class="panel-title panel-title-foreground"><i class="fa-solid fa-list-ul panel-title-icon panel-title-icon-accent"></i>最近活跃会话</span></div>
+          <div class="panel-body-scroll">
+             ${sessionsHtml || '<div class="panel-empty">暂无活跃会话</div>'}
           </div>
         </div>
         
-        <div class="glass-panel" data-spotlight style="margin-bottom: 0; display: flex; flex-direction: column;">
-          <div class="panel-header" style="border-bottom: 1px solid var(--border-default);"><span class="panel-title" style="color: var(--foreground);"><i class="fa-solid fa-network-wired" style="color: var(--warning); margin-right: 10px;"></i>频道状态快照</span></div>
-          <div style="flex: 1; overflow-y: auto;">
-             ${channelHtml || '<div style="padding: 24px; text-align: center; color: var(--foreground-muted); font-size: 0.9rem;">暂无频道数据</div>'}
+        <div class="glass-panel glass-panel-shell" data-spotlight>
+          <div class="panel-header"><span class="panel-title panel-title-foreground"><i class="fa-solid fa-network-wired panel-title-icon panel-title-icon-warning"></i>频道状态快照</span></div>
+          <div class="panel-body-scroll">
+             ${channelHtml || '<div class="panel-empty">暂无频道数据</div>'}
           </div>
         </div>
       </div>
     `;
   } catch (err) {
-    container.innerHTML = `<div class="glass-panel" style="padding: 20px; color: var(--danger)">${escapeHtml(err.message)}</div>`;
+    container.innerHTML = `<div class="glass-panel panel-error">${escapeHtml(err.message)}</div>`;
   }
 }
 
@@ -715,7 +938,7 @@ function providerModelRowTemplate(rowData = {}) {
       </label>
       <input type="text" class="provider-model-input" placeholder="输入类型（逗号分隔，可留空）" value="${escapeHtml(row.input)}" />
       <input type="hidden" class="provider-model-extras" value="${escapeHtml(JSON.stringify(row.extras))}" />
-      <button type="button" class="provider-model-remove danger-action-btn" data-provider-model-remove title="移除模型" aria-label="移除模型">
+      <button type="button" class="provider-model-remove danger-action-btn btn-danger" data-provider-model-remove title="移除模型" aria-label="移除模型">
         <i class="fa-solid fa-minus"></i>
       </button>
     </div>
@@ -744,56 +967,56 @@ function providerCardTemplate(providerKey = "", provider = {}, originalKey = "")
 
   return `
     <article class="provider-edit-card" data-provider-card data-original-key="${escapeHtml(originalKey)}">
-      <div class="provider-card-head" style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
-        <div class="provider-card-title"><span style="display:inline-flex; width:22px; height:22px; justify-content:center; align-items:center; margin-right:8px; color:var(--accent);">${iconHTML}</span><span style="font-weight:600;">当前 Provider 配置</span></div>
+      <div class="provider-card-head provider-card-head-spacious">
+        <div class="provider-card-title"><span class="provider-card-title-icon">${iconHTML}</span><span class="provider-card-title-strong">当前 Provider 配置</span></div>
       </div>
-      <div class="provider-card-grid skeuo-input-group" style="gap:16px;">
-        <div class="config-row" style="margin:0;">
+      <div class="provider-card-grid">
+        <div class="config-row">
           <label>Provider Key (唯一标识)</label>
           <input type="text" class="provider-key skeuo-input" placeholder="如 openrouter" value="${escapeHtml(providerKey)}" />
         </div>
 
-        <div class="config-row" style="margin:0;">
+        <div class="config-row">
           <label>Base URL</label>
           <input type="text" class="provider-base-url skeuo-input" placeholder="https://openrouter.ai/api/v1 (可为空)" value="${escapeHtml(info.baseUrl)}" />
         </div>
 
-        <div class="config-row" style="margin:0;">
+        <div class="config-row">
           <label>API Key</label>
-          <div class="provider-secret-wrap" style="position:relative; width: 100%;">
-            <input type="password" class="provider-api-key skeuo-input" placeholder="${isRedactedApiKey ? "检测到脱敏密钥（不修改可保持原样）" : "sk-..."}" autocomplete="off" value="${escapeHtml(info.apiKey)}" style="padding-right: 40px;" />
-            <button type="button" class="provider-secret-toggle" data-secret-toggle aria-label="显示 API Key" title="显示 API Key" style="position:absolute; right:10px; top:50%; transform:translateY(-50%); background:none; border:none; color:var(--text-muted); cursor:pointer;">
+          <div class="provider-secret-wrap">
+            <input type="password" class="provider-api-key skeuo-input" placeholder="${isRedactedApiKey ? "检测到脱敏密钥（不修改可保持原样）" : "sk-..."}" autocomplete="off" value="${escapeHtml(info.apiKey)}" />
+            <button type="button" class="provider-secret-toggle" data-secret-toggle aria-label="显示 API Key" title="显示 API Key">
               <i class="fa-regular fa-eye"></i>
             </button>
           </div>
-          ${isRedactedApiKey ? '<small class="form-hint" style="margin-top:6px;">当前显示的是脱敏占位符。保持不变会沿用旧密钥，输入新值可覆盖。</small>' : ""}
+          ${isRedactedApiKey ? '<small class="form-hint">当前显示的是脱敏占位符。保持不变会沿用旧密钥，输入新值可覆盖。</small>' : ""}
         </div>
 
-        <div class="config-row" style="margin:0;">
+        <div class="config-row">
           <label>API Type</label>
           <select class="provider-api-type skeuo-input">${optionsHtml}</select>
         </div>
         
-        <div class="config-row" style="margin: 8px 0;">
+        <div class="config-row provider-models-row">
           <label>包含的模型列表</label>
-          <div class="provider-model-list" style="display:flex; flex-direction:column; gap:8px;">${modelRowsHtml}</div>
-          <button type="button" class="provider-model-add panel-action-btn" data-provider-model-add style="margin-top: 10px; border-style: dashed; width: 100%;">
+          <div class="provider-model-list">${modelRowsHtml}</div>
+          <button type="button" class="provider-model-add panel-action-btn btn-secondary btn-block btn-dashed btn-mt-sm" data-provider-model-add>
             <i class="fa-solid fa-plus"></i> 追加一个模型
           </button>
         </div>
 
-        <div class="config-row provider-json-row" style="margin: 12px 0 0 0;">
-          <label style="display:flex; justify-content:space-between; gap: 10px; align-items: center;">
+        <div class="config-row provider-json-row">
+          <label class="provider-json-label">
             <span>当前 Provider 完整配置 (JSON)</span>
-            <span style="display:inline-flex; align-items:center; gap:8px;">
-              <button type="button" class="panel-action-btn provider-json-apply" data-provider-json-apply style="padding: 4px 10px; height: 28px; font-size: 0.78rem;">
+            <span class="provider-json-actions">
+              <button type="button" class="panel-action-btn btn-secondary btn-size-xs provider-json-apply" data-provider-json-apply>
                 <i class="fa-solid fa-wand-magic-sparkles"></i> 回填表单
               </button>
-              <span class="provider-json-error json-error-text" style="display:none;"><i class="fa-solid fa-triangle-exclamation"></i> 格式异常</span>
+              <span class="provider-json-error json-error-text is-hidden"><i class="fa-solid fa-triangle-exclamation"></i> 格式异常</span>
             </span>
           </label>
           <textarea class="provider-json-config skeuo-textarea" placeholder="{\n  &quot;baseUrl&quot;: &quot;https://example.com/v1&quot;,\n  &quot;apiKey&quot;: &quot;sk-...&quot;,\n  &quot;apiType&quot;: &quot;openai&quot;,\n  &quot;models&quot;: []\n}">${escapeHtml(initialJsonStr)}</textarea>
-          <small class="form-hint" style="margin-top:6px;">上方表单会自动同步到此 JSON；你也可以直接修改后点击“回填表单”。</small>
+          <small class="form-hint">上方表单会自动同步到此 JSON；你也可以直接修改后点击“回填表单”。</small>
         </div>
       </div>
     </article>
@@ -824,11 +1047,11 @@ function renderProviderMatrix(providers) {
   const entries = Object.entries(providers || {});
   if (entries.length === 0) {
     matrix.innerHTML = `
-      <div class="empty-placeholder" style="grid-column: 1 / -1; padding: 40px;">
+      <div class="empty-placeholder provider-empty-placeholder">
         <i class="fa-solid fa-plug-circle-xmark empty-icon"></i>
-        <h3 style="color:var(--text-primary); font-size:1.1rem;">还没有接入任何算力核心</h3>
+        <h3 class="provider-empty-title">还没有接入任何算力核心</h3>
         <p>先添加一个 Provider，模型管理功能才会生效。</p>
-        <button type="button" class="panel-action-btn" data-provider-matrix-add style="margin-top: 10px;">
+        <button type="button" class="panel-action-btn btn-secondary btn-mt-sm" data-provider-matrix-add>
           <i class="fa-solid fa-plus"></i> 接入第一个 Provider
         </button>
       </div>
@@ -854,7 +1077,7 @@ function renderProviderMatrix(providers) {
         return `<span class="model-chip">${escapeHtml(r.id)}</span>`;
       }).join('');
 
-      const overCount = modelCount > 8 ? `<span class="model-chip" style="background: rgba(255,255,255,0.05);">+${modelCount - 8}</span>` : "";
+      const overCount = modelCount > 8 ? `<span class="model-chip model-chip-muted">+${modelCount - 8}</span>` : "";
 
       const iconHTML = brand.isSvg ? brand.icon : `<i class="${brand.icon}"></i>`;
 
@@ -872,10 +1095,10 @@ function renderProviderMatrix(providers) {
             </div>
             
           </div>
-          <div class="model-chips-container" style="margin-top: auto; padding-top: 10px;">
+          <div class="model-chips-container model-chips-container-end">
             ${modelChips}
             ${overCount}
-            <span class="model-chip" data-provider-card-manage data-provider-key="${escapeHtml(key)}" style="background:none; border-style:dashed; cursor:pointer;" title="配置更多">
+            <span class="model-chip model-chip-manage" data-provider-card-manage data-provider-key="${escapeHtml(key)}" title="配置更多">
               <i class="fa-solid fa-ellipsis"></i>
             </span>
           </div>
@@ -897,6 +1120,12 @@ function setProviderModalOpen(open) {
   modal.classList.toggle("open", open);
   modal.setAttribute("aria-hidden", open ? "false" : "true");
   document.body.classList.toggle("provider-modal-open", open);
+
+  if (open) {
+    captureModalFocus("models-provider-modal", { initialSelector: "#models-providers-editor .provider-key" });
+  } else {
+    releaseModalFocus("models-provider-modal");
+  }
 }
 
 function setProviderEditorDirty(dirty) {
@@ -920,7 +1149,7 @@ function setProviderModalMeta() {
       : "仅创建当前供应商，不会影响其他 Provider。";
   }
   if (deleteBtn) {
-    deleteBtn.style.display = isEdit ? "inline-flex" : "none";
+    deleteBtn.classList.toggle("is-hidden", !isEdit);
   }
   if (saveCurrentBtn) {
     saveCurrentBtn.innerHTML = '<i class="fa-solid fa-check"></i> 保存当前供应商';
@@ -955,15 +1184,17 @@ function openProviderModal({ mode = "create", providerKey = "" } = {}) {
 
   setProviderModalMeta();
   setProviderModalOpen(true);
-  requestAnimationFrame(() => {
-    const container = $("models-providers-editor");
-    container?.querySelector(".provider-key")?.focus();
-  });
 }
 
-function closeProviderModal({ force = false } = {}) {
+async function closeProviderModal({ force = false } = {}) {
   if (!force && state.providerEditor.dirty) {
-    const shouldDiscard = window.confirm("当前供应商尚未保存，确定放弃本次修改吗？");
+    const shouldDiscard = await requestConfirmDialog({
+      title: "放弃未保存修改",
+      message: "当前供应商尚未保存，确定放弃本次修改吗？",
+      confirmText: "放弃修改",
+      cancelText: "继续编辑",
+      variant: "primary"
+    });
     if (!shouldDiscard) return false;
   }
 
@@ -980,14 +1211,14 @@ function clearProviderJsonError(card) {
   const jsonInput = card?.querySelector(".provider-json-config");
   const jsonErrorText = card?.querySelector(".provider-json-error");
   if (jsonInput) jsonInput.classList.remove("json-error");
-  if (jsonErrorText) jsonErrorText.style.display = "none";
+  if (jsonErrorText) jsonErrorText.classList.add("is-hidden");
 }
 
 function showProviderJsonError(card) {
   const jsonInput = card?.querySelector(".provider-json-config");
   const jsonErrorText = card?.querySelector(".provider-json-error");
   if (jsonInput) jsonInput.classList.add("json-error");
-  if (jsonErrorText) jsonErrorText.style.display = "flex";
+  if (jsonErrorText) jsonErrorText.classList.remove("is-hidden");
 }
 
 function parseProviderJsonConfig(card, { strict = true, allowEmpty = true } = {}) {
@@ -1205,7 +1436,7 @@ function collectCurrentProvider() {
   return { key, providerConfig: mergedConfig };
 }
 
-function saveCurrentProvider() {
+async function saveCurrentProvider() {
   try {
     const { key, providerConfig } = collectCurrentProvider();
     const originalKey = state.providerEditor.originalKey;
@@ -1234,21 +1465,27 @@ function saveCurrentProvider() {
     state.modelProvidersDraft[key] = providerConfig;
     renderProviderMatrix(state.modelProvidersDraft);
     setProviderEditorDirty(false);
-    closeProviderModal({ force: true });
+    await closeProviderModal({ force: true });
     showToast(`Provider ${key} 已保存到草稿，点击顶部“保存并应用”后生效`, "success");
   } catch (err) {
     showToast(err.message || String(err), "error");
   }
 }
 
-function deleteCurrentProvider() {
+async function deleteCurrentProvider() {
   const targetKey = state.providerEditor.originalKey;
   if (!targetKey) {
     showToast("当前是新增模式，没有可删除的 Provider", "warning");
     return;
   }
 
-  const confirmed = window.confirm(`确定删除 Provider "${targetKey}" 吗？删除后需点击顶部“保存并应用”才会真正生效。`);
+  const confirmed = await requestConfirmDialog({
+    title: "删除 Provider",
+    message: `确定删除 Provider "${targetKey}" 吗？\n删除后需点击顶部“保存并应用”才会真正生效。`,
+    confirmText: "确认删除",
+    cancelText: "取消",
+    variant: "danger"
+  });
   if (!confirmed) return;
 
   if (Object.prototype.hasOwnProperty.call(state.modelProvidersDraft, targetKey)) {
@@ -1257,7 +1494,7 @@ function deleteCurrentProvider() {
   }
 
   setProviderEditorDirty(false);
-  closeProviderModal({ force: true });
+  await closeProviderModal({ force: true });
   showToast(`Provider ${targetKey} 已从草稿中移除`, "success");
 }
 
@@ -1298,10 +1535,7 @@ async function saveModels() {
 
     const payload = {
       models: {
-        providers,
-        // 旧的字段如果不再渲染，可以为了向下兼容传 null 覆盖或直接保留，这里选择覆盖掉
-        default: null,
-        aliases: {}
+        providers
       },
       baseHash: state.modelsHash
     };
@@ -1323,7 +1557,7 @@ async function saveModels() {
     }
 
     showToast("配置已成功保存并下发至 OpenClaw！", "success");
-    closeProviderModal();
+    await closeProviderModal({ force: true });
     await loadModels();
   } catch (err) {
     showToast(err.message || String(err), "error");
@@ -1398,8 +1632,13 @@ async function loadSkills() {
         eligible: skill.eligible === true,
         disabled: skill.disabled === true,
         blockedByAllowlist: skill.blockedByAllowlist === true,
-        missing: normalizeSkillMissing(skill.missing)
+        missing: normalizeSkillMissing(skill.missing),
+        primaryEnv: skill.primaryEnv || null,
+        install: Array.isArray(skill.install) ? skill.install : [],
+        emoji: skill.emoji || ""
       }));
+
+    _skillsCache = rows;
 
     // 划分四个象限
     const activeSkills = rows.filter(s => s.enabled && s.eligible);
@@ -1414,32 +1653,32 @@ async function loadSkills() {
 
       if (category === "active") {
         reasonBlock = `
-          <div style="display: flex; align-items: center; gap: 6px; margin-top:12px; color: var(--success); font-weight: 500; font-size:0.85rem;">
+          <div class="skill-hint-active">
             <i class="fa-solid fa-bolt"></i>
             <span>技能活跃中，将自动参与协同</span>
           </div>
         `;
       } else if (category === "blocked") {
         reasonBlock = `
-          <div style="display: flex; align-items: center; gap: 8px; margin-top:12px; color: var(--danger); font-size:0.85rem; background: rgba(239, 68, 68, 0.1); padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(239, 68, 68, 0.3);">
+          <div class="skill-hint-block skill-hint-blocked">
             <i class="fa-solid fa-ban"></i>
             <span>被所属节点组的安全白名单拦截，禁止强制运行。</span>
           </div>
         `;
       } else if (category === "pending") {
-        const missHtml = reasons.map(r => `<li style="margin-bottom: 4px;">${escapeHtml(r)}</li>`).join("");
+        const missHtml = reasons.map(r => `<li>${escapeHtml(r)}</li>`).join("");
         reasonBlock = `
-          <div style="display: flex; flex-direction: column; gap: 8px; margin-top:12px; color: var(--warning); font-size:0.85rem; background: rgba(251, 191, 36, 0.08); padding: 12px 16px; border-radius: 8px; border: 1px solid rgba(251, 191, 36, 0.25);">
-            <div style="font-weight: 600; display: flex; align-items: center; gap: 6px; font-size: 0.9rem;">
+          <div class="skill-hint-pending">
+            <div class="skill-hint-title">
               <i class="fa-solid fa-triangle-exclamation"></i>缺少必要运行条件
             </div>
-            <ul style="margin: 4px 0 0 0; padding-left: 24px; opacity: 0.95; list-style-type: disc;">${missHtml}</ul>
-            <div style="margin-top: 4px; font-size: 0.8rem; opacity: 0.75; font-style: italic;">提示：请在终端服务器补齐环境变量或依赖包后，尝试在此重新开启。</div>
+            <ul class="skill-hint-list">${missHtml}</ul>
+            <div class="skill-hint-note">提示：请在终端服务器补齐环境变量或依赖包后，尝试在此重新开启。</div>
           </div>
         `;
       } else if (category === "disabled") {
         reasonBlock = `
-          <div style="display: flex; align-items: center; gap: 8px; margin-top:12px; color: var(--text-muted); font-size:0.85rem; background: rgba(255,255,255, 0.04); padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.1);">
+          <div class="skill-hint-block skill-hint-disabled">
             <i class="fa-solid fa-power-off"></i>
             <span>已停用该模块，拨动右侧开关启用即可恢复。</span>
           </div>
@@ -1449,23 +1688,41 @@ async function loadSkills() {
       // 禁用开关判定（被组策略阻止不能开）
       const toggleDisabled = category === "blocked" ? "disabled" : "";
 
+      const statusLabels = {
+        active: { text: '运行中', className: 'skill-entry-status-active' },
+        pending: { text: '待配置', className: 'skill-entry-status-pending' },
+        disabled: { text: '已停用', className: 'skill-entry-status-disabled' },
+        blocked: { text: '被拦截', className: 'skill-entry-status-blocked' }
+      };
+      const statusInfo = statusLabels[category] || { text: '未知', className: 'skill-entry-status-disabled' };
+      const toggleClass = category === 'blocked'
+        ? 'switch-toggle skill-entry-toggle skill-entry-toggle-blocked'
+        : 'switch-toggle skill-entry-toggle';
+
       return `
-        <article class="skill-entry" style="padding: 20px; border-bottom: 1px solid var(--border-default); display: flex; align-items: flex-start; gap: 16px; transition: background 0.2s;">
-          <div class="skill-entry-main" style="flex: 1;">
-            <div class="skill-entry-head" style="margin-bottom: 8px;">
-              <strong class="skill-entry-name" style="font-size: 1.1rem; letter-spacing: 0.2px;">${escapeHtml(cleanName)}</strong>
-              <span class="skill-chip skill-chip-source" style="margin-left:8px;">${escapeHtml(skill.source)}</span>
+        <article class="skill-entry">
+          <div class="skill-entry-main">
+            <div class="skill-entry-head">
+              <strong class="skill-entry-name">${escapeHtml(cleanName)}</strong>
+              <span class="skill-chip skill-chip-source">${escapeHtml(skill.source)}</span>
             </div>
-            <div class="skill-entry-key" style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); margin-bottom: 8px;">${escapeHtml(skill.key)}</div>
-            <div class="skill-entry-description" style="color: var(--foreground-subtle); font-size: 0.9rem; line-height: 1.4;">${escapeHtml(skill.description || "暂无技能描述。")}</div>
+            <div class="skill-entry-key">${escapeHtml(skill.key)}</div>
+            <div class="skill-entry-description">${escapeHtml(skill.description || "暂无技能描述。")}</div>
             ${reasonBlock}
           </div>
-          <div style="display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-width: 60px;">
-             <label class="switch-toggle skill-entry-toggle" aria-label="切换状态" style="${category === 'blocked' ? 'opacity: 0.5; filter: grayscale(1); cursor: not-allowed;' : ''}">
-              <input type="checkbox" data-skill-toggle="${escapeHtml(skill.key)}" ${skill.enabled ? "checked" : ""} ${toggleDisabled} />
-              <span class="slider"><span class="knob"></span></span>
-            </label>
-            <span style="font-size: 0.75rem; color: var(--foreground-muted); margin-top: 8px; font-weight: 600;">${skill.enabled ? '已启用' : '未启用'}</span>
+          <div class="skill-entry-side">
+            <div class="skill-entry-controls">
+              <button type="button" class="skill-config-btn panel-action-btn btn-secondary btn-size-sm" data-skill-config="${escapeHtml(skill.key)}">
+                <i class="fa-solid fa-sliders"></i> 配置
+              </button>
+              <div class="skill-toggle-wrap">
+                 <label class="${toggleClass}" aria-label="切换状态">
+                  <input type="checkbox" data-skill-toggle="${escapeHtml(skill.key)}" ${skill.enabled ? "checked" : ""} ${toggleDisabled} />
+                  <span class="slider"><span class="knob"></span></span>
+                </label>
+                <span class="skill-entry-status ${statusInfo.className}">${statusInfo.text}</span>
+              </div>
+            </div>
           </div>
         </article>
       `;
@@ -1473,7 +1730,7 @@ async function loadSkills() {
 
     const renderList = (items, category, emptyMsg) => {
       if (items.length === 0) {
-        return `<div style="padding: 30px; text-align: center; color: var(--text-muted); font-size: 0.95rem;">${emptyMsg}</div>`;
+        return `<div class="skill-list-empty">${emptyMsg}</div>`;
       }
       return items.map((skill) => renderSkillEntry(skill, { category })).join("");
     };
@@ -1519,26 +1776,267 @@ document.addEventListener("click", (e) => {
 
   document.querySelectorAll(".skills-tab-btn").forEach(b => {
     b.classList.remove("active");
-    b.style.color = "var(--text-muted)";
-    b.style.background = "transparent";
-    b.style.boxShadow = "none";
   });
 
   btn.classList.add("active");
-  btn.style.color = "var(--foreground)";
-  btn.style.background = "rgba(255,255,255,0.1)";
-  btn.style.boxShadow = "0 2px 8px rgba(0,0,0,0.2), inset 0 1px 1px rgba(255,255,255,0.1)";
 
   const targetId = btn.getAttribute("data-target") + "-panel";
   document.querySelectorAll(".skills-panel").forEach(p => {
-    p.style.display = "none";
     p.classList.remove("active");
   });
 
   const panel = document.getElementById(targetId);
   if (panel) {
-    panel.style.display = "block";
     panel.classList.add("active");
+  }
+});
+
+// 绑定技能配置 Modal 流转
+function addSkillEnvRow(container, key, value, readonlyKey) {
+  const row = document.createElement("div");
+  row.className = "env-row";
+
+  const keyInput = document.createElement("input");
+  keyInput.type = "text";
+  keyInput.className = "env-key form-control form-control-mono form-control-sm";
+  keyInput.value = key;
+  keyInput.placeholder = "变量名";
+  if (readonlyKey) {
+    keyInput.readOnly = true;
+    keyInput.classList.add("is-readonly");
+  }
+
+  const valInput = document.createElement("input");
+  valInput.type = "text";
+  valInput.className = "env-val form-control form-control-mono form-control-sm";
+  valInput.value = value;
+  valInput.placeholder = "值";
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.className = "env-row-delete panel-action-btn btn-secondary btn-size-sm btn-danger";
+  deleteBtn.title = "移除";
+  deleteBtn.innerHTML = '<i class="fa-solid fa-trash-can"></i>';
+
+  row.appendChild(keyInput);
+  row.appendChild(valInput);
+  row.appendChild(deleteBtn);
+  container.appendChild(row);
+}
+
+function setSkillModalOpen(open) {
+  const modal = $("skill-config-modal");
+  if (!modal) return;
+
+  state.skillModalOpen = open === true;
+  modal.classList.toggle("open", state.skillModalOpen);
+  modal.setAttribute("aria-hidden", state.skillModalOpen ? "false" : "true");
+  document.body.classList.toggle("skill-modal-open", state.skillModalOpen);
+
+  if (state.skillModalOpen) {
+    captureModalFocus("skill-config-modal", { initialSelector: getSkillModalInitialSelector() });
+  } else {
+    releaseModalFocus("skill-config-modal");
+  }
+}
+
+document.addEventListener("click", async (e) => {
+  // 打开技能配置 Modal
+  const configBtn = e.target.closest("[data-skill-config]");
+  if (configBtn) {
+    const skillKey = configBtn.getAttribute("data-skill-config");
+    if (!skillKey) return;
+
+    const skill = _skillsCache.find(s => s.key === skillKey);
+    if (!skill) return;
+
+    const modal = $("skill-config-modal");
+    if (!modal) return;
+
+    // 填充基本信息
+    $("skill-modal-title").textContent = `${skill.emoji ? skill.emoji + " " : ""}${skill.name}`;
+    $("skill-config-key").textContent = skill.key;
+    $("skill-config-desc").textContent = skill.description || "暂无技能描述。";
+
+    // 状态/缺失信息
+    const statusEl = $("skill-config-status");
+    const missingItems = [];
+    if (skill.missing.bins?.length > 0) missingItems.push(`缺少命令: ${skill.missing.bins.join(", ")}`);
+    if (skill.missing.anyBins?.length > 0) missingItems.push(`至少安装其一: ${skill.missing.anyBins.join(", ")}`);
+    if (skill.missing.env?.length > 0) missingItems.push(`缺少环境变量: ${skill.missing.env.join(", ")}`);
+    if (skill.missing.config?.length > 0) missingItems.push(`缺少配置项: ${skill.missing.config.join(", ")}`);
+
+    if (missingItems.length > 0) {
+      statusEl.innerHTML = `
+        <div class="form-status-block form-status-warning">
+          <div class="form-status-title">
+            <i class="fa-solid fa-triangle-exclamation"></i>缺少运行条件
+          </div>
+          <ul class="form-status-list">
+            ${missingItems.map(i => `<li>${escapeHtml(i)}</li>`).join("")}
+          </ul>
+        </div>`;
+    } else if (skill.eligible) {
+      statusEl.innerHTML = `
+        <div class="form-status-block form-status-success">
+          <i class="fa-solid fa-circle-check"></i> 所有运行条件已满足，技能正常工作中。
+        </div>`;
+    } else {
+      statusEl.innerHTML = "";
+    }
+
+    // API Key 区域
+    const apiKeySection = $("skill-config-apikey-section");
+    const apiKeyInput = $("skill-config-apikey");
+    if (skill.primaryEnv) {
+      apiKeySection?.classList.remove("is-hidden");
+      $("skill-config-primary-env").textContent = skill.primaryEnv;
+      apiKeyInput.value = "";
+    } else {
+      apiKeySection?.classList.add("is-hidden");
+    }
+
+    // 环境变量区域
+    const envRowsContainer = $("skill-config-env-rows");
+    const envEmptyHint = $("skill-config-env-empty");
+    envRowsContainer.innerHTML = "";
+    const missingEnvs = (skill.missing.env || []).filter(e => e !== skill.primaryEnv);
+    if (missingEnvs.length > 0) {
+      for (const envName of missingEnvs) {
+        addSkillEnvRow(envRowsContainer, envName, "", true);
+      }
+      envEmptyHint?.classList.add("is-hidden");
+    } else {
+      envEmptyHint?.classList.remove("is-hidden");
+    }
+
+    // 安装按钮
+    const installBtn = $("skill-config-install-btn");
+    if (skill.install?.length > 0 && skill.missing.bins?.length > 0) {
+      installBtn?.classList.remove("is-hidden");
+      $("skill-config-install-label").textContent = skill.install[0].label || "安装依赖";
+      installBtn.setAttribute("data-install-name", skill.name);
+      installBtn.setAttribute("data-install-id", skill.install[0].id);
+      installBtn.setAttribute("data-skill-key", skill.key);
+    } else {
+      installBtn?.classList.add("is-hidden");
+    }
+
+    // 存储当前 skill key
+    $("skill-config-save-btn").setAttribute("data-current-skill", skillKey);
+
+    // 显示 Modal
+    setSkillModalOpen(true);
+    return;
+  }
+
+  // 关闭 Modal
+  const closeTrigger = e.target.closest("[data-skill-modal-close]");
+  if (closeTrigger) {
+    setSkillModalOpen(false);
+    return;
+  }
+
+  // 添加环境变量行
+    if (e.target.closest("#skill-config-env-add")) {
+      const envRows = $("skill-config-env-rows");
+      if (envRows) {
+        addSkillEnvRow(envRows, "", "", false);
+        const envEmpty = $("skill-config-env-empty");
+        envEmpty?.classList.add("is-hidden");
+      }
+      return;
+    }
+
+  // 删除环境变量行
+  if (e.target.closest(".env-row-delete")) {
+    const row = e.target.closest(".env-row");
+    if (row) row.remove();
+    const envRows = $("skill-config-env-rows");
+    const envEmpty = $("skill-config-env-empty");
+    if (envRows && envEmpty && envRows.children.length === 0) {
+      envEmpty.classList.remove("is-hidden");
+    }
+    return;
+  }
+
+  // 保存配置
+  const saveBtn = e.target.closest("#skill-config-save-btn");
+  if (saveBtn) {
+    const skillKey = saveBtn.getAttribute("data-current-skill");
+    if (!skillKey) return;
+
+    saveBtn.disabled = true;
+    const originalText = saveBtn.innerHTML;
+    saveBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 正在保存...';
+
+    try {
+      const payload = { skillKey };
+
+      // API Key
+      const apiKeyInput = $("skill-config-apikey");
+      const apiKeySection = $("skill-config-apikey-section");
+      if (apiKeySection && !apiKeySection.classList.contains("is-hidden") && apiKeyInput?.value?.trim()) {
+        payload.apiKey = apiKeyInput.value.trim();
+      }
+
+      // 环境变量
+      const envRows = document.querySelectorAll("#skill-config-env-rows .env-row");
+      if (envRows.length > 0) {
+        const env = {};
+        for (const row of envRows) {
+          const key = row.querySelector(".env-key")?.value?.trim();
+          const val = row.querySelector(".env-val")?.value?.trim();
+          if (key) env[key] = val || "";
+        }
+        if (Object.keys(env).length > 0) {
+          payload.env = env;
+        }
+      }
+
+      await api("/api/skills/update", {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+
+      // 关闭弹窗并重载列表
+      setSkillModalOpen(false);
+      await loadSkills();
+
+    } catch (err) {
+      alert(`保存配置时发生错误：\n\n${err.message}`);
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.innerHTML = originalText;
+    }
+    return;
+  }
+
+  // 安装依赖
+  const installBtn = e.target.closest("#skill-config-install-btn");
+  if (installBtn) {
+    const name = installBtn.getAttribute("data-install-name");
+    const installId = installBtn.getAttribute("data-install-id");
+    if (!name || !installId) return;
+
+    installBtn.disabled = true;
+    const originalText = installBtn.innerHTML;
+    installBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 正在安装...';
+
+    try {
+      await api("/api/skills/install", {
+        method: "POST",
+        body: JSON.stringify({ name, installId })
+      });
+      setSkillModalOpen(false);
+      await loadSkills();
+    } catch (err) {
+      alert(`安装失败：\n\n${err.message}`);
+    } finally {
+      installBtn.disabled = false;
+      installBtn.innerHTML = originalText;
+    }
+    return;
   }
 });
 
@@ -1564,8 +2062,8 @@ async function loadCron() {
 
   // 完全隐藏表单，直到数据加载完毕再连同骨架屏一起展示
   if (formWrap) {
-    formWrap.style.display = 'none';
-    formWrap.style.opacity = '0';
+    formWrap.classList.add("cron-form-wrap-loading");
+    formWrap.classList.remove("cron-form-wrap-ready");
   }
 
   target.innerHTML = renderSkeleton(4);
@@ -1579,13 +2077,10 @@ async function loadCron() {
 
     // 数据拉取成功后，开始展示动画
     if (formWrap) {
-      formWrap.style.display = 'block';
-      // 给一点极小的延迟让 display:block 渲染，从而触发 opacity 过渡
-      setTimeout(() => {
-        formWrap.style.transition = 'opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1), transform 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
-        formWrap.style.opacity = '1';
-        formWrap.style.transform = 'translateY(0)';
-      }, 50);
+      formWrap.classList.remove("cron-form-wrap-loading");
+      requestAnimationFrame(() => {
+        formWrap.classList.add("cron-form-wrap-ready");
+      });
     }
     const jobs = data.jobs || [];
     if (jobs.length === 0) {
@@ -1593,62 +2088,62 @@ async function loadCron() {
       return;
     }
 
-    const html = `<div class="dashboard-grid" style="gap: 16px;">` + jobs.map((r) => {
+    const html = `<div class="dashboard-grid dashboard-grid-compact">` + jobs.map((r) => {
       const sch = r.schedule || {};
       let badge = '';
       if (sch.kind === 'at') {
         const timeStr = new Date(sch.at).toLocaleString();
-        badge = `<span style="color: #60a5fa; background: rgba(59, 112, 252, 0.15); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; border: 1px solid rgba(59, 112, 252, 0.3);"><i class="fa-regular fa-clock" style="margin-right:6px"></i>一次性: ${timeStr}</span>`;
+        badge = `<span class="cron-badge cron-badge-at"><i class="fa-regular fa-clock icon-prefix-md"></i>一次性: ${timeStr}</span>`;
       } else if (sch.kind === 'cron') {
         let expr = sch.human || sch.expr;
         if (expr && expr.startsWith('在 ')) expr = expr.substring(2);
         if (expr && expr.startsWith('在')) expr = expr.substring(1);
-        badge = `<span style="color: var(--success); background: rgba(16, 185, 129, 0.15); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; border: 1px solid rgba(16, 185, 129, 0.3);"><i class="fa-solid fa-rotate" style="margin-right:6px"></i>周期: ${escapeHtml(expr)}</span>`;
+        badge = `<span class="cron-badge cron-badge-cron"><i class="fa-solid fa-rotate icon-prefix-md"></i>周期: ${escapeHtml(expr)}</span>`;
       } else if (sch.kind === 'every') {
         const ms = parseInt(sch.everyMs, 10);
         const desc = ms >= 60000 ? `每 ${Math.round(ms / 60000)} 分钟` : `每 ${Math.round(ms / 1000)} 秒`;
-        badge = `<span style="color: var(--warning); background: rgba(251, 191, 36, 0.15); padding: 4px 10px; border-radius: 6px; font-size: 0.8rem; border: 1px solid rgba(251, 191, 36, 0.3);"><i class="fa-solid fa-stopwatch" style="margin-right:6px"></i>循环: ${desc}</span>`;
+        badge = `<span class="cron-badge cron-badge-every"><i class="fa-solid fa-stopwatch icon-prefix-md"></i>循环: ${desc}</span>`;
       } else {
-        badge = `<code style="font-size: 0.8rem; color: var(--text-muted); padding: 4px 8px; border-radius: 6px; background: rgba(255,255,255,0.05)">${escapeHtml(JSON.stringify(sch))}</code>`;
+        badge = `<code class="cron-badge-code">${escapeHtml(JSON.stringify(sch))}</code>`;
       }
 
       const stateInfo = r.state || {};
-      let statusBadge = '<span style="color: var(--foreground-muted);">-</span>';
+      let statusBadge = '<span class="cron-status-empty">-</span>';
       if (stateInfo.lastStatus === 'ok') {
-        statusBadge = '<span style="color: var(--success); font-weight: 500;"><i class="fa-solid fa-check-circle" style="margin-right:4px;"></i>运行成功</span>';
+        statusBadge = '<span class="cron-status-ok"><i class="fa-solid fa-check-circle icon-prefix-sm"></i>运行成功</span>';
       } else if (stateInfo.lastStatus === 'error') {
-        statusBadge = '<span style="color: var(--danger); font-weight: 500;"><i class="fa-solid fa-xmark-circle" style="margin-right:4px;"></i>运行失败</span>';
+        statusBadge = '<span class="cron-status-error"><i class="fa-solid fa-xmark-circle icon-prefix-sm"></i>运行失败</span>';
       } else if (stateInfo.lastStatus) {
         statusBadge = `<span>${escapeHtml(stateInfo.lastStatus)}</span>`;
       }
-      const timeStr = stateInfo.lastRunAtMs ? `<div style="font-size: 0.8rem; color: var(--foreground-muted); margin-top: 4px;"><i class="fa-regular fa-clock" style="margin-right:4px;"></i>上次运行时间: ${new Date(stateInfo.lastRunAtMs).toLocaleString()}</div>` : "";
+      const timeStr = stateInfo.lastRunAtMs ? `<div class="panel-time-note"><i class="fa-regular fa-clock icon-prefix-sm"></i>上次运行时间: ${new Date(stateInfo.lastRunAtMs).toLocaleString()}</div>` : "";
 
       return `
-        <div class="glass-panel" data-spotlight style="padding: 20px; display: flex; flex-direction: column; gap: 16px; margin-bottom: 0;">
-          <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
-            <div style="display:flex; flex-direction:column; gap:4px; flex: 1;">
-              <strong style="font-size: 1.05rem; color: var(--foreground); font-weight: 600; letter-spacing: -0.01em;">${escapeHtml(r.name || "(unnamed)")}</strong>
-              <span style="font-size: 0.8rem; color: var(--foreground-muted); font-family: var(--font-mono);">${escapeHtml(r.id)}</span>
+        <div class="glass-panel glass-panel-card" data-spotlight>
+          <div class="panel-head">
+            <div class="panel-head-main">
+              <strong class="panel-head-title">${escapeHtml(r.name || "(unnamed)")}</strong>
+              <span class="panel-head-subtitle">${escapeHtml(r.id)}</span>
             </div>
-            <label class="switch-toggle" style="margin-top: 2px;">
+            <label class="switch-toggle panel-switch-offset">
               <input type="checkbox" data-cron-enabled="${escapeHtml(r.id)}" ${r.enabled ? "checked" : ""} />
               <span class="slider"><span class="knob"></span></span>
             </label>
           </div>
           
-          <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center;">
+          <div class="panel-inline-list">
             ${badge}
           </div>
 
-          <div style="background: rgba(255, 255, 255, 0.02); border-radius: 8px; padding: 12px; border: 1px solid var(--border-default);">
-            <div style="font-size: 0.85rem;">${statusBadge}</div>
+          <div class="panel-soft-box">
+            <div class="panel-soft-text">${statusBadge}</div>
             ${timeStr}
           </div>
           
-          <div style="display: flex; gap: 8px; margin-top: auto; padding-top: 8px;">
-            <button data-cron-run="${escapeHtml(r.id)}" class="action-btn play-btn" style="flex: 1; justify-content: center; background: rgba(59, 112, 252, 0.15); color: #82b0ff; border-color: rgba(59, 112, 252, 0.3);" title="立即执行"><i class="fa-solid fa-play" style="margin-right: 6px;"></i>执行</button>
-            <button data-cron-runs="${escapeHtml(r.id)}" class="action-btn log-btn" style="flex: 1; justify-content: center;" title="运行日志"><i class="fa-solid fa-clock-rotate-left" style="margin-right: 6px;"></i>日志</button>
-            <button data-cron-remove="${escapeHtml(r.id)}" class="action-btn danger-action-btn" style="flex: 1; justify-content: center;" title="删除任务"><i class="fa-solid fa-trash-can" style="margin-right: 6px;"></i>删除</button>
+          <div class="action-btn-row">
+            <button data-cron-run="${escapeHtml(r.id)}" class="action-btn play-btn action-btn-fill action-btn-run" title="立即执行"><i class="fa-solid fa-play icon-prefix-md"></i>执行</button>
+            <button data-cron-runs="${escapeHtml(r.id)}" class="action-btn log-btn action-btn-fill" title="运行日志"><i class="fa-solid fa-clock-rotate-left icon-prefix-md"></i>日志</button>
+            <button data-cron-remove="${escapeHtml(r.id)}" class="action-btn danger-action-btn action-btn-fill" title="删除任务"><i class="fa-solid fa-trash-can icon-prefix-md"></i>删除</button>
           </div>
         </div>
       `;
@@ -1694,10 +2189,10 @@ async function loadCron() {
           const runs = await api(`/api/cron/runs?jobId=${encodeURIComponent(jobId)}`);
           const el = $("cron-result");
           el.textContent = JSON.stringify(runs, null, 2);
-          el.style.display = "block";
+          el.classList.add("cron-result-visible");
         } catch (err) {
           const el = $("cron-result");
-          el.style.display = "block";
+          el.classList.add("cron-result-visible");
           showError("cron-result", err);
         }
       });
@@ -1707,7 +2202,14 @@ async function loadCron() {
       btn.addEventListener("click", async () => {
         const jobId = btn.getAttribute("data-cron-remove");
         if (!jobId) return;
-        if (!confirm(`Remove job ${jobId}?`)) return;
+        const confirmed = await requestConfirmDialog({
+          title: "删除计划任务",
+          message: `确定删除任务 ${jobId} 吗？`,
+          confirmText: "确认删除",
+          cancelText: "取消",
+          variant: "danger"
+        });
+        if (!confirmed) return;
         try {
           await api("/api/cron/remove", { method: "POST", body: JSON.stringify({ jobId }) });
           await loadCron();
@@ -1717,6 +2219,10 @@ async function loadCron() {
       });
     }
   } catch (err) {
+    if (formWrap) {
+      formWrap.classList.remove("cron-form-wrap-loading");
+      formWrap.classList.add("cron-form-wrap-ready");
+    }
     target.textContent = err.message;
   }
 }
@@ -1804,7 +2310,7 @@ async function addCronJob() {
       btn.disabled = true;
     }
 
-    const result = await api("/api/cron/add", {
+    await api("/api/cron/add", {
       method: "POST",
       body: JSON.stringify({ job })
     });
@@ -1874,44 +2380,41 @@ async function loadNodes() {
     }));
     const commandMap = new Map(rows.map((row) => [String(row.nodeId || ""), row.commandList]));
 
-    const html = `<div class="dashboard-grid" style="gap: 16px;">` + rows.map((r) => {
+    const html = `<div class="dashboard-grid dashboard-grid-compact">` + rows.map((r) => {
       const statusClass = r.connected ? 'ok' : 'warn';
       const statusText = r.connected ? '在线' : '离线';
-      const statusColor = r.connected ? 'var(--success)' : 'var(--warning)';
-      const statusBg = r.connected ? 'rgba(16, 185, 129, 0.15)' : 'rgba(251, 191, 36, 0.15)';
-      const statusBorder = r.connected ? 'rgba(16, 185, 129, 0.3)' : 'rgba(251, 191, 36, 0.3)';
 
       return `
-        <div class="glass-panel node-row" data-node-id="${escapeHtml(r.nodeId)}" data-spotlight style="padding: 20px; display: flex; flex-direction: column; gap: 16px; margin-bottom: 0; cursor: pointer;">
+        <div class="glass-panel node-row node-card glass-panel-card" data-node-id="${escapeHtml(r.nodeId)}" data-spotlight>
           
-          <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;">
-            <div style="display:flex; flex-direction:column; gap:4px; flex: 1;">
-              <strong style="font-size: 1.05rem; color: var(--foreground); font-weight: 600; letter-spacing: -0.01em;">${escapeHtml(r.displayName || r.nodeId)}</strong>
-              <span style="font-size: 0.8rem; color: var(--foreground-muted); font-family: var(--font-mono);">${escapeHtml(r.nodeId)}</span>
+          <div class="panel-head">
+            <div class="panel-head-main">
+              <strong class="panel-head-title">${escapeHtml(r.displayName || r.nodeId)}</strong>
+              <span class="panel-head-subtitle">${escapeHtml(r.nodeId)}</span>
             </div>
-            <span style="color: ${statusColor}; background: ${statusBg}; border: 1px solid ${statusBorder}; padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 600; white-space: nowrap;">
-               <i class="${r.connected ? 'fa-solid fa-link' : 'fa-solid fa-link-slash'}" style="margin-right:4px;"></i>${statusText}
+            <span class="status-badge status-badge-tight ${statusClass}">
+               <i class="${r.connected ? 'fa-solid fa-link' : 'fa-solid fa-link-slash'} icon-prefix-sm"></i>${statusText}
             </span>
           </div>
           
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; background: rgba(255, 255, 255, 0.02); border-radius: 8px; padding: 12px; border: 1px solid var(--border-default);">
-            <div style="display: flex; flex-direction: column; gap: 4px;">
-              <span style="font-size: 0.75rem; color: var(--foreground-muted);">运行平台</span>
-              <span style="font-size: 0.85rem; color: var(--foreground); font-family: var(--font-mono);">${escapeHtml(r.platform || "-")}</span>
+          <div class="node-meta-grid">
+            <div class="node-meta-item">
+              <span class="node-meta-label">运行平台</span>
+              <span class="node-meta-value">${escapeHtml(r.platform || "-")}</span>
             </div>
-            <div style="display: flex; flex-direction: column; gap: 4px;">
-              <span style="font-size: 0.75rem; color: var(--foreground-muted);">远程 IP</span>
-              <span style="font-size: 0.85rem; color: var(--foreground); font-family: var(--font-mono);">${escapeHtml(r.remoteIp || "-")}</span>
+            <div class="node-meta-item">
+              <span class="node-meta-label">远程 IP</span>
+              <span class="node-meta-value">${escapeHtml(r.remoteIp || "-")}</span>
             </div>
-            <div style="grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px;">
-              <span style="font-size: 0.75rem; color: var(--foreground-muted);">能力 (Caps)</span>
-              <span style="font-size: 0.82rem; color: var(--foreground-subtle);">${escapeHtml(r.caps || "-")}</span>
+            <div class="node-meta-item node-meta-item-full">
+              <span class="node-meta-label">能力 (Caps)</span>
+              <span class="node-meta-value-subtle">${escapeHtml(r.caps || "-")}</span>
             </div>
           </div>
           
-          <div style="display: flex; justify-content: flex-end; margin-top: auto; padding-top: 8px;">
-            <button type="button" class="action-btn log-btn" data-node-describe="${escapeHtml(r.nodeId)}" title="详情信息" style="padding: 6px 12px; border-radius: 6px;">
-               <i class="fa-solid fa-circle-info" style="margin-right: 6px;"></i>详细节点信息
+          <div class="action-btn-row-end">
+            <button type="button" class="action-btn log-btn action-btn-horizontal" data-node-describe="${escapeHtml(r.nodeId)}" title="详情信息">
+               <i class="fa-solid fa-circle-info icon-prefix-md"></i>详细节点信息
             </button>
           </div>
         </div>
@@ -2022,6 +2525,10 @@ function stopLogStream() {
 }
 
 function initLogsView() {
+  if (!$("logs-output")?.textContent?.trim()) {
+    setLogsOutputPlaceholder("等待日志输出...");
+  }
+
   if (!$("logs-output").dataset.bound) {
     $("logs-output").dataset.bound = "1";
     $("logs-toggle").addEventListener("click", () => {
@@ -2031,11 +2538,11 @@ function initLogsView() {
 
     $("logs-clear").addEventListener("click", () => {
       state.logsCursor = null;
-      $("logs-output").innerHTML = "";
+      setLogsOutputPlaceholder("日志已清空，等待新输出...");
     });
 
     $("logs-keyword").addEventListener("input", () => {
-      $("logs-output").innerHTML = "";
+      setLogsOutputPlaceholder("正在筛选日志...");
       state.logsCursor = null;
       pullLogs();
     });
@@ -2103,14 +2610,37 @@ function bindEvents() {
   });
 
   const providerModal = $("models-provider-modal");
-  providerModal?.addEventListener("click", (event) => {
+  providerModal?.addEventListener("click", async (event) => {
     if (!event.target.closest("[data-provider-modal-close]")) return;
-    closeProviderModal();
+    await closeProviderModal();
   });
 
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || !state.providerModalOpen) return;
-    closeProviderModal();
+  const confirmModal = $("global-confirm-modal");
+  confirmModal?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-confirm-accept]")) {
+      settleConfirmDialog(true);
+      return;
+    }
+    if (event.target.closest("[data-confirm-cancel]")) {
+      settleConfirmDialog(false);
+    }
+  });
+
+  document.addEventListener("keydown", async (event) => {
+    if (event.key !== "Escape") return;
+    if (state.confirmDialog.open) {
+      event.preventDefault();
+      settleConfirmDialog(false);
+      return;
+    }
+    if (state.skillModalOpen) {
+      event.preventDefault();
+      setSkillModalOpen(false);
+      return;
+    }
+    if (!state.providerModalOpen) return;
+    event.preventDefault();
+    await closeProviderModal();
   });
 
   const providerEditor = $("models-providers-editor");
@@ -2199,7 +2729,7 @@ function bindEvents() {
         <i class="fa-solid fa-microchip" style="position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--text-muted); font-size: 0.8rem; pointer-events: none;"></i>
         <input type="text" class="alias-target" placeholder="目标模型 ID (如 rightcode/gpt-5.3-codex)" value="" style="padding-left: 32px; margin: 0; width: 100%;" />
       </div>
-      <button type="button" class="alias-remove danger-action-btn" title="删除"><i class="fa-regular fa-trash-can"></i></button>
+      <button type="button" class="alias-remove danger-action-btn btn-danger" title="删除"><i class="fa-regular fa-trash-can"></i></button>
     `;
     row.querySelector(".alias-remove")?.addEventListener("click", () => row.remove());
     container.appendChild(row);
@@ -2217,15 +2747,15 @@ function bindEvents() {
     tabForm.addEventListener("click", () => {
       tabForm.classList.add("active");
       tabJson.classList.remove("active");
-      viewForm.style.display = "block";
-      viewJson.style.display = "none";
+      viewForm.classList.remove("is-hidden");
+      viewJson.classList.remove("active");
       state.cronJsonMode = false;
     });
     tabJson.addEventListener("click", () => {
       tabJson.classList.add("active");
       tabForm.classList.remove("active");
-      viewJson.style.display = "block";
-      viewForm.style.display = "none";
+      viewJson.classList.add("active");
+      viewForm.classList.add("is-hidden");
       state.cronJsonMode = true;
     });
   }
@@ -2242,12 +2772,12 @@ function bindEvents() {
 
       if (v === "cron") {
         valLabel.textContent = "执行时间 (每天)";
-        valInput.style.display = "none";
-        timePicker.style.display = "flex";
+        valInput.classList.remove("cron-value-visible");
+        timePicker.classList.remove("is-hidden");
       } else if (v === "at") {
         valLabel.textContent = "指定日期时间 (ISO格式)";
-        timePicker.style.display = "none";
-        valInput.style.display = "block";
+        timePicker.classList.add("is-hidden");
+        valInput.classList.add("cron-value-visible");
 
         // 生成一个友好的默认值（当前时间后一小时）
         const tzOffset = (new Date()).getTimezoneOffset() * 60000;
@@ -2257,8 +2787,8 @@ function bindEvents() {
 
       } else if (v === "every") {
         valLabel.textContent = "间隔时间";
-        timePicker.style.display = "none";
-        valInput.style.display = "block";
+        timePicker.classList.add("is-hidden");
+        valInput.classList.add("cron-value-visible");
         valInput.type = "text";
         valInput.placeholder = "输入算式，如 30 * 60000 (半小时)";
         valInput.value = "60000";

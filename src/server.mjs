@@ -103,11 +103,11 @@ async function handleLogin(req, res) {
     const body = await parseBody(req);
     const username = body.username;
     const password = body.password;
-    
+
     // WebUI login creds are independent from gateway auth creds.
     const validUsername = process.env.WEBUI_USERNAME || process.env.GATEWAY_USERNAME || "admin";
     const validPassword = process.env.WEBUI_PASSWORD || gatewayConfig.password || gatewayConfig.token || "";
-    
+
     if (username === validUsername && (validPassword ? password === validPassword : true)) {
       const token = createToken();
       jsonResponse(res, 200, { ok: true, token });
@@ -359,10 +359,10 @@ class GatewaySession {
 function isGatewaySessionAlive(session) {
   return Boolean(
     session &&
-      session.connected &&
-      session.ws &&
-      session.ws.readyState === WebSocket.OPEN &&
-      !session.closed
+    session.connected &&
+    session.ws &&
+    session.ws.readyState === WebSocket.OPEN &&
+    !session.closed
   );
 }
 
@@ -560,6 +560,21 @@ async function handleApi(req, res, pathname, query) {
       return jsonResponse(res, 200, data);
     }
 
+    if (req.method === "POST" && pathname === "/api/skills/install") {
+      const body = await parseBody(req);
+      if (!body.name || !body.installId) {
+        return jsonResponse(res, 400, { ok: false, error: "name and installId are required" });
+      }
+      const result = await withGateway((gateway) =>
+        gateway.request("skills.install", {
+          name: body.name,
+          installId: body.installId,
+          timeoutMs: body.timeoutMs || 120000
+        })
+      );
+      return jsonResponse(res, 200, { ok: true, result });
+    }
+
     if (req.method === "POST" && pathname === "/api/skills/update") {
       const body = await parseBody(req);
       const result = await withGateway((gateway) =>
@@ -576,16 +591,16 @@ async function handleApi(req, res, pathname, query) {
     if (req.method === "GET" && pathname === "/api/cron/list") {
       const includeDisabled = query.get("includeDisabled") === "true";
       const data = await withGateway((gateway) => gateway.request("cron.list", { includeDisabled }));
-      
+
       // Inject human readable descriptions
       if (data && data.jobs) {
         data.jobs = data.jobs.map(job => {
           if (job.schedule && job.schedule.kind === 'cron' && job.schedule.expr) {
-             try {
-               job.schedule.human = cronstrue.toString(job.schedule.expr, { locale: "zh_CN" });
-             } catch(e) {
-               // ignore invalid cron
-             }
+            try {
+              job.schedule.human = cronstrue.toString(job.schedule.expr, { locale: "zh_CN" });
+            } catch (e) {
+              // ignore invalid cron
+            }
           }
           return job;
         });
@@ -690,7 +705,7 @@ const server = http.createServer(async (req, res) => {
     const token = authHeader.replace(/^Bearer\s+/i, '');
     const hasConfiguredAuth = !!(gatewayConfig.password || gatewayConfig.token);
     const requiresAuth = hasConfiguredAuth && pathname !== "/api/health";
-    
+
     if (requiresAuth) {
       const sessionRecord = getSessionRecord(token);
       if (!sessionRecord) {

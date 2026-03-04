@@ -1,44 +1,9 @@
-const themes = {
-  dark: {
-    '--primary-color': '#3b70fc',
-    '--primary-gradient': 'linear-gradient(135deg, #3b70fc 0%, #667eea 100%)',
-    '--primary-glow': 'rgba(59, 112, 252, 0.5)',
-    '--glass-bg': 'rgba(30, 60, 114, 0.65)',
-    '--glass-border': 'rgba(255, 255, 255, 0.18)',
-    '--text-primary': '#ffffff',
-    '--text-secondary': 'rgba(255, 255, 255, 0.7)',
-    '--text-muted': 'rgba(255, 255, 255, 0.4)',
-    '--bg-image': "url('/assets/bg.jpg')"
-  },
-  light: {
-    '--primary-color': '#00a3ff',
-    '--primary-gradient': 'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
-    '--primary-glow': 'rgba(0, 163, 255, 0.5)',
-    '--glass-bg': 'rgba(255, 255, 255, 0.85)',
-    '--glass-border': 'rgba(255, 255, 255, 0.5)',
-    '--text-primary': '#1a202c',
-    '--text-secondary': '#4a5568',
-    '--text-muted': '#a0aec0',
-    '--bg-image': "url('/assets/blog-bg.jpg')"
-  }
-};
-
 function applyTheme(themeName) {
-  const theme = themes[themeName];
-  if (!theme) return;
-  
-  for (const [key, value] of Object.entries(theme)) {
-    document.documentElement.style.setProperty(key, value);
-  }
-  document.documentElement.setAttribute('data-theme', themeName);
-  
-  // 更新背景伪元素颜色以匹配明暗
   if (themeName === 'light') {
-    document.body.style.setProperty('--backdrop-color', 'rgba(255, 255, 255, 0.4)');
+    document.documentElement.setAttribute('data-theme', 'light');
   } else {
-    document.body.style.setProperty('--backdrop-color', 'rgba(0, 10, 30, 0.6)');
+    document.documentElement.removeAttribute('data-theme');
   }
-  
   localStorage.setItem('openclaw-theme', themeName);
 }
 
@@ -52,15 +17,27 @@ window.addEventListener('DOMContentLoaded', () => {
   if (footer) {
     const themeBtn = document.createElement('button');
     themeBtn.className = 'theme-switch-btn';
-    themeBtn.innerHTML = '<i class="fa-solid fa-palette"></i> 切换主题';
+
+    const current = localStorage.getItem('openclaw-theme') || 'dark';
+    themeBtn.innerHTML = current === 'dark'
+      ? '<i class="fa-solid fa-sun"></i> 亮色模式'
+      : '<i class="fa-solid fa-moon"></i> 暗色模式';
 
     themeBtn.addEventListener('click', () => {
       const current = localStorage.getItem('openclaw-theme') || 'dark';
-      applyTheme(current === 'dark' ? 'light' : 'dark');
+      const newTheme = current === 'dark' ? 'light' : 'dark';
+      applyTheme(newTheme);
+
+      themeBtn.innerHTML = newTheme === 'dark'
+        ? '<i class="fa-solid fa-sun"></i> 亮色模式'
+        : '<i class="fa-solid fa-moon"></i> 暗色模式';
     });
 
-    // 将按钮放在 sidebar-footer 内部，退出按钮之前
     const logoutWrap = footer.querySelector('.logout-wrap');
-    footer.insertBefore(themeBtn, logoutWrap);
+    if (logoutWrap) {
+      footer.insertBefore(themeBtn, logoutWrap);
+    } else {
+      footer.appendChild(themeBtn);
+    }
   }
 });
