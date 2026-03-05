@@ -157,6 +157,30 @@ const gatewayConfig = {
   token: process.env.GATEWAY_TOKEN ?? gatewayDefaults.token
 };
 
+function resolveGatewayClientUrl(req) {
+  const override = process.env.GATEWAY_PUBLIC_WS_URL;
+  if (typeof override === "string" && override.trim()) {
+    return override.trim();
+  }
+
+  const forwardedProtoRaw = req.headers["x-forwarded-proto"];
+  const forwardedHostRaw = req.headers["x-forwarded-host"];
+  const forwardedProto = Array.isArray(forwardedProtoRaw)
+    ? forwardedProtoRaw[0]
+    : String(forwardedProtoRaw || "").split(",")[0].trim();
+  const forwardedHost = Array.isArray(forwardedHostRaw)
+    ? forwardedHostRaw[0]
+    : String(forwardedHostRaw || "").split(",")[0].trim();
+  const host = forwardedHost || String(req.headers.host || "").trim();
+  const normalizedProto = forwardedProto === "https" || forwardedProto === "wss" ? "wss" : "ws";
+
+  if (host) {
+    return `${normalizedProto}://${host}/gateway/`;
+  }
+
+  return gatewayConfig.url;
+}
+
 const PORT = Number.parseInt(process.env.PORT || "18790", 10);
 
 let previousCpuTimes = null;
@@ -494,6 +518,16 @@ async function handleApi(req, res, pathname, query) {
         ok: true,
         system: readSystemLoad()
       });
+    }
+
+    if (req.method === "GET" && pathname === "/api/gateway-auth") {
+      const payload = {
+        ok: true,
+        url: resolveGatewayClientUrl(req)
+      };
+      if (gatewayConfig.password) payload.password = gatewayConfig.password;
+      if (gatewayConfig.token) payload.token = gatewayConfig.token;
+      return jsonResponse(res, 200, payload);
     }
 
     if (req.method === "GET" && pathname === "/api/overview") {
