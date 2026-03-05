@@ -80,6 +80,10 @@
           <i class="fa-solid fa-server"></i>
           <span>节点拓扑</span>
         </a>
+        <a data-view="chat" class="nav-item">
+          <i class="fa-solid fa-comments"></i>
+          <span>Chat 对话</span>
+        </a>
         <a data-view="logs" class="nav-item">
           <i class="fa-solid fa-terminal"></i>
           <span>实时日志</span>
@@ -420,6 +424,57 @@
         </div>
       </section>
 
+      <section id="view-chat" class="view">
+        <div class="view-shell-head view-shell-head-wrap">
+          <div class="view-shell-copy">
+            <h2 class="view-shell-title">Chat / Playground</h2>
+            <p class="view-shell-subtitle">直接在控制台中和网关会话交互，实时验证模型与技能行为。</p>
+          </div>
+          <div class="view-shell-actions">
+            <span id="chat-connection-pill" class="status-badge status-badge-tight warn">网关连接中</span>
+            <button type="button" id="chat-reconnect-btn" class="panel-action-btn btn-secondary chat-reconnect-btn is-hidden">
+              <i class="fa-solid fa-plug-circle-bolt"></i> 立即重连
+            </button>
+            <button type="button" id="chat-new-session" class="btn-primary btn-primary-strong">
+              <i class="fa-solid fa-plus"></i> 新建会话
+            </button>
+            <button type="button" id="chat-toggle-sessions" class="panel-action-btn btn-secondary chat-mobile-toggle"
+              aria-expanded="false" aria-controls="chat-sessions-panel">
+              <i class="fa-solid fa-list"></i> 会话列表
+            </button>
+          </div>
+        </div>
+
+        <div class="chat-layout">
+          <aside id="chat-sessions-panel" class="glass-panel chat-sessions" data-spotlight>
+            <header class="chat-sessions-head">
+              <h3>会话列表</h3>
+              <p>选择会话后可查看历史并继续对话</p>
+            </header>
+            <div id="chat-session-list" class="chat-session-list"></div>
+          </aside>
+
+          <section class="glass-panel chat-main" data-spotlight>
+            <header class="chat-main-head">
+              <div>
+                <h3 id="chat-session-title" class="chat-main-title">未选择会话</h3>
+                <p id="chat-session-subtitle" class="chat-main-subtitle">请先选择会话或创建新会话</p>
+              </div>
+            </header>
+            <div id="chat-messages" class="chat-messages"></div>
+            <form id="chat-input-form" class="chat-input-area">
+              <textarea id="chat-input" class="chat-input" rows="4" aria-label="输入聊天消息"
+                placeholder="输入消息后按 Enter 发送，Shift+Enter 换行"></textarea>
+              <div class="chat-input-actions">
+                <span class="chat-input-hint">Enter 发送，Shift+Enter 换行，Esc 收起移动端会话列表</span>
+                <button type="submit" id="chat-send-btn" class="btn-primary"><i class="fa-solid fa-paper-plane"></i>
+                  发送</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      </section>
+
       <section id="view-logs" class="view">
         <div class="view-shell-head">
           <div class="view-shell-copy">
@@ -457,7 +512,7 @@
       </div>
     </section>
   </div>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app.js?v=20260304-chat-streamsmooth-v10"></script>
   <div id="toast-container" class="toast-container"></div>
 </body>
 

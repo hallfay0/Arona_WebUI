@@ -1,3 +1,5 @@
+import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260304-chat-streamsmooth-v10";
+
 const state = {
   currentView: "overview",
   modelsHash: "",
@@ -26,7 +28,37 @@ const state = {
   overviewTimer: null,
   nodeCommandDefaults: [],
   modelDefaultOptions: [],
-  cronJsonMode: false
+  cronJsonMode: false,
+  chat: {
+    client: null,
+    authConfig: null,
+    initialized: false,
+    viewActive: false,
+    sessions: [],
+    sessionKey: "",
+    messages: [],
+    pendingRuns: new Map(),
+    status: "disconnected",
+    needsRefresh: false,
+    historyRefreshTimer: null,
+    bindingsReady: false,
+    mobileSessionsOpen: false,
+    sending: false,
+    manualAuthSecret: "",
+    lastStatusReason: "",
+    deltaFlushTimer: null,
+    deltaFlushIsRaf: false,
+    pendingDeltaByRun: new Map(),
+    streamTargetByMessage: new Map(),
+    streamAnimationTimer: null,
+    streamAnimationIsRaf: false,
+    streamAnimationLastTs: 0,
+    historyLimit: 10,
+    historyBatchSize: 10,
+    historyMaxLimit: 1000,
+    hasOlderMessages: false,
+    loadingOlderMessages: false
+  }
 };
 
 const REDACTED_API_KEY_TOKEN = "__OPENCLAW_REDACTED__";
@@ -122,6 +154,7 @@ const viewLoaders = {
   skills: loadSkills,
   cron: loadCron,
   nodes: loadNodes,
+  chat: loadChat,
   logs: initLogsView
 };
 
@@ -427,6 +460,133 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function escapeSelectorAttrValue(value) {
+  const raw = String(value || "");
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(raw);
+  }
+  return raw.replace(/(["\\])/g, "\\$1");
+}
+
+function sanitizeMarkdownHref(rawHref) {
+  const href = String(rawHref || "").replaceAll("&amp;", "&").trim();
+  if (!href) return "";
+  if (!/^(https?:\/\/|mailto:|\/)/i.test(href)) return "";
+  return escapeHtml(href);
+}
+
+function renderMarkdownInline(value) {
+  const source = String(value || "");
+  if (!source) return "";
+
+  const codeTokens = [];
+  const withCodeTokens = source.replace(/`([^`\n]+?)`/g, (_, code) => {
+    const token = `@@CODE${codeTokens.length}@@`;
+    codeTokens.push(String(code || ""));
+    return token;
+  });
+
+  const linkTokens = [];
+  const withLinkTokens = withCodeTokens.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (full, label, rawHref) => {
+    const href = sanitizeMarkdownHref(rawHref);
+    if (!href) return full;
+    const token = `@@LINK${linkTokens.length}@@`;
+    linkTokens.push(`<a href="${href}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`);
+    return token;
+  });
+
+  let html = escapeHtml(withLinkTokens);
+
+  html = html.replace(/\*\*([^*][\s\S]*?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__([^_][\s\S]*?)__/g, "<strong>$1</strong>");
+  html = html.replace(/~~([^~][\s\S]*?)~~/g, "<del>$1</del>");
+  html = html.replace(/\*([^*\n][\s\S]*?)\*/g, "<em>$1</em>");
+  html = html.replace(/_([^_\n][\s\S]*?)_/g, "<em>$1</em>");
+
+  html = html.replace(/@@LINK(\d+)@@/g, (_, index) => linkTokens[Number(index)] || "");
+
+  html = html.replace(/@@CODE(\d+)@@/g, (_, index) => {
+    const code = codeTokens[Number(index)] || "";
+    return `<code>${escapeHtml(code)}</code>`;
+  });
+
+  return html;
+}
+
+function renderMarkdownBlock(block) {
+  const lines = String(block || "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return "";
+
+  const headingMatch = lines.length === 1 ? lines[0].match(/^\s{0,3}(#{1,6})\s+(.+)$/) : null;
+  if (headingMatch) {
+    const level = headingMatch[1].length;
+    const text = renderMarkdownInline(headingMatch[2]);
+    return `<h${level}>${text}</h${level}>`;
+  }
+
+  if (lines.every((line) => /^\s*>\s?/.test(line))) {
+    const quoted = lines.map((line) => line.replace(/^\s*>\s?/, ""));
+    return `<blockquote>${quoted.map((line) => renderMarkdownInline(line)).join("<br>")}</blockquote>`;
+  }
+
+  if (lines.every((line) => /^\s*[-*]\s+/.test(line))) {
+    const items = lines.map((line) => line.replace(/^\s*[-*]\s+/, ""));
+    return `<ul>${items.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ul>`;
+  }
+
+  if (lines.every((line) => /^\s*\d+\.\s+/.test(line))) {
+    const items = lines.map((line) => line.replace(/^\s*\d+\.\s+/, ""));
+    return `<ol>${items.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ol>`;
+  }
+
+  return `<p>${lines.map((line) => renderMarkdownInline(line)).join("<br>")}</p>`;
+}
+
+function renderMarkdown(value) {
+  const source = String(value || "").replace(/\r\n?/g, "\n").trim();
+  if (!source) return "";
+
+  const chunks = [];
+  const codeBlockRegex = /```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g;
+  let cursor = 0;
+  let match = codeBlockRegex.exec(source);
+
+  const pushTextBlocks = (text) => {
+    const blocks = String(text || "")
+      .split(/\n{2,}/)
+      .map((block) => block.trim())
+      .filter(Boolean);
+    for (const block of blocks) {
+      chunks.push(renderMarkdownBlock(block));
+    }
+  };
+
+  while (match) {
+    const before = source.slice(cursor, match.index);
+    if (before.trim()) {
+      pushTextBlocks(before);
+    }
+
+    const language = String(match[1] || "").trim();
+    const code = String(match[2] || "").replace(/\n$/, "");
+    const langAttr = language ? ` data-lang="${escapeHtml(language)}"` : "";
+    chunks.push(`<pre class="chat-md-code"><code${langAttr}>${escapeHtml(code)}</code></pre>`);
+
+    cursor = match.index + match[0].length;
+    match = codeBlockRegex.exec(source);
+  }
+
+  const tail = source.slice(cursor);
+  if (tail.trim()) {
+    pushTextBlocks(tail);
+  }
+
+  return chunks.join("");
+}
+
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -568,6 +728,8 @@ function setView(view) {
   } else {
     stopLogStream();
   }
+
+  setChatViewActive(view === "chat");
 }
 
 async function refreshCurrentView() {
@@ -2468,6 +2630,1648 @@ async function invokeNodeCommand() {
   }
 }
 
+function setChatViewActive(active) {
+  state.chat.viewActive = active === true;
+  if (!state.chat.viewActive) {
+    clearChatDeltaFlushScheduler();
+    state.chat.pendingDeltaByRun.clear();
+    clearChatStreamAnimationScheduler();
+    toggleChatSessionsPanel(false);
+    return;
+  }
+
+  if (state.chat.needsRefresh && state.chat.sessionKey) {
+    state.chat.needsRefresh = false;
+    scheduleChatHistoryRefresh(state.chat.sessionKey, 0);
+  }
+}
+
+function setChatStatus(status, metadata = {}) {
+  state.chat.status = status || "disconnected";
+  state.chat.lastStatusReason = String(metadata.reason || "");
+  const pill = $("chat-connection-pill");
+  updateChatReconnectButton(state.chat.status, metadata);
+  if (!pill) return;
+
+  const statusMap = {
+    connected: { text: "网关已连接", cls: "ok" },
+    connecting: { text: "网关连接中", cls: "warn" },
+    reconnecting: { text: "网关重连中", cls: "warn" },
+    disconnected: { text: "网关未连接", cls: "bad" }
+  };
+
+  const normalized = statusMap[state.chat.status] || statusMap.disconnected;
+  let text = normalized.text;
+  if (Number.isFinite(metadata.attempt) && state.chat.status === "reconnecting") {
+    text = `${normalized.text} (${metadata.attempt})`;
+  }
+
+  pill.classList.remove("ok", "warn", "bad");
+  pill.classList.add(normalized.cls);
+  pill.textContent = text;
+}
+
+function updateChatReconnectButton(status, metadata = {}) {
+  const button = $("chat-reconnect-btn");
+  if (!button) return;
+
+  const normalized = String(status || "disconnected");
+  const reason = String(metadata.reason || "").trim();
+
+  if (normalized === "connected") {
+    button.classList.add("is-hidden");
+    button.disabled = false;
+    button.innerHTML = '<i class="fa-solid fa-plug-circle-bolt"></i> 立即重连';
+    button.title = "";
+    return;
+  }
+
+  button.classList.remove("is-hidden");
+  button.title = reason ? `最近连接错误：${reason}` : "手动重连网关";
+
+  if (normalized === "connecting" || normalized === "reconnecting") {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-rotate-right fa-spin"></i> 重连中';
+    return;
+  }
+
+  button.disabled = false;
+  button.innerHTML = '<i class="fa-solid fa-plug-circle-bolt"></i> 立即重连';
+}
+
+function syncMessageTextSegment(message) {
+  if (!message || typeof message !== "object") return;
+  const nextText = String(message.text || "");
+  if (!nextText.trim()) return;
+
+  if (!Array.isArray(message.segments)) {
+    message.segments = [{ type: "text", text: nextText }];
+    return;
+  }
+
+  const firstTextIndex = message.segments.findIndex((segment) => segment?.type === "text");
+  if (firstTextIndex >= 0) {
+    message.segments[firstTextIndex] = { ...message.segments[firstTextIndex], text: nextText };
+    return;
+  }
+
+  message.segments.unshift({ type: "text", text: nextText });
+}
+
+function mergeStreamingText(currentText, incomingText) {
+  const current = String(currentText || "") === "思考中..." ? "" : String(currentText || "");
+  const incoming = String(incomingText || "");
+
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (incoming === current) return current;
+  if (incoming.startsWith(current)) return incoming;
+  if (current.startsWith(incoming)) return current;
+  if (current.includes(incoming)) return current;
+  if (incoming.includes(current)) return incoming;
+
+  const maxOverlap = Math.min(current.length, incoming.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (current.slice(-overlap) === incoming.slice(0, overlap)) {
+      return `${current}${incoming.slice(overlap)}`;
+    }
+  }
+
+  return `${current}${incoming}`;
+}
+
+function joinStreamTextFromSegments(segments) {
+  if (!Array.isArray(segments) || segments.length === 0) return "";
+  return segments
+    .filter((segment) => segment?.type === "text")
+    .map((segment) => String(segment?.text || ""))
+    .join("");
+}
+
+function clearChatDeltaFlushScheduler() {
+  if (!state.chat.deltaFlushTimer) return;
+
+  if (state.chat.deltaFlushIsRaf && typeof cancelAnimationFrame === "function") {
+    cancelAnimationFrame(state.chat.deltaFlushTimer);
+  } else {
+    clearTimeout(state.chat.deltaFlushTimer);
+  }
+
+  state.chat.deltaFlushTimer = null;
+  state.chat.deltaFlushIsRaf = false;
+}
+
+function scheduleChatDeltaFlushScheduler() {
+  if (state.chat.deltaFlushTimer) return;
+
+  if (typeof requestAnimationFrame === "function") {
+    state.chat.deltaFlushIsRaf = true;
+    state.chat.deltaFlushTimer = requestAnimationFrame(() => {
+      state.chat.deltaFlushTimer = null;
+      state.chat.deltaFlushIsRaf = false;
+      flushPendingRunDeltas();
+      if (state.chat.pendingDeltaByRun.size > 0) {
+        scheduleChatDeltaFlushScheduler();
+      }
+    });
+    return;
+  }
+
+  state.chat.deltaFlushIsRaf = false;
+  state.chat.deltaFlushTimer = setTimeout(() => {
+    state.chat.deltaFlushTimer = null;
+    flushPendingRunDeltas();
+  }, 16);
+}
+
+function clearChatStreamAnimationScheduler({ clearTargets = true } = {}) {
+  if (state.chat.streamAnimationTimer) {
+    if (state.chat.streamAnimationIsRaf && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(state.chat.streamAnimationTimer);
+    } else {
+      clearTimeout(state.chat.streamAnimationTimer);
+    }
+  }
+
+  state.chat.streamAnimationTimer = null;
+  state.chat.streamAnimationIsRaf = false;
+  state.chat.streamAnimationLastTs = 0;
+
+  if (clearTargets) {
+    state.chat.streamTargetByMessage.clear();
+  }
+}
+
+function advanceStreamDisplayText(currentText, targetText, charBudget) {
+  const current = String(currentText || "") === "思考中..." ? "" : String(currentText || "");
+  const target = String(targetText || "");
+  const budget = Math.max(1, Number(charBudget) || 1);
+
+  if (!target) return current;
+  if (current === target) return current;
+  if (!current) return target.slice(0, budget);
+
+  if (target.startsWith(current)) {
+    return `${current}${target.slice(current.length, current.length + budget)}`;
+  }
+
+  if (current.startsWith(target)) {
+    return target;
+  }
+
+  return target;
+}
+
+function scheduleChatStreamAnimation() {
+  if (state.chat.streamAnimationTimer || state.chat.streamTargetByMessage.size === 0) {
+    return;
+  }
+
+  const runFrame = (frameTs) => {
+    state.chat.streamAnimationTimer = null;
+    state.chat.streamAnimationIsRaf = false;
+
+    const nowTs = Number(frameTs) || Date.now();
+    const lastTs = state.chat.streamAnimationLastTs || nowTs;
+    const deltaMs = Math.max(8, Math.min(48, nowTs - lastTs));
+    state.chat.streamAnimationLastTs = nowTs;
+    const charBudget = Math.max(8, Math.min(56, Math.round(deltaMs * 1.4)));
+
+    const touched = [];
+    for (const [messageId, targetText] of state.chat.streamTargetByMessage.entries()) {
+      const id = String(messageId || "").trim();
+      if (!id) {
+        state.chat.streamTargetByMessage.delete(messageId);
+        continue;
+      }
+
+      const message = state.chat.messages.find((entry) => entry?.id === id);
+      if (!message || message.pending !== true) {
+        state.chat.streamTargetByMessage.delete(messageId);
+        continue;
+      }
+
+      const currentText = String(message.text || "");
+      const nextText = advanceStreamDisplayText(currentText, targetText, charBudget);
+      if (nextText !== currentText) {
+        message.text = nextText;
+        syncMessageTextSegment(message);
+        touched.push(id);
+      }
+
+      if (nextText === String(targetText || "")) {
+        state.chat.streamTargetByMessage.delete(messageId);
+      }
+    }
+
+    if (touched.length > 0) {
+      const incrementalUpdated = updateChatMessageRows(touched, { scrollOnUpdate: true });
+      if (!incrementalUpdated) {
+        renderChatMessages();
+      }
+    }
+
+    if (state.chat.streamTargetByMessage.size > 0) {
+      scheduleChatStreamAnimation();
+    } else {
+      state.chat.streamAnimationLastTs = 0;
+    }
+  };
+
+  if (typeof requestAnimationFrame === "function") {
+    state.chat.streamAnimationIsRaf = true;
+    state.chat.streamAnimationTimer = requestAnimationFrame(runFrame);
+    return;
+  }
+
+  state.chat.streamAnimationIsRaf = false;
+  state.chat.streamAnimationTimer = setTimeout(() => runFrame(Date.now()), 16);
+}
+
+function queuePendingRunDelta(runId, delta) {
+  const key = String(runId || "").trim();
+  if (!key || !delta) return;
+
+  const queue = Array.isArray(state.chat.pendingDeltaByRun.get(key))
+    ? state.chat.pendingDeltaByRun.get(key)
+    : [];
+  queue.push(String(delta));
+  state.chat.pendingDeltaByRun.set(key, queue);
+
+  scheduleChatDeltaFlushScheduler();
+}
+
+function flushPendingRunDeltas(targetRunId = "") {
+  if (!(state.chat.pendingDeltaByRun instanceof Map) || state.chat.pendingDeltaByRun.size === 0) {
+    return false;
+  }
+
+  const key = String(targetRunId || "").trim();
+  const entries = key
+    ? [[key, state.chat.pendingDeltaByRun.get(key) || []]]
+    : Array.from(state.chat.pendingDeltaByRun.entries());
+
+  let updated = false;
+  let fallbackImmediateUpdated = false;
+  for (const [runId, chunks] of entries) {
+    if (!Array.isArray(chunks) || chunks.length === 0) {
+      state.chat.pendingDeltaByRun.delete(runId);
+      continue;
+    }
+
+    const pendingId = String(state.chat.pendingRuns.get(runId) || "").trim();
+
+    patchPendingAssistantByRun(runId, (message) => {
+      if (!message || typeof message.text !== "string") return;
+      const currentTarget = String(state.chat.streamTargetByMessage.get(pendingId) ?? message.text ?? "");
+      let mergedText = currentTarget;
+      for (const chunk of chunks) {
+        mergedText = mergeStreamingText(mergedText, chunk);
+      }
+      const nextTarget = stripChatControlDirectives(mergedText, { trim: false });
+
+      if (pendingId) {
+        if (nextTarget !== currentTarget) {
+          state.chat.streamTargetByMessage.set(pendingId, nextTarget);
+          updated = true;
+        }
+        return;
+      }
+
+      if (nextTarget !== message.text) {
+        message.text = nextTarget;
+        syncMessageTextSegment(message);
+        updated = true;
+        fallbackImmediateUpdated = true;
+      }
+    });
+
+    state.chat.pendingDeltaByRun.delete(runId);
+  }
+
+  if (state.chat.pendingDeltaByRun.size === 0) {
+    clearChatDeltaFlushScheduler();
+  }
+
+  if (updated) {
+    scheduleChatStreamAnimation();
+    if (fallbackImmediateUpdated && state.chat.streamTargetByMessage.size === 0) {
+      renderChatMessages();
+    }
+  }
+
+  return updated;
+}
+
+function toggleChatSessionsPanel(forceOpen) {
+  const panel = $("chat-sessions-panel");
+  const toggle = $("chat-toggle-sessions");
+  if (!panel || !toggle) return;
+
+  const next = typeof forceOpen === "boolean" ? forceOpen : !state.chat.mobileSessionsOpen;
+  state.chat.mobileSessionsOpen = next;
+  panel.classList.toggle("mobile-open", next);
+  toggle.setAttribute("aria-expanded", next ? "true" : "false");
+}
+
+function getChatSessionItems(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload.sessions)) return payload.sessions;
+  if (Array.isArray(payload.items)) return payload.items;
+  if (Array.isArray(payload.data?.sessions)) return payload.data.sessions;
+  if (Array.isArray(payload.data?.items)) return payload.data.items;
+  if (Array.isArray(payload)) return payload;
+  return [];
+}
+
+function normalizeChatSession(session) {
+  const key = String(session?.key || session?.sessionKey || "").trim();
+  if (!key) return null;
+
+  const title =
+    String(session?.label || "").trim() ||
+    String(session?.displayName || "").trim() ||
+    String(session?.subject || "").trim() ||
+    key;
+
+  return {
+    key,
+    title,
+    updatedAt: Number(session?.updatedAt || 0),
+    model: String(session?.model || "").trim(),
+    channel: String(session?.channel || "").trim()
+  };
+}
+
+function normalizeSegmentType(rawType) {
+  const value = String(rawType || "").trim().toLowerCase();
+  if (!value) return "";
+  if (value === "text") return "text";
+  if (
+    value === "thinking" ||
+    value === "reasoning" ||
+    value === "reasoning_text" ||
+    value === "reasoning_summary" ||
+    value === "summary_text"
+  ) {
+    return "thinking";
+  }
+  if (value === "toolcall" || value === "tool_call" || value === "tooluse" || value === "tool_use") {
+    return "toolCall";
+  }
+  if (value === "toolresult" || value === "tool_result") {
+    return "toolResult";
+  }
+  return "";
+}
+
+const REPLY_TO_CURRENT_DIRECTIVE_RE = /\[\[\s*reply(?:[\s_-]*to)?[\s_-]*current\s*\]\]/gi;
+
+function stripChatControlDirectives(rawText, { trim = true } = {}) {
+  const text = String(rawText || "");
+  if (!text) return "";
+  const cleaned = text.replace(REPLY_TO_CURRENT_DIRECTIVE_RE, "").replace(/\n{3,}/g, "\n\n");
+  return trim ? cleaned.trim() : cleaned;
+}
+
+function tryParseStructuredChunk(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text.startsWith("{") || !text.endsWith("}")) return null;
+  if (!text.includes('"type"')) return null;
+
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object") return null;
+    const normalizedType = normalizeSegmentType(parsed.type);
+    return normalizedType ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function stringifySegmentPayload(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildChatSegments(source, { allowStructuredString = true, fallbackToolName = "tool" } = {}) {
+  const segments = [];
+
+  const appendPiece = (piece) => {
+    if (piece === null || piece === undefined) return;
+
+    if (typeof piece === "string") {
+      const parsed = allowStructuredString ? tryParseStructuredChunk(piece) : null;
+      if (parsed) {
+        appendPiece(parsed);
+        return;
+      }
+      const text = stripChatControlDirectives(piece);
+      if (text) segments.push({ type: "text", text });
+      return;
+    }
+
+    if (typeof piece !== "object") {
+      segments.push({ type: "text", text: String(piece) });
+      return;
+    }
+
+    const normalizedType = normalizeSegmentType(piece.type);
+    if (normalizedType === "thinking") {
+      const summaryText = Array.isArray(piece.summary)
+        ? piece.summary
+            .map((item) => {
+              if (!item || typeof item !== "object") return "";
+              return String(item.text || item.summary || "").trim();
+            })
+            .filter(Boolean)
+            .join("\n")
+        : "";
+      const thinkingText =
+        (typeof piece.thinking === "string" && piece.thinking) ||
+        (typeof piece.summary === "string" && piece.summary) ||
+        summaryText ||
+        (typeof piece.text === "string" && piece.text) ||
+        "";
+      const text = stripChatControlDirectives(thinkingText);
+      if (text) segments.push({ type: "thinking", text });
+      return;
+    }
+
+    if (normalizedType === "toolCall") {
+      const name = String(piece.name || piece.toolName || piece.tool_name || fallbackToolName || "tool").trim() || "tool";
+      const args = piece.arguments ?? piece.args ?? piece.partialJson ?? piece.input ?? null;
+      const toolCallId = String(piece.id || piece.toolCallId || piece.tool_call_id || "").trim();
+      segments.push({
+        type: "toolCall",
+        name,
+        args,
+        toolCallId,
+        partialJson: typeof piece.partialJson === "string" ? piece.partialJson : ""
+      });
+      return;
+    }
+
+    if (normalizedType === "toolResult") {
+      const name = String(piece.name || piece.toolName || piece.tool_name || fallbackToolName || "tool").trim() || "tool";
+      const text = (
+        (typeof piece.text === "string" && piece.text) ||
+        (typeof piece.content === "string" && piece.content) ||
+        (typeof piece.output === "string" && piece.output) ||
+        (typeof piece.result === "string" && piece.result) ||
+        (typeof piece.message === "string" && piece.message) ||
+        ""
+      ).trim();
+      const toolCallId = String(piece.toolCallId || piece.tool_call_id || piece.id || "").trim();
+      segments.push({
+        type: "toolResult",
+        name,
+        text,
+        isError: piece.isError === true || piece.error === true,
+        toolCallId
+      });
+      return;
+    }
+
+    const fallbackText =
+      (typeof piece.text === "string" && piece.text) ||
+      (typeof piece.message === "string" && piece.message) ||
+      "";
+    const cleanedFallback = stripChatControlDirectives(fallbackText);
+    if (cleanedFallback) {
+      segments.push({ type: "text", text: cleanedFallback });
+    }
+  };
+
+  if (Array.isArray(source)) {
+    for (const piece of source) appendPiece(piece);
+  } else {
+    appendPiece(source);
+  }
+
+  return segments;
+}
+
+function flattenChatContent(content) {
+  const segments = buildChatSegments(content, { allowStructuredString: true });
+  const text = segments
+    .filter((segment) => segment.type === "text")
+    .map((segment) => String(segment.text || "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+  return text;
+}
+
+function joinTextFromSegments(segments) {
+  if (!Array.isArray(segments) || segments.length === 0) return "";
+  return segments
+    .filter((segment) => segment.type === "text")
+    .map((segment) => String(segment.text || "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function createChatRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function normalizeChatMessage(item, index = 0) {
+  const roleRaw = String(item?.role || item?.type || "assistant").toLowerCase();
+  const role = roleRaw.includes("user")
+    ? "user"
+    : roleRaw.includes("assistant")
+      ? "assistant"
+      : roleRaw.includes("tool")
+        ? "tool"
+        : roleRaw.includes("system")
+          ? "system"
+          : "assistant";
+
+  const isToolResultRole = roleRaw === "toolresult" || roleRaw === "tool_result";
+  let segments = buildChatSegments(item?.content, {
+    allowStructuredString: role !== "user",
+    fallbackToolName: String(item?.toolName || item?.tool_name || "tool").trim() || "tool"
+  });
+
+  if (segments.length === 0) {
+    const fallbackText =
+      (typeof item?.text === "string" && item.text) ||
+      (typeof item?.message === "string" && item.message) ||
+      "";
+    const fallbackTrimmed = stripChatControlDirectives(fallbackText);
+    const structuredFallback = role !== "user" ? tryParseStructuredChunk(fallbackTrimmed) : null;
+    if (structuredFallback) {
+      segments = buildChatSegments([structuredFallback], {
+        allowStructuredString: true,
+        fallbackToolName: String(item?.toolName || item?.tool_name || "tool").trim() || "tool"
+      });
+    } else if (fallbackTrimmed) {
+      segments = [{ type: "text", text: fallbackTrimmed }];
+    }
+  }
+
+  if (isToolResultRole) {
+    const toolText = joinTextFromSegments(segments) || "(无输出)";
+    segments = [{
+      type: "toolResult",
+      name: String(item?.toolName || item?.tool_name || "tool").trim() || "tool",
+      text: toolText,
+      isError: item?.isError === true || item?.error === true,
+      toolCallId: String(item?.toolCallId || item?.tool_call_id || "").trim()
+    }];
+  }
+
+  const text = joinTextFromSegments(segments) || "<empty>";
+
+  const tsRaw = Number(item?.ts || item?.createdAt || item?.updatedAt || 0);
+  const ts = Number.isFinite(tsRaw) && tsRaw > 0 ? tsRaw : Date.now();
+  const id =
+    String(item?.messageId || item?.id || "").trim() ||
+    `${role}-${ts}-${index}`;
+
+  return {
+    id,
+    role,
+    text,
+    segments,
+    ts,
+    pending: item?.pending === true
+  };
+}
+
+function formatChatTime(ts) {
+  const parsed = Number(ts || 0);
+  if (!Number.isFinite(parsed) || parsed <= 0) return "";
+  try {
+    return new Date(parsed).toLocaleTimeString();
+  } catch {
+    return "";
+  }
+}
+
+function renderToolPayload(value) {
+  const text = stringifySegmentPayload(value).trim();
+  if (!text) return "";
+  return escapeHtml(text);
+}
+
+function renderChatSegment(segment, messageId, segmentIndex, options = {}) {
+  if (!segment || typeof segment !== "object") return "";
+
+  if (segment.type === "thinking") {
+    const thinkingText = String(segment.text || "").trim();
+    if (!thinkingText) return "";
+    const openAttr = options.autoOpenThinking ? " open" : "";
+    return `
+      <details class="chat-segment-thinking" data-msg-id="${escapeHtml(messageId)}" data-seg-index="${segmentIndex}"${openAttr}>
+        <summary><i class="fa-regular fa-lightbulb"></i> 思考过程</summary>
+        <pre>${escapeHtml(thinkingText)}</pre>
+      </details>
+    `;
+  }
+
+  if (segment.type === "toolCall") {
+    const toolName = String(segment.name || "tool").trim() || "tool";
+    const argsText = renderToolPayload(segment.args || segment.partialJson || "");
+    const callId = String(segment.toolCallId || "").trim();
+    return `
+      <details class="chat-segment-tool chat-segment-tool-call" data-msg-id="${escapeHtml(messageId)}" data-seg-index="${segmentIndex}">
+        <summary>
+          <span class="chat-segment-tool-title"><i class="fa-solid fa-screwdriver-wrench"></i> 工具调用 · ${escapeHtml(toolName)}</span>
+          <span class="chat-segment-tool-status">执行中</span>
+        </summary>
+        ${callId ? `<div class="chat-segment-tool-meta">callId: ${escapeHtml(callId)}</div>` : ""}
+        ${argsText ? `<pre>${argsText}</pre>` : '<div class="chat-segment-tool-empty">无参数</div>'}
+      </details>
+    `;
+  }
+
+  if (segment.type === "toolResult") {
+    const toolName = String(segment.name || "tool").trim() || "tool";
+    const resultText = String(segment.text || "").trim() || "(无输出)";
+    const openAttr = resultText.length <= 120 ? " open" : "";
+    const callId = String(segment.toolCallId || "").trim();
+    const statusText = segment.isError ? "失败" : "完成";
+    return `
+      <details class="chat-segment-tool chat-segment-tool-result${segment.isError ? " is-error" : ""}" data-msg-id="${escapeHtml(messageId)}" data-seg-index="${segmentIndex}"${openAttr}>
+        <summary>
+          <span class="chat-segment-tool-title"><i class="fa-solid fa-terminal"></i> 工具结果 · ${escapeHtml(toolName)}</span>
+          <span class="chat-segment-tool-status">${statusText}</span>
+        </summary>
+        ${callId ? `<div class="chat-segment-tool-meta">callId: ${escapeHtml(callId)}</div>` : ""}
+        <pre>${escapeHtml(resultText)}</pre>
+      </details>
+    `;
+  }
+
+  const rawText = String(segment.text || "");
+  const text = options.streamingText === true ? rawText : rawText.trim();
+  if (!String(text).trim()) return "";
+
+  if (options.streamingText === true) {
+    return `<div class="chat-bubble-content chat-bubble-content-streaming">${escapeHtml(text).replaceAll("\n", "<br>")}</div>`;
+  }
+
+  const html = renderMarkdown(text);
+  return `<div class="chat-bubble-content chat-markdown">${html || escapeHtml(text).replaceAll("\n", "<br>")}</div>`;
+}
+
+function buildRenderableChatSegments(message, options = {}) {
+  const source = Array.isArray(message?.segments) ? message.segments : [];
+  const orderWeight = (segment) => {
+    if (!segment || typeof segment !== "object") return 99;
+    if (segment.type === "thinking") return 0;
+    if (segment.type === "text") return 1;
+    if (segment.type === "toolCall") return 2;
+    if (segment.type === "toolResult") return 3;
+    return 50;
+  };
+
+  const orderedSource = source
+    .map((segment, index) => ({ segment, index, weight: orderWeight(segment) }))
+    .sort((a, b) => (a.weight - b.weight) || (a.index - b.index));
+
+  const segments = orderedSource
+    .map(({ segment, index }) => ({
+      html: renderChatSegment(segment, message?.id || "", index, {
+        autoOpenThinking: options.autoOpenThinking === true && segment?.type === "thinking",
+        streamingText: options.streaming === true && segment?.type === "text"
+      }),
+      segment
+    }))
+    .filter((entry) => entry.html);
+
+  if (segments.length > 0) {
+    return segments.map((entry) => entry.html).join("");
+  }
+
+  const fallbackText = String(message?.text || "").trim();
+  if (!fallbackText) return '<div class="chat-bubble-content">(空消息)</div>';
+  const html = renderMarkdown(fallbackText);
+  return `<div class="chat-bubble-content chat-markdown">${html || escapeHtml(fallbackText).replaceAll("\n", "<br>")}</div>`;
+}
+
+function resolveLatestThinkingMessageId(messages) {
+  return [...messages]
+    .reverse()
+    .find(
+      (message) =>
+        message?.role === "assistant" &&
+        message?.pending !== true &&
+        Array.isArray(message?.segments) &&
+        message.segments.some((segment) => segment?.type === "thinking")
+    )?.id || "";
+}
+
+function renderChatMessageRow(message, index, latestThinkingMessageId = "") {
+  const role = message?.role || "assistant";
+  const rowClass = role === "user" ? "chat-message-row user" : "chat-message-row";
+  const bubbleClass = role === "user"
+    ? "chat-bubble chat-bubble-user"
+    : role === "tool"
+      ? "chat-bubble chat-bubble-tool"
+      : role === "system"
+        ? "chat-bubble chat-bubble-system"
+        : "chat-bubble chat-bubble-assistant";
+  const metaRole = role === "user" ? "你" : role === "tool" ? "工具" : role === "system" ? "系统" : "助手";
+  const segmentsHtml = buildRenderableChatSegments(message, {
+    autoOpenThinking: role === "assistant" && (message?.pending === true || message?.id === latestThinkingMessageId),
+    streaming: message?.pending === true
+  });
+  const timeText = formatChatTime(message?.ts);
+  const pending = message?.pending === true ? "<span class=\"chat-message-pending\">生成中</span>" : "";
+
+  return `
+    <div class="${rowClass}" data-msg-index="${index}" data-msg-id="${escapeHtml(message?.id || "")}">
+      <article class="${bubbleClass}">
+        ${segmentsHtml}
+        <footer class="chat-bubble-meta">
+          <span>${metaRole}</span>
+          <span>${escapeHtml(timeText)}</span>
+          ${pending}
+        </footer>
+      </article>
+    </div>
+  `;
+}
+
+function updateChatMessageRows(messageIds, { scrollOnUpdate = false, forceFull = false } = {}) {
+  if (!Array.isArray(messageIds) || messageIds.length === 0) return false;
+
+  const container = $("chat-messages");
+  if (!container) return false;
+  if (!Array.isArray(state.chat.messages) || state.chat.messages.length === 0) return false;
+
+  const uniqueMessageIds = [...new Set(messageIds.map((id) => String(id || "").trim()).filter(Boolean))];
+  if (uniqueMessageIds.length === 0) return false;
+
+  const latestThinkingMessageId = resolveLatestThinkingMessageId(state.chat.messages);
+  const nearBottom = container.scrollHeight - container.clientHeight - container.scrollTop < 140;
+
+  let updated = false;
+  for (const messageId of uniqueMessageIds) {
+    const messageIndex = state.chat.messages.findIndex((item) => item?.id === messageId);
+    if (messageIndex < 0) continue;
+    const message = state.chat.messages[messageIndex];
+
+    const row = container.querySelector(`.chat-message-row[data-msg-id="${escapeSelectorAttrValue(messageId)}"]`);
+    if (!row) continue;
+
+    if (!forceFull && message?.pending === true) {
+      const textSegment = Array.isArray(message.segments)
+        ? message.segments.find((segment) => segment?.type === "text")
+        : null;
+      const nextText = String(textSegment?.text || message.text || "");
+      const contentNode = row.querySelector(".chat-bubble-content-streaming");
+
+      if (contentNode) {
+        const nextHtml = escapeHtml(nextText).replaceAll("\n", "<br>");
+        if (contentNode.innerHTML !== nextHtml) {
+          contentNode.innerHTML = nextHtml;
+          updated = true;
+        }
+        continue;
+      }
+    }
+
+    row.outerHTML = renderChatMessageRow(message, messageIndex, latestThinkingMessageId);
+    updated = true;
+  }
+
+  if (updated && scrollOnUpdate && nearBottom) {
+    scrollChatToBottom(true);
+  }
+
+  return updated;
+}
+
+function renderChatSessions() {
+  const container = $("chat-session-list");
+  if (!container) return;
+
+  if (!Array.isArray(state.chat.sessions) || state.chat.sessions.length === 0) {
+    container.innerHTML = `
+      <div class="chat-empty-state">
+        <i class="fa-regular fa-comments"></i>
+        <p>暂无可用会话</p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = state.chat.sessions
+    .map((session) => {
+      const active = session.key === state.chat.sessionKey;
+      const timeText = formatChatTime(session.updatedAt) || "--:--:--";
+      const subtitle = session.model || session.channel || "未标注模型";
+      return `
+        <button type="button" class="chat-session-item${active ? " active" : ""}" data-session-key="${escapeHtml(session.key)}">
+          <span class="chat-session-title">${escapeHtml(session.title)}</span>
+          <span class="chat-session-meta">${escapeHtml(subtitle)}</span>
+          <span class="chat-session-time"><i class="fa-regular fa-clock"></i>${escapeHtml(timeText)}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function updateChatSessionHeader() {
+  const title = $("chat-session-title");
+  const subtitle = $("chat-session-subtitle");
+  if (!title || !subtitle) return;
+
+  if (!state.chat.sessionKey) {
+    title.textContent = "未选择会话";
+    subtitle.textContent = "请先选择会话或创建新会话";
+    return;
+  }
+
+  const session = state.chat.sessions.find((item) => item.key === state.chat.sessionKey);
+  title.textContent = session?.title || state.chat.sessionKey;
+  subtitle.textContent = session?.model || state.chat.sessionKey;
+}
+
+function scrollChatToBottom(force = false) {
+  const container = $("chat-messages");
+  if (!container) return;
+
+  if (force) {
+    container.scrollTop = container.scrollHeight;
+    return;
+  }
+
+  const nearBottom = container.scrollHeight - container.clientHeight - container.scrollTop < 140;
+  if (nearBottom) {
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+function renderChatMessages({ autoScroll = true } = {}) {
+  const container = $("chat-messages");
+  if (!container) return;
+
+  const messages = Array.isArray(state.chat.messages) ? state.chat.messages : [];
+  if (messages.length === 0) {
+    container.innerHTML = `
+      <div class="chat-empty-state chat-empty-state-main">
+        <i class="fa-regular fa-face-smile"></i>
+        <p>从下方输入框发送第一条消息，开始调试 Playground。</p>
+      </div>
+    `;
+    return;
+  }
+
+  const historyBanner = state.chat.loadingOlderMessages
+    ? '<div class="chat-history-banner loading"><i class="fa-solid fa-rotate-right fa-spin"></i> 正在加载更早消息...</div>'
+    : state.chat.hasOlderMessages
+      ? '<div class="chat-history-banner">上滑继续加载更早消息</div>'
+      : "";
+
+  const latestThinkingMessageId = resolveLatestThinkingMessageId(messages);
+
+  container.innerHTML = `${historyBanner}${messages
+    .map((message, index) => renderChatMessageRow(message, index, latestThinkingMessageId))
+    .join("")}`;
+
+  if (autoScroll) {
+    scrollChatToBottom();
+  }
+}
+
+function setChatSending(sending) {
+  state.chat.sending = sending === true;
+  const sendBtn = $("chat-send-btn");
+  if (!sendBtn) return;
+
+  sendBtn.disabled = state.chat.sending;
+  sendBtn.innerHTML = state.chat.sending
+    ? '<i class="fa-solid fa-spinner fa-spin"></i> 发送中'
+    : '<i class="fa-solid fa-paper-plane"></i> 发送';
+}
+
+function scheduleChatHistoryRefresh(sessionKey, delayMs = 180) {
+  if (!sessionKey) return;
+  if (state.chat.historyRefreshTimer) {
+    clearTimeout(state.chat.historyRefreshTimer);
+    state.chat.historyRefreshTimer = null;
+  }
+
+  state.chat.historyRefreshTimer = setTimeout(() => {
+    state.chat.historyRefreshTimer = null;
+    loadChatHistory(sessionKey, { silent: true }).catch((error) => {
+      console.error(error);
+    });
+  }, delayMs);
+}
+
+function patchPendingAssistantByRun(runId, updater) {
+  if (!runId || !state.chat.pendingRuns.has(runId)) return;
+  const pendingId = state.chat.pendingRuns.get(runId);
+  const index = state.chat.messages.findIndex((item) => item.id === pendingId);
+  if (index < 0) return;
+  updater(state.chat.messages[index]);
+}
+
+function extractEventMessageText(payloadMessage, { trim = true } = {}) {
+  if (typeof payloadMessage === "string") {
+    return stripChatControlDirectives(payloadMessage, { trim });
+  }
+  if (!payloadMessage || typeof payloadMessage !== "object") return "";
+  if (typeof payloadMessage.text === "string") {
+    return stripChatControlDirectives(payloadMessage.text, { trim });
+  }
+  if (typeof payloadMessage.message === "string") {
+    return stripChatControlDirectives(payloadMessage.message, { trim });
+  }
+  return stripChatControlDirectives(flattenChatContent(payloadMessage.content), { trim });
+}
+
+function extractEventMessageSegments(payloadMessage) {
+  if (payloadMessage === null || payloadMessage === undefined) return [];
+
+  if (typeof payloadMessage === "string") {
+    return buildChatSegments(payloadMessage, { allowStructuredString: true });
+  }
+
+  if (Array.isArray(payloadMessage)) {
+    return buildChatSegments(payloadMessage, { allowStructuredString: true });
+  }
+
+  if (typeof payloadMessage === "object") {
+    if (Array.isArray(payloadMessage.content)) {
+      return buildChatSegments(payloadMessage.content, { allowStructuredString: true });
+    }
+    if (typeof payloadMessage.type === "string") {
+      return buildChatSegments([payloadMessage], { allowStructuredString: true });
+    }
+    const fallbackText =
+      (typeof payloadMessage.text === "string" && payloadMessage.text) ||
+      (typeof payloadMessage.message === "string" && payloadMessage.message) ||
+      "";
+    const cleaned = stripChatControlDirectives(fallbackText, { trim: false });
+    return cleaned ? [{ type: "text", text: cleaned }] : [];
+  }
+
+  return [];
+}
+
+function mergeStructuredSegmentsIntoMessage(message, incomingSegments) {
+  if (!message || typeof message !== "object") return false;
+  if (!Array.isArray(incomingSegments) || incomingSegments.length === 0) return false;
+
+  const structured = incomingSegments.filter((segment) => segment && segment.type && segment.type !== "text");
+  if (structured.length === 0) return false;
+
+  if (!Array.isArray(message.segments)) {
+    message.segments = [];
+  }
+
+  let changed = false;
+
+  for (const segment of structured) {
+    const type = String(segment?.type || "");
+    const toolCallId = String(segment?.toolCallId || "").trim();
+    const toolName = String(segment?.name || "").trim();
+
+    const matchIndex = message.segments.findIndex((existing) => {
+      if (!existing || existing.type !== type) return false;
+      const existingCallId = String(existing.toolCallId || "").trim();
+      const existingName = String(existing.name || "").trim();
+      if (toolCallId && existingCallId) return toolCallId === existingCallId;
+      if (type === "thinking") return true;
+      return toolName && existingName && toolName === existingName;
+    });
+
+    if (matchIndex < 0) {
+      message.segments.push({ ...segment });
+      changed = true;
+      continue;
+    }
+
+    const existing = message.segments[matchIndex];
+    if (type === "thinking") {
+      const existingText = String(existing.text || "");
+      const incomingText = String(segment.text || "");
+      const mergedText = mergeStreamingText(existingText, incomingText);
+      if (mergedText !== existingText) {
+        message.segments[matchIndex] = { ...existing, text: mergedText };
+        changed = true;
+      }
+      continue;
+    }
+
+    if (type === "toolCall") {
+      const nextArgs = segment.args ?? existing.args ?? null;
+      const nextPartialJson = String(segment.partialJson || existing.partialJson || "");
+      const updated = {
+        ...existing,
+        ...segment,
+        args: nextArgs,
+        partialJson: nextPartialJson
+      };
+      const before = JSON.stringify(existing);
+      const after = JSON.stringify(updated);
+      if (before !== after) {
+        message.segments[matchIndex] = updated;
+        changed = true;
+      }
+      continue;
+    }
+
+    if (type === "toolResult") {
+      const existingText = String(existing.text || "");
+      const incomingText = String(segment.text || "");
+      const mergedText = incomingText || existingText;
+      const updated = {
+        ...existing,
+        ...segment,
+        text: mergedText,
+        isError: segment.isError === true || existing.isError === true
+      };
+      const before = JSON.stringify(existing);
+      const after = JSON.stringify(updated);
+      if (before !== after) {
+        message.segments[matchIndex] = updated;
+        changed = true;
+      }
+      continue;
+    }
+  }
+
+  return changed;
+}
+
+function normalizeGatewayAuthMode(value) {
+  const mode = String(value || "").toLowerCase();
+  if (mode === "none" || mode === "password" || mode === "token") return mode;
+  return "unknown";
+}
+
+async function ensureChatAuthForFallback(authConfig) {
+  if (String(authConfig?.source || "").toLowerCase() !== "fallback") return;
+  if (authConfig?.password || authConfig?.token) return;
+
+  const authMode = normalizeGatewayAuthMode(authConfig?.authMode);
+  if (authMode === "none") return;
+  if (state.chat.manualAuthSecret) return;
+
+  const label = authMode === "token" ? "令牌" : "密码";
+  const value = window.prompt(`检测到旧版后端未提供 /api/gateway-auth，请输入网关${label}继续连接：`, "");
+  const secret = String(value || "").trim();
+  if (!secret) {
+    throw new Error(`未提供网关${label}，Chat 无法建立连接`);
+  }
+  state.chat.manualAuthSecret = secret;
+}
+
+function buildChatConnectAuth(authConfig) {
+  const auth = {};
+  if (typeof authConfig?.password === "string" && authConfig.password) {
+    auth.password = authConfig.password;
+  }
+  if (typeof authConfig?.token === "string" && authConfig.token) {
+    auth.token = authConfig.token;
+  }
+
+  if (!auth.password && !auth.token && state.chat.manualAuthSecret) {
+    const mode = normalizeGatewayAuthMode(authConfig?.authMode);
+    if (mode === "token") {
+      auth.token = state.chat.manualAuthSecret;
+    } else {
+      auth.password = state.chat.manualAuthSecret;
+    }
+  }
+
+  return auth;
+}
+
+function isGatewayDisconnectedError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("gateway websocket is not connected") || message.includes("gateway websocket closed");
+}
+
+async function chatRequest(method, params = {}) {
+  await ensureChatClientConnected();
+  if (!state.chat.client) {
+    throw new Error("chat client is not ready");
+  }
+
+  try {
+    return await state.chat.client.request(method, params);
+  } catch (error) {
+    if (!isGatewayDisconnectedError(error)) {
+      throw error;
+    }
+    await ensureChatClientConnected();
+    if (!state.chat.client) {
+      throw new Error("chat client is not ready");
+    }
+    return state.chat.client.request(method, params);
+  }
+}
+
+async function ensureChatClientConnected() {
+  if (!state.chat.client) {
+    const authConfig = await fetchGatewayAuthConfig();
+    await ensureChatAuthForFallback(authConfig);
+    const connectAuth = buildChatConnectAuth(authConfig);
+    const client = new GatewayClient({
+      requestTimeoutMs: 15000,
+      connectTimeoutMs: 15000,
+      reconnectBaseDelayMs: 600,
+      reconnectMaxDelayMs: 10000,
+      maxReconnectAttempts: 10,
+      autoReconnect: true
+    });
+
+    client.onStatusChange((info) => {
+      setChatStatus(info.status, info);
+      if (info.status === "disconnected") {
+        clearChatDeltaFlushScheduler();
+        state.chat.pendingDeltaByRun.clear();
+        clearChatStreamAnimationScheduler();
+      }
+      if (info.status === "connected" && state.chat.viewActive) {
+        loadChatSessions({ preserveSelection: true }).catch((error) => {
+          console.error(error);
+        });
+      }
+    });
+
+    client.onEvent((frame) => {
+      if (!frame || frame.event !== "chat") return;
+
+      const payload = frame.payload || {};
+      const eventSessionKey = String(payload.sessionKey || "").trim();
+      if (!eventSessionKey) return;
+
+      const runId = String(payload.runId || "").trim();
+      const eventState = String(payload.state || "").toLowerCase();
+      const isCurrentSession = eventSessionKey === state.chat.sessionKey;
+
+      if (!isCurrentSession || !state.chat.viewActive) {
+        state.chat.needsRefresh = true;
+        return;
+      }
+
+      if (runId && state.chat.pendingRuns.has(runId)) {
+        const eventSegments = [
+          ...extractEventMessageSegments(payload.message),
+          ...extractEventMessageSegments(payload.thinking),
+          ...extractEventMessageSegments(payload.reasoning),
+          ...extractEventMessageSegments(payload.reasoningDelta)
+        ];
+        let structuredChanged = false;
+        const pendingMessageId = String(state.chat.pendingRuns.get(runId) || "").trim();
+
+        patchPendingAssistantByRun(runId, (message) => {
+          if (eventState === "delta") {
+            structuredChanged = mergeStructuredSegmentsIntoMessage(message, eventSegments) || structuredChanged;
+            const delta = joinStreamTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: false });
+            if (delta) queuePendingRunDelta(runId, delta);
+            return;
+          }
+
+          if (eventState === "final" || eventState === "aborted" || eventState === "error") {
+            flushPendingRunDeltas(runId);
+          }
+
+          if (eventState === "error") {
+            message.pending = false;
+            message.text = payload.errorMessage || "模型回复失败";
+            message.segments = [{ type: "text", text: message.text }];
+            state.chat.streamTargetByMessage.delete(message.id);
+            return;
+          }
+
+          if (eventState === "aborted") {
+            message.pending = false;
+            message.text = "本次回复已中止";
+            message.segments = [{ type: "text", text: message.text }];
+            state.chat.streamTargetByMessage.delete(message.id);
+            return;
+          }
+
+          if (eventState === "final") {
+            const finalText = joinTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: true });
+            if (finalText) message.text = finalText;
+            if (eventSegments.length > 0) {
+              message.segments = eventSegments;
+            }
+            syncMessageTextSegment(message);
+            message.pending = false;
+            state.chat.streamTargetByMessage.delete(message.id);
+          }
+        });
+
+        if (eventState === "final" || eventState === "aborted" || eventState === "error") {
+          state.chat.pendingRuns.delete(runId);
+          if (state.chat.streamTargetByMessage.size === 0) {
+            clearChatStreamAnimationScheduler({ clearTargets: false });
+          }
+        }
+
+        if (eventState !== "delta") {
+          renderChatMessages();
+        } else if (structuredChanged && pendingMessageId) {
+          const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: false, forceFull: true });
+          if (!updated) {
+            renderChatMessages({ autoScroll: false });
+          }
+        }
+      }
+
+      if (eventState === "final" || eventState === "aborted" || eventState === "error") {
+        scheduleChatHistoryRefresh(eventSessionKey, 120);
+        loadChatSessions({ preserveSelection: true }).catch((error) => {
+          console.error(error);
+        });
+      }
+    });
+
+    state.chat.authConfig = authConfig;
+    state.chat.client = client;
+    try {
+      await client.connect(authConfig.url, connectAuth);
+    } catch (error) {
+      if (String(authConfig?.source || "").toLowerCase() === "fallback") {
+        state.chat.manualAuthSecret = "";
+      }
+      throw error;
+    }
+    state.chat.initialized = true;
+    return;
+  }
+
+  if (!state.chat.client.isConnected()) {
+    const authConfig = state.chat.authConfig || (await fetchGatewayAuthConfig());
+    await ensureChatAuthForFallback(authConfig);
+    const connectAuth = buildChatConnectAuth(authConfig);
+    state.chat.authConfig = authConfig;
+    try {
+      await state.chat.client.connect(authConfig.url, connectAuth);
+    } catch (error) {
+      if (String(authConfig?.source || "").toLowerCase() === "fallback") {
+        state.chat.manualAuthSecret = "";
+      }
+      throw error;
+    }
+  }
+}
+
+async function loadChatSessions({ preserveSelection = true } = {}) {
+  const payload = await chatRequest("sessions.list", { limit: 60, includeLastMessage: true });
+  const sessions = getChatSessionItems(payload)
+    .map((item) => normalizeChatSession(item))
+    .filter(Boolean);
+
+  state.chat.sessions = sessions;
+
+  if (preserveSelection && state.chat.sessionKey) {
+    const stillExists = sessions.some((item) => item.key === state.chat.sessionKey);
+    if (!stillExists) {
+      state.chat.sessionKey = sessions[0]?.key || "";
+      state.chat.messages = [];
+    }
+  } else {
+    state.chat.sessionKey = sessions[0]?.key || "";
+  }
+
+  renderChatSessions();
+  updateChatSessionHeader();
+}
+
+async function loadChatHistory(sessionKey, { silent = false, limit, preserveScroll = false } = {}) {
+  if (!sessionKey) {
+    state.chat.messages = [];
+    state.chat.hasOlderMessages = false;
+    state.chat.loadingOlderMessages = false;
+    clearChatStreamAnimationScheduler();
+    renderChatMessages();
+    return { count: 0, limit: 0 };
+  }
+
+  const container = $("chat-messages");
+  if (container && !silent && !preserveScroll) {
+    container.innerHTML = renderSkeleton(4);
+  }
+
+  const requestedLimit = Math.max(
+    1,
+    Math.min(
+      state.chat.historyMaxLimit,
+      Number.isFinite(Number(limit)) ? Number(limit) : state.chat.historyLimit
+    )
+  );
+  const previousCount = state.chat.messages.length;
+  const previousHeight = preserveScroll && container ? container.scrollHeight : 0;
+  const previousTop = preserveScroll && container ? container.scrollTop : 0;
+
+  clearChatDeltaFlushScheduler();
+  state.chat.pendingDeltaByRun.clear();
+  clearChatStreamAnimationScheduler();
+
+  const payload = await chatRequest("chat.history", {
+    sessionKey,
+    limit: requestedLimit
+  });
+
+  const messagesRaw = Array.isArray(payload?.messages) ? payload.messages : [];
+  state.chat.messages = messagesRaw.map((message, index) => normalizeChatMessage(message, index));
+  state.chat.historyLimit = requestedLimit;
+
+  const currentCount = state.chat.messages.length;
+  if (currentCount < requestedLimit) {
+    state.chat.hasOlderMessages = false;
+  } else if (currentCount > previousCount) {
+    state.chat.hasOlderMessages = requestedLimit < state.chat.historyMaxLimit;
+  } else {
+    state.chat.hasOlderMessages = false;
+  }
+
+  state.chat.pendingRuns.clear();
+  renderChatMessages({ autoScroll: !preserveScroll });
+
+  if (preserveScroll && container) {
+    const nextHeight = container.scrollHeight;
+    const delta = Math.max(0, nextHeight - previousHeight);
+    container.scrollTop = previousTop + delta;
+  } else if (silent) {
+    scrollChatToBottom(false);
+  } else {
+    scrollChatToBottom(true);
+  }
+
+  return { count: currentCount, limit: requestedLimit };
+}
+
+async function loadOlderChatHistory() {
+  if (!state.chat.sessionKey) return;
+  if (!state.chat.hasOlderMessages) return;
+  if (state.chat.loadingOlderMessages) return;
+  if (state.chat.sending || state.chat.pendingRuns.size > 0) return;
+
+  const nextLimit = Math.min(state.chat.historyLimit + state.chat.historyBatchSize, state.chat.historyMaxLimit);
+  if (nextLimit <= state.chat.historyLimit) {
+    state.chat.hasOlderMessages = false;
+    renderChatMessages({ autoScroll: false });
+    return;
+  }
+
+  const previousCount = state.chat.messages.length;
+  state.chat.loadingOlderMessages = true;
+  renderChatMessages({ autoScroll: false });
+
+  try {
+    const result = await loadChatHistory(state.chat.sessionKey, {
+      silent: true,
+      preserveScroll: true,
+      limit: nextLimit
+    });
+
+    if (result.count <= previousCount || result.count < nextLimit) {
+      state.chat.hasOlderMessages = false;
+    } else {
+      state.chat.hasOlderMessages = nextLimit < state.chat.historyMaxLimit;
+    }
+  } catch (error) {
+    showToast(error?.message || String(error), "error");
+  } finally {
+    state.chat.loadingOlderMessages = false;
+    renderChatMessages({ autoScroll: false });
+  }
+}
+
+async function selectChatSession(sessionKey, { reload = true } = {}) {
+  const nextKey = String(sessionKey || "").trim();
+  if (!nextKey) return;
+  if (state.chat.sessionKey === nextKey && !reload) return;
+
+  state.chat.sessionKey = nextKey;
+  state.chat.historyLimit = state.chat.historyBatchSize;
+  state.chat.hasOlderMessages = false;
+  state.chat.loadingOlderMessages = false;
+  renderChatSessions();
+  updateChatSessionHeader();
+
+  if (reload) {
+    await loadChatHistory(nextKey);
+  }
+}
+
+async function createChatSession() {
+  const now = new Date();
+  const label = `WebUI ${now.toLocaleString("zh-CN")}`;
+  const tempKey = `webui-${Date.now()}`;
+  const result = await chatRequest("sessions.patch", {
+    key: tempKey,
+    label
+  });
+
+  const resolvedKey = String(result?.key || tempKey).trim();
+  await loadChatSessions({ preserveSelection: false });
+  if (resolvedKey) {
+    await selectChatSession(resolvedKey, { reload: true });
+  }
+  showToast("已创建新会话", "success", 1800);
+}
+
+async function sendChatMessage(text) {
+  await ensureChatClientConnected();
+
+  const message = String(text || "").trim();
+  if (!message) return;
+  if (!state.chat.sessionKey) {
+    throw new Error("请先选择会话");
+  }
+
+  if (state.chat.sending) return;
+  setChatSending(true);
+
+  const userMessage = {
+    id: `local-user-${Date.now()}`,
+    role: "user",
+    text: message,
+    segments: [{ type: "text", text: message }],
+    ts: Date.now()
+  };
+  const pendingAssistant = {
+    id: `local-assistant-${Date.now()}`,
+    role: "assistant",
+    text: "思考中...",
+    segments: [{ type: "text", text: "思考中..." }],
+    ts: Date.now(),
+    pending: true
+  };
+
+  state.chat.messages.push(userMessage, pendingAssistant);
+  renderChatMessages();
+  scrollChatToBottom(true);
+
+  try {
+    const idempotencyKey = createChatRequestId();
+    const result = await chatRequest("chat.send", {
+      sessionKey: state.chat.sessionKey,
+      message,
+      idempotencyKey
+    });
+
+    const runId = String(result?.runId || "").trim();
+    if (runId) {
+      state.chat.pendingRuns.set(runId, pendingAssistant.id);
+    } else {
+      pendingAssistant.pending = false;
+      pendingAssistant.text = "回复已提交，请稍后刷新会话查看结果";
+      renderChatMessages();
+    }
+
+    await loadChatSessions({ preserveSelection: true });
+  } catch (error) {
+    pendingAssistant.pending = false;
+    pendingAssistant.text = `发送失败：${error instanceof Error ? error.message : String(error)}`;
+    renderChatMessages();
+    throw error;
+  } finally {
+    setChatSending(false);
+  }
+}
+
+function ensureChatBindings() {
+  if (state.chat.bindingsReady) return;
+
+  const sessionList = $("chat-session-list");
+  sessionList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-session-key]");
+    if (!button) return;
+    const sessionKey = button.getAttribute("data-session-key");
+    if (!sessionKey) return;
+
+    selectChatSession(sessionKey, { reload: true }).catch((error) => {
+      showToast(error.message || String(error), "error");
+    });
+
+    if (window.matchMedia("(max-width: 1024px)").matches) {
+      toggleChatSessionsPanel(false);
+    }
+  });
+
+  $("chat-new-session")?.addEventListener("click", async () => {
+    try {
+      await createChatSession();
+    } catch (error) {
+      showToast(error.message || String(error), "error");
+    }
+  });
+
+  const input = $("chat-input");
+  input?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    if (event.shiftKey) return;
+    event.preventDefault();
+    $("chat-input-form")?.requestSubmit();
+  });
+
+  input?.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 240)}px`;
+  });
+
+  $("chat-toggle-sessions")?.addEventListener("click", () => {
+    toggleChatSessionsPanel();
+  });
+
+  $("chat-messages")?.addEventListener("scroll", () => {
+    const container = $("chat-messages");
+    if (!container) return;
+    if (container.scrollTop > 72) return;
+    if (!state.chat.viewActive || !state.chat.hasOlderMessages || state.chat.loadingOlderMessages) return;
+
+    loadOlderChatHistory().catch((error) => {
+      showToast(error?.message || String(error), "error");
+    });
+  }, { passive: true });
+
+  $("chat-reconnect-btn")?.addEventListener("click", async () => {
+    try {
+      setChatStatus("connecting", { reason: state.chat.lastStatusReason });
+      await ensureChatClientConnected();
+      await loadChatSessions({ preserveSelection: true });
+      if (state.chat.sessionKey) {
+        await loadChatHistory(state.chat.sessionKey, { silent: true });
+      }
+      showToast("网关连接已恢复", "success", 1600);
+    } catch (error) {
+      const message = error?.message || String(error);
+      setChatStatus("disconnected", { reason: message });
+      showToast(message, "error");
+    }
+  });
+
+  $("chat-input-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = $("chat-input")?.value || "";
+    if (!text.trim()) return;
+    try {
+      await sendChatMessage(text);
+      if ($("chat-input")) {
+        $("chat-input").value = "";
+        $("chat-input").style.height = "";
+      }
+    } catch (error) {
+      showToast(error.message || String(error), "error");
+    }
+  });
+
+  state.chat.bindingsReady = true;
+}
+
+async function loadChat() {
+  ensureChatBindings();
+  setChatViewActive(true);
+
+  try {
+    setChatStatus(state.chat.initialized ? state.chat.status : "connecting");
+    await ensureChatClientConnected();
+    await loadChatSessions({ preserveSelection: true });
+
+    if (!state.chat.sessionKey) {
+      state.chat.messages = [];
+      state.chat.hasOlderMessages = false;
+      state.chat.loadingOlderMessages = false;
+      renderChatMessages();
+      return;
+    }
+
+    updateChatSessionHeader();
+    const shouldReloadHistory = state.chat.needsRefresh || state.chat.messages.length === 0;
+    state.chat.needsRefresh = false;
+    if (shouldReloadHistory) {
+      await loadChatHistory(state.chat.sessionKey);
+    } else {
+      renderChatMessages();
+    }
+  } catch (error) {
+    state.chat.needsRefresh = true;
+    state.chat.messages = [];
+    state.chat.hasOlderMessages = false;
+    state.chat.loadingOlderMessages = false;
+    renderChatMessages();
+    setChatStatus("disconnected", { reason: error?.message || String(error) });
+    showToast(error.message || String(error), "error");
+  }
+}
+
 function normalizeLogLine(line) {
   const raw = String(line || "").trim();
   if (!raw) return "";
@@ -2636,6 +4440,11 @@ function bindEvents() {
     if (state.skillModalOpen) {
       event.preventDefault();
       setSkillModalOpen(false);
+      return;
+    }
+    if (state.currentView === "chat" && state.chat.mobileSessionsOpen) {
+      event.preventDefault();
+      toggleChatSessionsPanel(false);
       return;
     }
     if (!state.providerModalOpen) return;
