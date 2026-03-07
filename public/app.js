@@ -1,9 +1,14 @@
-import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260304-chat-streamsmooth-v10";
+import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260307-model-fix-v12";
 
 const state = {
   currentView: "overview",
   modelsHash: "",
   modelProvidersDraft: {},
+  deletedModelProviderKeys: new Set(),
+  modelsApply: {
+    phase: "idle",
+    message: ""
+  },
   providerModalOpen: false,
   skillModalOpen: false,
   providerEditor: {
@@ -234,6 +239,10 @@ async function api(path, options = {}) {
   return data;
 }
 
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 
 // Blog Admin Toast Implementation
 function showToast(message, type = 'info', duration = 3000) {
@@ -290,6 +299,91 @@ function removeToast(toast) {
   toast.addEventListener('animationend', () => {
     toast.remove();
   });
+}
+
+function setModelsApplyState(phase = "idle", message = "") {
+  state.modelsApply.phase = phase;
+  state.modelsApply.message = message;
+
+  const badge = $("models-apply-status");
+  const saveBtn = $("models-save");
+  const reloadBtn = $("models-reload");
+
+  if (badge) {
+    if (phase === "idle") {
+      badge.hidden = true;
+      badge.style.display = "none";
+      badge.className = "status-badge status-badge-tight warn";
+      badge.textContent = "";
+    } else {
+      badge.hidden = false;
+      badge.style.display = "inline-flex";
+      badge.className = `status-badge status-badge-tight ${phase === "error" ? "bad" : "warn"}`;
+      badge.innerHTML = phase === "restarting"
+        ? `<i class="fa-solid fa-rotate-right fa-spin status-badge-icon"></i>${escapeHtml(message || "网关热重启中")}`
+        : `<i class="fa-solid fa-triangle-exclamation status-badge-icon"></i>${escapeHtml(message || "网关暂时不可用")}`;
+    }
+  }
+
+  if (saveBtn) {
+    if (phase === "idle") {
+      saveBtn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 保存并应用配置';
+      saveBtn.disabled = false;
+    } else if (phase === "restarting") {
+      saveBtn.innerHTML = '<i class="fa-solid fa-rotate-right fa-spin"></i> 等待网关重启...';
+      saveBtn.disabled = true;
+    } else if (phase === "error") {
+      saveBtn.innerHTML = '<i class="fa-solid fa-rotate-right"></i> 重试连接网关';
+      saveBtn.disabled = false;
+    }
+  }
+
+  if (reloadBtn) {
+    reloadBtn.disabled = phase === "restarting";
+  }
+}
+
+function isLikelyGatewayHotRestartError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return (
+    message.includes("econnrefused")
+    || message.includes("socket hang up")
+    || message.includes("fetch failed")
+    || message.includes("gateway websocket is not connected")
+    || message.includes("gateway websocket closed")
+    || message.includes("gateway session closed")
+    || message.includes("gateway unavailable")
+    || message.includes("temporarily unavailable")
+    || (message.includes("gateway") && message.includes("not connected"))
+  );
+}
+
+async function waitForModelsGatewayRecovery({
+  initialDelayMs = 1200,
+  retryDelayMs = 900,
+  maxAttempts = 12
+} = {}) {
+  let lastError = null;
+  if (initialDelayMs > 0) await wait(initialDelayMs);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    setModelsApplyState("restarting", `网关热重启中（第 ${attempt}/${maxAttempts} 次回连）`);
+    try {
+      await loadModels({ silent: true, rethrow: true });
+      setModelsApplyState("idle");
+      showToast("网关热重启完成，配置已重新连接", "success", 1800);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isLikelyGatewayHotRestartError(error) || attempt === maxAttempts) {
+        break;
+      }
+      await wait(retryDelayMs);
+    }
+  }
+
+  setModelsApplyState("error", "网关热重启时间过长，请稍后手动重试");
+  throw lastError || new Error("网关热重启恢复失败");
 }
 
 function applyConfirmAcceptVariant(button, variant = "primary") {
@@ -801,6 +895,10 @@ function evaluateArithmetic(expr) {
 function setView(view) {
   state.currentView = view;
 
+  if (view === "models" && state.modelsApply.phase === "idle") {
+    setModelsApplyState("idle");
+  }
+
   for (const section of document.querySelectorAll(".view")) {
     section.classList.toggle("active", section.id === `view-${view}`);
   }
@@ -1057,11 +1155,51 @@ function normalizeProviderEditorData(provider) {
       "",
     apiKey: (typeof source.apiKey === "string" && source.apiKey) || "",
     apiType:
-      (typeof source.apiType === "string" && source.apiType) ||
-      (typeof source.type === "string" && source.type) ||
-      "openai",
+      normalizeProviderApiKind(source.api || source.apiType || source.type || ""),
     modelRows: normalizeProviderModels(modelsValue)
   };
+}
+
+const LEGACY_PROVIDER_API_KIND_MAP = {
+  openai: "openai-completions",
+  custom: "openai-completions",
+  "azure-openai": "openai-completions",
+  anthropic: "anthropic-messages",
+  gemini: "google-generative-ai",
+  google: "google-generative-ai"
+};
+
+const PROVIDER_API_OPTIONS = [
+  { value: "openai-completions", label: "OpenAI Compatible / Completions" },
+  { value: "openai-responses", label: "OpenAI Responses" },
+  { value: "openai-codex-responses", label: "OpenAI Codex Responses" },
+  { value: "anthropic-messages", label: "Anthropic Messages" },
+  { value: "google-generative-ai", label: "Google Generative AI" },
+  { value: "ollama", label: "Ollama" },
+  { value: "github-copilot", label: "GitHub Copilot" },
+  { value: "bedrock-converse-stream", label: "AWS Bedrock Converse" }
+];
+
+function normalizeProviderApiKind(value, fallback = "openai-completions") {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  const normalized = raw.toLowerCase();
+  return LEGACY_PROVIDER_API_KIND_MAP[normalized] || normalized;
+}
+
+function getProviderBrandKind(value) {
+  const normalized = normalizeProviderApiKind(value, "openai-completions");
+  if (
+    normalized === "openai-completions"
+    || normalized === "openai-responses"
+    || normalized === "openai-codex-responses"
+  ) {
+    return "openai";
+  }
+  if (normalized === "anthropic-messages") return "anthropic";
+  if (normalized === "google-generative-ai") return "google";
+  if (normalized === "ollama") return "ollama";
+  return normalized;
 }
 
 function normalizeProviderModelRow(entry, fallbackId = "") {
@@ -1133,7 +1271,7 @@ const PROVIDER_BRANDS = {
 };
 
 function getProviderBrand(key, rawType) {
-  const typeKey = (rawType || "").toLowerCase();
+  const typeKey = getProviderBrandKind(rawType);
   const k = (key || "").toLowerCase();
 
   // 1. 优先尝试直接名称包含的品牌匹配（因为 key 通常是用户的命名，具有直接指导意义）
@@ -1205,19 +1343,19 @@ function providerModelRowTemplate(rowData = {}) {
 
 function providerCardTemplate(providerKey = "", provider = {}, originalKey = "") {
   const info = normalizeProviderEditorData(provider);
-  const apiTypeOptions = ["openai", "anthropic", "azure-openai", "gemini", "custom"];
-  if (info.apiType && !apiTypeOptions.includes(info.apiType)) {
-    apiTypeOptions.unshift(info.apiType);
+  const apiTypeOptions = PROVIDER_API_OPTIONS.slice();
+  if (info.apiType && !apiTypeOptions.some((option) => option.value === info.apiType)) {
+    apiTypeOptions.unshift({ value: info.apiType, label: info.apiType });
   }
   const optionsHtml = apiTypeOptions
-    .map((type) => `<option value="${type}"${type === info.apiType ? " selected" : ""}>${type}</option>`)
+    .map((option) => `<option value="${option.value}"${option.value === info.apiType ? " selected" : ""}>${option.label}</option>`)
     .join("");
   const modelRowsHtml = info.modelRows.map((row) => providerModelRowTemplate(row)).join("");
 
   const providerFullConfig = cloneProviderConfig(provider);
   const initialJsonStr = Object.keys(providerFullConfig).length > 0
     ? JSON.stringify(providerFullConfig, null, 2)
-    : JSON.stringify({ baseUrl: "", apiKey: "", apiType: info.apiType || "openai", models: [] }, null, 2);
+    : JSON.stringify({ baseUrl: "", apiKey: "", api: info.apiType || "openai-completions", models: [] }, null, 2);
   const isRedactedApiKey = info.apiKey === REDACTED_API_KEY_TOKEN;
 
   const brand = getProviderBrand(providerKey, info.apiType);
@@ -1251,7 +1389,7 @@ function providerCardTemplate(providerKey = "", provider = {}, originalKey = "")
         </div>
 
         <div class="config-row">
-          <label>API Type</label>
+          <label>API Adapter</label>
           <select class="provider-api-type skeuo-input">${optionsHtml}</select>
         </div>
         
@@ -1273,7 +1411,7 @@ function providerCardTemplate(providerKey = "", provider = {}, originalKey = "")
               <span class="provider-json-error json-error-text is-hidden"><i class="fa-solid fa-triangle-exclamation"></i> 格式异常</span>
             </span>
           </label>
-          <textarea class="provider-json-config skeuo-textarea" placeholder="{\n  &quot;baseUrl&quot;: &quot;https://example.com/v1&quot;,\n  &quot;apiKey&quot;: &quot;sk-...&quot;,\n  &quot;apiType&quot;: &quot;openai&quot;,\n  &quot;models&quot;: []\n}">${escapeHtml(initialJsonStr)}</textarea>
+          <textarea class="provider-json-config skeuo-textarea" placeholder="{\n  &quot;baseUrl&quot;: &quot;https://example.com/v1&quot;,\n  &quot;apiKey&quot;: &quot;sk-...&quot;,\n  &quot;api&quot;: &quot;openai-completions&quot;,\n  &quot;models&quot;: []\n}">${escapeHtml(initialJsonStr)}</textarea>
           <small class="form-hint">上方表单会自动同步到此 JSON；你也可以直接修改后点击“回填表单”。</small>
         </div>
       </div>
@@ -1322,10 +1460,7 @@ function renderProviderMatrix(providers) {
       const rows = getProviderModelRows(provider);
       const modelCount = rows.length;
 
-      const apiType =
-        (typeof provider?.apiType === "string" && provider.apiType) ||
-        (typeof provider?.type === "string" && provider.type) ||
-        "openai";
+      const apiType = normalizeProviderApiKind(provider?.api || provider?.apiType || provider?.type || "");
 
       const brand = getProviderBrand(key, apiType);
 
@@ -1463,7 +1598,7 @@ async function closeProviderModal({ force = false } = {}) {
   return true;
 }
 
-const PROVIDER_MANAGED_KEYS = new Set(["baseUrl", "baseURL", "url", "apiKey", "apiType", "type", "models"]);
+const PROVIDER_MANAGED_KEYS = new Set(["baseUrl", "baseURL", "url", "apiKey", "api", "apiType", "type", "models"]);
 
 function clearProviderJsonError(card) {
   const jsonInput = card?.querySelector(".provider-json-config");
@@ -1554,13 +1689,8 @@ function collectProviderModelsFromCard(card, { strict = true, keyForError = "未
     delete extras.contextWindow;
     delete extras.input;
 
-    const useObjectShape = reasoning || contextWindow !== null || inputValues.length > 0 || Object.keys(extras).length > 0;
-    if (!useObjectShape) {
-      models.push(modelId);
-      continue;
-    }
-
-    const modelPayload = { ...extras, id: modelId };
+    const modelName = typeof extras.name === "string" && extras.name.trim() ? extras.name.trim() : modelId;
+    const modelPayload = { ...extras, id: modelId, name: modelName };
     if (reasoning) modelPayload.reasoning = true;
     if (contextWindow !== null) modelPayload.contextWindow = contextWindow;
     if (inputValues.length > 0) modelPayload.input = inputValues;
@@ -1574,7 +1704,7 @@ function collectProviderFormState(card, { strict = true } = {}) {
   const key = card.querySelector(".provider-key")?.value.trim() || "";
   const baseUrl = card.querySelector(".provider-base-url")?.value.trim() || "";
   const apiKey = card.querySelector(".provider-api-key")?.value.trim() || "";
-  const apiType = card.querySelector(".provider-api-type")?.value.trim() || "openai";
+  const apiType = normalizeProviderApiKind(card.querySelector(".provider-api-type")?.value.trim() || "");
   const models = collectProviderModelsFromCard(card, { strict, keyForError: key || "未命名" });
 
   if (strict) {
@@ -1588,7 +1718,7 @@ function collectProviderFormState(card, { strict = true } = {}) {
   const providerConfig = {
     baseUrl,
     apiKey,
-    apiType: apiType || "openai",
+    api: apiType || "openai-completions",
     models
   };
 
@@ -1612,6 +1742,15 @@ function sanitizeProvidersForSave(providers) {
       delete provider.apiKey;
       sanitized[providerKey] = provider;
     }
+  }
+  return sanitized;
+}
+
+function buildProvidersPatchForSave(providers, deletedKeys = []) {
+  const sanitized = sanitizeProvidersForSave(providers);
+  for (const key of deletedKeys) {
+    if (!key) continue;
+    sanitized[key] = null;
   }
   return sanitized;
 }
@@ -1643,10 +1782,7 @@ function fillProviderFormFromJson(card, { silent = false } = {}) {
     (typeof jsonConfig.url === "string" && jsonConfig.url) ||
     "";
   const apiKey = (typeof jsonConfig.apiKey === "string" && jsonConfig.apiKey) || "";
-  const apiType =
-    (typeof jsonConfig.apiType === "string" && jsonConfig.apiType) ||
-    (typeof jsonConfig.type === "string" && jsonConfig.type) ||
-    "openai";
+  const apiType = normalizeProviderApiKind(jsonConfig.api || jsonConfig.apiType || jsonConfig.type || "");
 
   const keyInput = card.querySelector(".provider-key");
   const baseUrlInput = card.querySelector(".provider-base-url");
@@ -1718,8 +1854,10 @@ async function saveCurrentProvider() {
 
     if (originalKey && originalKey !== key) {
       delete state.modelProvidersDraft[originalKey];
+      state.deletedModelProviderKeys.add(originalKey);
     }
 
+    state.deletedModelProviderKeys.delete(key);
     state.modelProvidersDraft[key] = providerConfig;
     renderProviderMatrix(state.modelProvidersDraft);
     setProviderEditorDirty(false);
@@ -1748,6 +1886,7 @@ async function deleteCurrentProvider() {
 
   if (Object.prototype.hasOwnProperty.call(state.modelProvidersDraft, targetKey)) {
     delete state.modelProvidersDraft[targetKey];
+    state.deletedModelProviderKeys.add(targetKey);
     renderProviderMatrix(state.modelProvidersDraft);
   }
 
@@ -1758,10 +1897,11 @@ async function deleteCurrentProvider() {
 
 // （模型选择器和绑定逻辑已移除）
 
-async function loadModels() {
+async function loadModels({ silent = false, rethrow = false } = {}) {
   try {
     const data = await api("/api/models");
     state.modelsHash = data.configHash;
+    state.deletedModelProviderKeys = new Set();
 
     const cfg = data.modelsConfig || {};
     const providers = cfg.providers || {};
@@ -1772,8 +1912,14 @@ async function loadModels() {
 
     renderProviderEditor("", {}, "");
     renderProviderMatrix(state.modelProvidersDraft);
+    setModelsApplyState("idle");
   } catch (err) {
-    showToast(err.message || String(err), "error");
+    if (!silent) {
+      showToast(err.message || String(err), "error");
+    }
+    if (rethrow) {
+      throw err;
+    }
   }
 }
 
@@ -1784,9 +1930,21 @@ async function saveModels() {
       return;
     }
 
-    const providers = sanitizeProvidersForSave(state.modelProvidersDraft);
+    if (state.modelsApply.phase === "error") {
+      setModelsApplyState("restarting", "网关热重启中，正在重新建立连接...");
+      await waitForModelsGatewayRecovery({ initialDelayMs: 0 });
+      return;
+    }
 
-    if (Object.keys(providers).length === 0) {
+    const providers = buildProvidersPatchForSave(
+      state.modelProvidersDraft,
+      Array.from(state.deletedModelProviderKeys)
+    );
+
+    if (
+      Object.keys(state.modelProvidersDraft).length === 0
+      && state.deletedModelProviderKeys.size === 0
+    ) {
       showToast("没有任何 Provider 数据！", "error");
       return;
     }
@@ -1804,26 +1962,22 @@ async function saveModels() {
       btn.disabled = true;
     }
 
-    await api("/api/models/save", {
+    const saveResult = await api("/api/models/save", {
       method: "POST",
       body: JSON.stringify(payload)
     });
 
-    if (btn) {
-      btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 保存并应用配置';
-      btn.disabled = false;
-    }
-
-    showToast("配置已成功保存并下发至 OpenClaw！", "success");
+    showToast("配置已成功下发，正在等待网关热重启...", "info", 1800);
     await closeProviderModal({ force: true });
-    await loadModels();
+
+    const restartDelayMs = Math.max(800, Number(saveResult?.result?.restart?.delayMs || 0) + 400);
+    setModelsApplyState("restarting", "网关热重启中，正在等待重新连接...");
+    await waitForModelsGatewayRecovery({ initialDelayMs: restartDelayMs });
   } catch (err) {
     showToast(err.message || String(err), "error");
   } finally {
-    const btn = $("models-save");
-    if (btn) {
-      btn.innerHTML = '<i class="fa-solid fa-floppy-disk"></i> 保存并应用配置';
-      btn.disabled = false;
+    if (state.modelsApply.phase === "idle") {
+      setModelsApplyState("idle");
     }
   }
 }
@@ -5987,6 +6141,7 @@ function bindEvents() {
 
 async function bootstrap() {
   bindEvents();
+  setModelsApplyState("idle");
   initLogsView();
   await loadHealth();
   setView("overview");

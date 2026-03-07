@@ -222,11 +222,18 @@ function resolveGatewayClientUrl(req) {
   const forwardedHost = Array.isArray(forwardedHostRaw)
     ? forwardedHostRaw[0]
     : String(forwardedHostRaw || "").split(",")[0].trim();
-  const host = forwardedHost || String(req.headers.host || "").trim();
-  const normalizedProto = forwardedProto === "https" || forwardedProto === "wss" ? "wss" : "ws";
+  const normalizedForwardedProto = forwardedProto.toLowerCase();
+  const hasForwardedContext = Boolean(forwardedProto || forwardedHost);
 
-  if (host) {
-    return `${normalizedProto}://${host}/gateway/`;
+  if (hasForwardedContext) {
+    const host = forwardedHost || String(req.headers.host || "").trim();
+    const normalizedProto = normalizedForwardedProto === "https" || normalizedForwardedProto === "wss"
+      ? "wss"
+      : "ws";
+
+    if (host) {
+      return `${normalizedProto}://${host}/gateway/`;
+    }
   }
 
   return gatewayConfig.url;

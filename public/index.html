@@ -7,7 +7,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>灵诗控制台 | OpenClaw</title>
   <link rel="stylesheet" href="/assets/fontawesome/css/all.min.css">
-  <link rel="stylesheet" href="/styles.css?v=20260307-ui-polish-v1" />
+  <link rel="stylesheet" href="/styles.css?v=20260307-models-ui-v8" />
   <script src="/theme.js"></script>
   <style>
     /* 针对由 JS 动态渲染的表格特殊列的限宽，防止撑开页面 */
@@ -160,6 +160,7 @@
             <p class="view-shell-subtitle">调整终端运行的大脑，为不同任务分配和新增外部算力提供商。</p>
           </div>
           <div class="view-shell-actions">
+            <span id="models-apply-status" class="status-badge status-badge-tight warn" role="status" aria-live="polite" hidden>网关热重启中</span>
             <button id="models-provider-add" type="button" class="btn-primary btn-primary-strong"><i
                 class="fa-solid fa-plus"></i> 接入新引擎</button>
             <button type="button" id="models-reload" class="panel-action-btn btn-secondary"><i class="fa-solid fa-rotate-right"></i>
@@ -591,7 +592,7 @@
       </div>
     </section>
   </div>
-  <script type="module" src="/app.js?v=20260307-persona-v2"></script>
+  <script type="module" src="/app.js?v=20260307-models-ui-v8"></script>
   <div id="toast-container" class="toast-container"></div>
 </body>
 

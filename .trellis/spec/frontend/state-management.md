@@ -21,6 +21,8 @@ const state = {
   currentView: "overview",        // 当前激活的导航视图
   modelsHash: "",                 // 模型配置的哈希（用于脏检测）
   modelProvidersDraft: {},        // 模型提供商编辑草稿
+  deletedModelProviderKeys: new Set(), // 待作为 tombstone 下发的 Provider 删除集合
+  modelsApply: { ... },           // 模型配置保存/热重启恢复状态
   providerModalOpen: false,       // Provider 编辑弹窗是否打开
   skillModalOpen: false,          // Skill 配置弹窗是否打开
   providerEditor: { ... },       // Provider 编辑器元数据
@@ -67,6 +69,12 @@ let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
 - 只有当「请求编号仍然匹配」且「当前选中的 agent / file 仍然一致」时，异步结果才允许落地到状态。
 - 文件缺失不是异常终态：会落到 `fileMissing = true` 的“可创建态”。
 - 详情见 `.trellis/spec/frontend/persona-editor-state.md`。
+
+### 6. 模型配置热重启子状态
+
+- `deletedModelProviderKeys`：记录用户删除或重命名后需要在 `config.patch` 中发送 `null` tombstone 的 provider key。
+- `modelsApply.phase`：`"idle" | "restarting" | "error"`，驱动“网关热重启中”状态徽标和按钮禁用 / 重试连接状态。
+- `modelsApply.message`：当前热重启提示文案；在轮询恢复期间动态更新。
 
 ---
 

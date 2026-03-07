@@ -104,7 +104,10 @@
   }
   ```
 - `/api/models/save` forwards to `config.patch({ raw, baseHash, note })` with note `"MVP dashboard updated model/provider config"`.
-- Browser editor depends on provider config round-tripping extra fields. Managed keys are `baseUrl|baseURL|url|apiKey|apiType|type|models`; everything else must survive save.
+- Browser editor depends on provider config round-tripping extra fields. Managed keys are `baseUrl|baseURL|url|apiKey|api|apiType|type|models`; everything else must survive save.
+- Browser provider save normalizes legacy adapter fields `apiType` / `type` into gateway-schema `api` before calling `/api/models/save`.
+- Browser provider delete / rename emits `models.providers.<key> = null` tombstones so `config.patch` actually removes old provider keys instead of merging them back.
+- Browser provider model rows always serialize as object entries; when `name` is omitted in the form, save falls back to `name = id` to satisfy gateway schema.
 - `__OPENCLAW_REDACTED__` is a browser-only placeholder; save callers must remove it before sending.
 
 #### Skills contract
@@ -165,6 +168,9 @@
   - `/api/models` returns `configHash` and `modelsConfig`
   - `/api/models/save` forwards `baseHash`
   - provider extra fields survive round-trip save
+  - legacy provider `apiType` / `type` backfills and saves as `api`
+  - deleting or renaming a provider removes the old provider key after reload
+  - newly added provider models save as `{ id, name, ... }` objects instead of invalid string entries
 - Skills
   - `/api/skills/install` default `timeoutMs=120000`
   - `/api/skills/update` accepts enable-only and env/apiKey payloads

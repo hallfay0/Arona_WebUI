@@ -211,9 +211,8 @@ export class GatewayClient {
 
       socket.addEventListener("error", () => {
         if (socket !== this.ws) return;
-        if (!this.connected) {
-          this.failConnect(new Error("gateway websocket error"));
-        }
+        // Browser WebSocket error events do not expose actionable details.
+        // Wait for the close event so we can surface its code/reason when available.
       });
 
       this.connectTimer = setTimeout(() => {
