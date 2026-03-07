@@ -39,6 +39,56 @@ function parsePositiveInt(value, fallback) {
   return parsed;
 }
 
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+const INVALID_OPTIONAL_STRING = Symbol("invalid optional string");
+
+function readRequiredString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function readOptionalString(source, key) {
+  if (!source || typeof source !== "object" || !hasOwn(source, key)) return undefined;
+  return typeof source[key] === "string" ? source[key].trim() : INVALID_OPTIONAL_STRING;
+}
+
+const AGENT_FILE_NAMES = [
+  "AGENTS.md",
+  "SOUL.md",
+  "TOOLS.md",
+  "IDENTITY.md",
+  "USER.md",
+  "HEARTBEAT.md",
+  "BOOTSTRAP.md",
+  "MEMORY.md",
+  "memory.md"
+];
+
+const AGENT_FILE_NAME_SET = new Set(AGENT_FILE_NAMES);
+const AGENT_FILE_NAME_LOOKUP = new Map(AGENT_FILE_NAMES.map((name) => [name.toLowerCase(), name]));
+
+function readAgentFileName(value) {
+  const raw = readRequiredString(value);
+  if (!raw) return "";
+  // Preserve exact canonical casing first so MEMORY.md and memory.md stay distinct.
+  if (AGENT_FILE_NAME_SET.has(raw)) return raw;
+  return AGENT_FILE_NAME_LOOKUP.get(raw.toLowerCase()) || "";
+}
+
+function isMissingAgentFileError(error) {
+  const message = String(error instanceof Error ? error.message : error || "").toLowerCase();
+  if (!message || message.includes("api endpoint not found") || message.includes("unsupported file")) {
+    return false;
+  }
+  return message.includes("enoent")
+    || message.includes("no such file")
+    || message.includes("missing file")
+    || (message.includes("file") && message.includes("not found"))
+    || (message.includes("workspace") && message.includes("not found"));
+}
+
 const SESSION_TTL_MS = parsePositiveInt(process.env.SESSION_TTL_MS || "86400000", 86_400_000);
 const SESSION_CLEANUP_INTERVAL_MS = parsePositiveInt(process.env.SESSION_CLEANUP_INTERVAL_MS || "300000", 300_000);
 const GATEWAY_POOL_IDLE_MS = parsePositiveInt(process.env.GATEWAY_POOL_IDLE_MS || "30000", 30_000);
@@ -115,7 +165,7 @@ async function handleLogin(req, res) {
       jsonResponse(res, 401, { ok: false, error: "阿洛娜不认识这个账号或密码哦...请老师核对一下！(>_<)" });
     }
   } catch (err) {
-    jsonResponse(res, 500, { ok: false, error: err.message });
+    jsonResponse(res, getApiErrorStatusCode(err), { ok: false, error: err.message });
   }
 }
 
@@ -150,6 +200,7 @@ function loadGatewayDefaults() {
 }
 
 const gatewayDefaults = loadGatewayDefaults();
+const DEFAULT_AGENT_WORKSPACE = "~/.openclaw/workspace";
 const gatewayConfig = {
   url: process.env.GATEWAY_URL || gatewayDefaults.url,
   origin: process.env.GATEWAY_ORIGIN || gatewayDefaults.origin,
@@ -454,6 +505,186 @@ function jsonResponse(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
+function emptyAgentFilesResponse(agentId) {
+  return {
+    ok: true,
+    agentId,
+    files: []
+  };
+}
+
+function missingAgentFileResponse(agentId, name) {
+  return {
+    ok: true,
+    agentId,
+    file: {
+      name,
+      content: "",
+      missing: true
+    }
+  };
+}
+
+function readTrimmedStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  const deduped = [];
+  const seen = new Set();
+  for (const item of value) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    deduped.push(trimmed);
+  }
+  return deduped;
+}
+
+function readConfigAgentEntry(configPayload, agentId) {
+  const parsed = configPayload && typeof configPayload === "object" ? configPayload.parsed : null;
+  const agentsRoot = parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+  const list = Array.isArray(agentsRoot?.list) ? agentsRoot.list : [];
+  const normalizedAgentId = readRequiredString(agentId).toLowerCase();
+
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") continue;
+    const entryId = readRequiredString(entry.id).toLowerCase();
+    if (!entryId || entryId !== normalizedAgentId) continue;
+    return entry;
+  }
+  return null;
+}
+
+function readConfigAgentWorkspaceInfo(configPayload, agentId, fallbackWorkspace = "") {
+  const parsed = configPayload && typeof configPayload === "object" ? configPayload.parsed : null;
+  const agentsRoot = parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+  const configuredDefaultWorkspace = readRequiredString(agentsRoot?.defaults?.workspace) || fallbackWorkspace;
+  const defaultWorkspace = configuredDefaultWorkspace || DEFAULT_AGENT_WORKSPACE;
+  const entry = readConfigAgentEntry(configPayload, agentId);
+  const entryWorkspace = readRequiredString(entry?.workspace);
+  if (entryWorkspace) {
+    return {
+      workspace: entryWorkspace,
+      defaultWorkspace,
+      matchedAgent: true,
+      source: "agents.list.workspace"
+    };
+  }
+
+  return {
+    workspace: defaultWorkspace,
+    defaultWorkspace,
+    matchedAgent: Boolean(entry),
+    source: configuredDefaultWorkspace ? "agents.defaults.workspace" : "default"
+  };
+}
+
+function readConfigAgentWorkspace(configPayload, agentId, fallbackWorkspace = "") {
+  return readConfigAgentWorkspaceInfo(configPayload, agentId, fallbackWorkspace).workspace;
+}
+
+function readAgentMemoryInfo(configPayload, agentId) {
+  const parsed = configPayload && typeof configPayload === "object" ? configPayload.parsed : null;
+  const agentsRoot = parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+  const defaultsMemory = agentsRoot?.defaults?.memorySearch;
+  const entry = readConfigAgentEntry(configPayload, agentId);
+  const agentMemory = entry?.memorySearch && typeof entry.memorySearch === "object" ? entry.memorySearch : null;
+  const defaultExtraPaths = readTrimmedStringArray(defaultsMemory?.extraPaths);
+  const agentExtraPaths = readTrimmedStringArray(agentMemory?.extraPaths);
+  const effectiveExtraPaths = readTrimmedStringArray([...defaultExtraPaths, ...agentExtraPaths]);
+  const backend = readRequiredString(parsed?.memory?.backend) || "builtin";
+
+  return {
+    backend,
+    defaultExtraPaths,
+    agentExtraPaths,
+    effectiveExtraPaths,
+    hasAgentOverride: Boolean(agentMemory && hasOwn(agentMemory, "extraPaths"))
+  };
+}
+
+function mergeAgentsListWithConfig(agentsPayload, configPayload) {
+  const source = agentsPayload && typeof agentsPayload === "object" ? agentsPayload : {};
+  const defaultWorkspace = readConfigAgentWorkspace(configPayload, source.defaultId);
+  const mergeAgentWorkspace = (agent, fallbackAgentId = "") => {
+    const isObjectAgent = agent && typeof agent === "object" && !Array.isArray(agent);
+    const nextAgent = isObjectAgent ? { ...agent } : null;
+    const agentId = readRequiredString(
+      (isObjectAgent ? nextAgent.id || nextAgent.agentId || nextAgent.key : agent) || fallbackAgentId
+    );
+    const currentWorkspace = isObjectAgent
+      ? readRequiredString(nextAgent.workspace || nextAgent.root || nextAgent.path || nextAgent.dir)
+      : "";
+    const {
+      workspace,
+      matchedAgent,
+      defaultWorkspace: agentDefaultWorkspace,
+      source: configWorkspaceSource
+    } = readConfigAgentWorkspaceInfo(configPayload, agentId, defaultWorkspace);
+    const memorySearch = readAgentMemoryInfo(configPayload, agentId || fallbackAgentId);
+    const effectiveWorkspace = currentWorkspace || workspace || agentDefaultWorkspace || DEFAULT_AGENT_WORKSPACE;
+    const workspaceSource = currentWorkspace ? "agents.list.workspace" : configWorkspaceSource;
+
+    if (nextAgent) {
+      if (workspace && (matchedAgent || !currentWorkspace)) {
+        nextAgent.workspace = workspace;
+      }
+      nextAgent.defaultWorkspace = agentDefaultWorkspace || DEFAULT_AGENT_WORKSPACE;
+      nextAgent.effectiveWorkspace = effectiveWorkspace;
+      nextAgent.workspaceSource = workspaceSource;
+      nextAgent.memorySearch = memorySearch;
+      return nextAgent;
+    }
+
+    const payload = {
+      agentId: agentId || readRequiredString(fallbackAgentId),
+      defaultWorkspace: agentDefaultWorkspace || DEFAULT_AGENT_WORKSPACE,
+      effectiveWorkspace,
+      workspaceSource,
+      memorySearch
+    };
+
+    if (workspace) {
+      payload.workspace = workspace;
+    }
+
+    return payload;
+  };
+
+  let agents = source.agents;
+  if (Array.isArray(source.agents)) {
+    agents = source.agents.map((agent) => mergeAgentWorkspace(agent));
+  } else if (source.agents && typeof source.agents === "object") {
+    agents = Object.fromEntries(
+      Object.entries(source.agents).map(([agentId, agent]) => [agentId, mergeAgentWorkspace(agent, agentId)])
+    );
+  }
+
+  return {
+    ...source,
+    agents
+  };
+}
+
+function getApiErrorStatusCode(error) {
+  if (Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode < 600) {
+    return error.statusCode;
+  }
+
+  const message = String(error instanceof Error ? error.message : error || "");
+  if (message.startsWith("invalid JSON body")) return 400;
+  if (message.includes("payload too large")) return 413;
+  if (
+    message.includes("not found")
+    || message.includes("must be a string")
+    || message.includes("is required")
+    || message.includes("memory.backend = qmd")
+    || message.includes("config hash is unavailable")
+  ) {
+    return 400;
+  }
+  return 500;
+}
+
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
@@ -622,6 +853,181 @@ async function handleApi(req, res, pathname, query) {
       return jsonResponse(res, 200, { ok: true, result });
     }
 
+    if (req.method === "GET" && pathname === "/api/agents") {
+      const data = await withGateway(async (gateway) => {
+        const [agents, config] = await Promise.all([
+          gateway.request("agents.list", {}),
+          gateway.request("config.get", {}).catch(() => null)
+        ]);
+        return mergeAgentsListWithConfig(agents, config);
+      });
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/agents/create") {
+      const body = await parseBody(req);
+      const name = readRequiredString(body?.name);
+      const workspace = readRequiredString(body?.workspace);
+      if (!name || !workspace) {
+        return jsonResponse(res, 400, { ok: false, error: "name and workspace are required" });
+      }
+
+      const params = { name, workspace };
+      const emoji = readOptionalString(body, "emoji");
+      const avatar = readOptionalString(body, "avatar");
+      if (emoji === INVALID_OPTIONAL_STRING) {
+        return jsonResponse(res, 400, { ok: false, error: "emoji must be a string when provided" });
+      }
+      if (avatar === INVALID_OPTIONAL_STRING) {
+        return jsonResponse(res, 400, { ok: false, error: "avatar must be a string when provided" });
+      }
+      if (emoji !== undefined && emoji !== "") params.emoji = emoji;
+      if (avatar !== undefined && avatar !== "") params.avatar = avatar;
+
+      const data = await withGateway((gateway) => gateway.request("agents.create", params));
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "POST" && pathname === "/api/agents/update") {
+      const body = await parseBody(req);
+      const agentId = readRequiredString(body?.agentId);
+      if (!agentId) {
+        return jsonResponse(res, 400, { ok: false, error: "agentId is required" });
+      }
+
+      const params = { agentId };
+      const name = readOptionalString(body, "name");
+      const workspace = readOptionalString(body, "workspace");
+      const avatar = readOptionalString(body, "avatar");
+      if (name === INVALID_OPTIONAL_STRING) {
+        return jsonResponse(res, 400, { ok: false, error: "name must be a string when provided" });
+      }
+      if (workspace === INVALID_OPTIONAL_STRING) {
+        return jsonResponse(res, 400, { ok: false, error: "workspace must be a string when provided" });
+      }
+      if (avatar === INVALID_OPTIONAL_STRING) {
+        return jsonResponse(res, 400, { ok: false, error: "avatar must be a string when provided" });
+      }
+      if (name !== undefined) {
+        if (!name) {
+          return jsonResponse(res, 400, { ok: false, error: "name must be a non-empty string when provided" });
+        }
+        params.name = name;
+      }
+      if (workspace !== undefined) {
+        if (!workspace) {
+          return jsonResponse(res, 400, { ok: false, error: "workspace must be a non-empty string when provided" });
+        }
+        params.workspace = workspace;
+      }
+      if (avatar !== undefined) params.avatar = avatar;
+
+      if (Object.keys(params).length === 1) {
+        return jsonResponse(res, 400, { ok: false, error: "at least one field to update is required" });
+      }
+
+      const data = await withGateway(async (gateway) => {
+        if (typeof params.workspace === "string") {
+          const agents = await gateway.request("agents.list", {});
+          const defaultId = readRequiredString(agents?.defaultId);
+          if (defaultId && defaultId.toLowerCase() === agentId.toLowerCase()) {
+            const error = new Error("默认 Agent 工作区受保护，如需修改请与 🦞 沟通");
+            error.statusCode = 409;
+            throw error;
+          }
+        }
+        return gateway.request("agents.update", params);
+      });
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "POST" && pathname === "/api/agents/delete") {
+      const body = await parseBody(req);
+      const agentId = readRequiredString(body?.agentId);
+      if (!agentId) {
+        return jsonResponse(res, 400, { ok: false, error: "agentId is required" });
+      }
+
+      const params = { agentId };
+      if (body?.deleteFiles === true) {
+        params.deleteFiles = true;
+      }
+
+      const data = await withGateway(async (gateway) => {
+        const agents = await gateway.request("agents.list", {});
+        const defaultId = readRequiredString(agents?.defaultId);
+        if (defaultId && defaultId.toLowerCase() === agentId.toLowerCase()) {
+          const error = new Error("默认 Agent 受保护，不能删除");
+          error.statusCode = 409;
+          throw error;
+        }
+        return gateway.request("agents.delete", params);
+      });
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "GET" && pathname === "/api/agents/files") {
+      const agentId = readRequiredString(query.get("agentId"));
+      if (!agentId) {
+        return jsonResponse(res, 400, { ok: false, error: "agentId is required" });
+      }
+
+      try {
+        const data = await withGateway((gateway) => gateway.request("agents.files.list", { agentId }));
+        return jsonResponse(res, 200, data);
+      } catch (error) {
+        if (isMissingAgentFileError(error)) {
+          return jsonResponse(res, 200, emptyAgentFilesResponse(agentId));
+        }
+        throw error;
+      }
+    }
+
+    if (req.method === "GET" && pathname === "/api/agents/file") {
+      const agentId = readRequiredString(query.get("agentId"));
+      const rawName = readRequiredString(query.get("name"));
+      if (!agentId || !rawName) {
+        return jsonResponse(res, 400, { ok: false, error: "agentId and name are required" });
+      }
+
+      const name = readAgentFileName(rawName);
+      if (!name) {
+        return jsonResponse(res, 400, { ok: false, error: "unsupported agent file name" });
+      }
+
+      try {
+        const data = await withGateway((gateway) => gateway.request("agents.files.get", { agentId, name }));
+        return jsonResponse(res, 200, data);
+      } catch (error) {
+        if (isMissingAgentFileError(error)) {
+          return jsonResponse(res, 200, missingAgentFileResponse(agentId, name));
+        }
+        throw error;
+      }
+    }
+
+    if (req.method === "POST" && pathname === "/api/agents/file") {
+      const body = await parseBody(req);
+      const agentId = readRequiredString(body?.agentId);
+      const rawName = readRequiredString(body?.name);
+      if (!agentId || !rawName) {
+        return jsonResponse(res, 400, { ok: false, error: "agentId and name are required" });
+      }
+
+      const name = readAgentFileName(rawName);
+      if (!name) {
+        return jsonResponse(res, 400, { ok: false, error: "unsupported agent file name" });
+      }
+
+      if (!hasOwn(body || {}, "content") || typeof body?.content !== "string") {
+        return jsonResponse(res, 400, { ok: false, error: "content must be a string" });
+      }
+
+      const content = body.content;
+      const data = await withGateway((gateway) => gateway.request("agents.files.set", { agentId, name, content }));
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
     if (req.method === "GET" && pathname === "/api/cron/list") {
       const includeDisabled = query.get("includeDisabled") === "true";
       const data = await withGateway((gateway) => gateway.request("cron.list", { includeDisabled }));
@@ -713,7 +1119,7 @@ async function handleApi(req, res, pathname, query) {
 
     return jsonResponse(res, 404, { ok: false, error: "API endpoint not found" });
   } catch (error) {
-    return jsonResponse(res, 500, {
+    return jsonResponse(res, getApiErrorStatusCode(error), {
       ok: false,
       error: error instanceof Error ? error.message : String(error)
     });

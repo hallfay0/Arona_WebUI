@@ -47,3 +47,8 @@ media/
 CLAUDE.md
 .sisyphus/
 docs/
+openclaw-src/
+.trellis/
+.opencode/
+.agents/
+AGENTS.md

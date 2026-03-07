@@ -17,9 +17,7 @@ const state = {
     lastActiveElement: null
   },
   modalFocus: {
-    modalId: null,
-    keydownHandler: null,
-    lastActiveElement: null
+    stack: []
   },
   logsCursor: null,
   logsTimer: null,
@@ -29,6 +27,30 @@ const state = {
   nodeCommandDefaults: [],
   modelDefaultOptions: [],
   cronJsonMode: false,
+  persona: {
+    agents: [],
+    defaultId: "",
+    mainKey: "",
+    scope: "",
+    selectedAgentId: "",
+    files: [],
+    filesWorkspace: "",
+    selectedFileName: "",
+    fileContent: "",
+    fileOriginalContent: "",
+    fileMissing: false,
+    loading: false,
+    filesLoading: false,
+    fileLoading: false,
+    metadataSaving: false,
+    fileSaving: false,
+    listError: "",
+    filesError: "",
+    fileError: "",
+    listRequestId: 0,
+    filesRequestId: 0,
+    fileRequestId: 0
+  },
   chat: {
     client: null,
     authConfig: null,
@@ -65,6 +87,30 @@ const REDACTED_API_KEY_TOKEN = "__OPENCLAW_REDACTED__";
 
 // Skills 缓存，供配置弹窗读取
 let _skillsCache = [];
+
+const PERSONA_FALLBACK_FILES = [
+  "IDENTITY.md",
+  "SOUL.md",
+  "AGENTS.md",
+  "TOOLS.md",
+  "USER.md",
+  "HEARTBEAT.md",
+  "BOOTSTRAP.md",
+  "MEMORY.md"
+];
+
+const PERSONA_DEFAULT_WORKSPACE = "~/.openclaw/workspace";
+
+const PERSONA_FILE_LABELS = {
+  "identity.md": "身份设定",
+  "soul.md": "灵魂核心",
+  "agents.md": "行为规范",
+  "tools.md": "工具提示",
+  "user.md": "用户画像",
+  "heartbeat.md": "心跳指令",
+  "bootstrap.md": "启动引导",
+  "memory.md": "长期记忆"
+};
 
 // =========================================
 // Spotlight 交互与全局光照
@@ -154,6 +200,7 @@ const viewLoaders = {
   skills: loadSkills,
   cron: loadCron,
   nodes: loadNodes,
+  persona: loadPersona,
   chat: loadChat,
   logs: initLogsView
 };
@@ -266,6 +313,7 @@ function settleConfirmDialog(confirmed) {
     modal.classList.remove("open");
     modal.setAttribute("aria-hidden", "true");
   }
+  releaseModalFocus("global-confirm-modal", { restoreFocus: false });
   document.body.classList.remove("confirm-modal-open");
 
   const resolver = state.confirmDialog.resolver;
@@ -322,10 +370,7 @@ function requestConfirmDialog({
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
     document.body.classList.add("confirm-modal-open");
-
-    requestAnimationFrame(() => {
-      confirmBtn.focus();
-    });
+    captureModalFocus("global-confirm-modal", { initialSelector: "#confirm-modal-accept" });
   });
 }
 
@@ -358,65 +403,116 @@ function focusElementSafely(element) {
   }
 }
 
+function getActiveModalFocusRecord() {
+  const stack = Array.isArray(state.modalFocus.stack) ? state.modalFocus.stack : [];
+  return stack[stack.length - 1] || null;
+}
+
+function detachModalFocusRecord(record) {
+  if (!record) return;
+  const modal = $(record.modalId);
+  if (modal && record.keydownHandler) {
+    modal.removeEventListener("keydown", record.keydownHandler);
+  }
+}
+
+function attachModalFocusRecord(record) {
+  if (!record) return;
+  const modal = $(record.modalId);
+  if (modal && record.keydownHandler) {
+    modal.addEventListener("keydown", record.keydownHandler);
+  }
+}
+
+function focusModalInitialTarget(modal, initialSelector = "") {
+  if (!modal || modal.contains(document.activeElement)) return;
+  const target = initialSelector ? modal.querySelector(initialSelector) : null;
+  if (target instanceof HTMLElement) {
+    focusElementSafely(target);
+    return;
+  }
+  const [first] = getModalFocusableElements(modal);
+  if (first) focusElementSafely(first);
+}
+
 function captureModalFocus(modalId, { initialSelector } = {}) {
   const modal = $(modalId);
   if (!modal) return;
 
-  if (state.modalFocus.modalId && state.modalFocus.modalId !== modalId) {
-    releaseModalFocus(state.modalFocus.modalId, { restoreFocus: false });
+  const activeRecord = getActiveModalFocusRecord();
+  if (activeRecord?.modalId === modalId) {
+    activeRecord.initialSelector = initialSelector || activeRecord.initialSelector || "";
+    requestAnimationFrame(() => {
+      focusModalInitialTarget(modal, activeRecord.initialSelector || "");
+    });
+    return;
   }
 
-  if (state.modalFocus.modalId !== modalId) {
-    const handler = (event) => {
-      if (event.key !== "Tab") return;
-      const focusables = getModalFocusableElements(modal);
-      if (focusables.length === 0) {
-        event.preventDefault();
-        return;
-      }
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        focusElementSafely(last);
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        focusElementSafely(first);
-      }
-    };
-
-    state.modalFocus.modalId = modalId;
-    state.modalFocus.keydownHandler = handler;
-    state.modalFocus.lastActiveElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    modal.addEventListener("keydown", handler);
+  if (activeRecord) {
+    detachModalFocusRecord(activeRecord);
   }
 
-  requestAnimationFrame(() => {
-    if (modal.contains(document.activeElement)) return;
-    const target = initialSelector ? modal.querySelector(initialSelector) : null;
-    if (target instanceof HTMLElement) {
-      focusElementSafely(target);
+  const handler = (event) => {
+    if (event.key !== "Tab") return;
+    const focusables = getModalFocusableElements(modal);
+    if (focusables.length === 0) {
+      event.preventDefault();
       return;
     }
-    const [first] = getModalFocusableElements(modal);
-    if (first) focusElementSafely(first);
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      focusElementSafely(last);
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      focusElementSafely(first);
+    }
+  };
+
+  const record = {
+    modalId,
+    keydownHandler: handler,
+    lastActiveElement: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    initialSelector: initialSelector || ""
+  };
+  state.modalFocus.stack.push(record);
+  modal.addEventListener("keydown", handler);
+
+  requestAnimationFrame(() => {
+    focusModalInitialTarget(modal, record.initialSelector);
   });
 }
 
 function releaseModalFocus(modalId, { restoreFocus = true } = {}) {
-  if (state.modalFocus.modalId !== modalId) return;
-  const modal = $(modalId);
-  if (modal && state.modalFocus.keydownHandler) {
-    modal.removeEventListener("keydown", state.modalFocus.keydownHandler);
+  const stack = Array.isArray(state.modalFocus.stack) ? state.modalFocus.stack : [];
+  if (stack.length === 0) return;
+
+  let index = -1;
+  for (let i = stack.length - 1; i >= 0; i -= 1) {
+    if (stack[i]?.modalId === modalId) {
+      index = i;
+      break;
+    }
+  }
+  if (index === -1) return;
+
+  const wasActiveRecord = index === stack.length - 1;
+  const [record] = stack.splice(index, 1);
+  detachModalFocusRecord(record);
+
+  const activeRecord = getActiveModalFocusRecord();
+  if (wasActiveRecord && activeRecord) {
+    attachModalFocusRecord(activeRecord);
+    requestAnimationFrame(() => {
+      const activeModal = $(activeRecord.modalId);
+      if (!activeModal) return;
+      focusModalInitialTarget(activeModal, activeRecord.initialSelector || "");
+    });
   }
 
-  const lastActiveElement = state.modalFocus.lastActiveElement;
-  state.modalFocus.modalId = null;
-  state.modalFocus.keydownHandler = null;
-  state.modalFocus.lastActiveElement = null;
-
-  if (restoreFocus && lastActiveElement instanceof HTMLElement) {
-    focusElementSafely(lastActiveElement);
+  if (restoreFocus && record?.lastActiveElement instanceof HTMLElement) {
+    focusElementSafely(record.lastActiveElement);
   }
 }
 
@@ -2630,6 +2726,1194 @@ async function invokeNodeCommand() {
   }
 }
 
+function toTrimmedString(value) {
+  if (value == null) return "";
+  return String(value).trim();
+}
+
+function normalizeTrimmedStringList(value) {
+  const source = Array.isArray(value) ? value : [];
+  const deduped = [];
+  const seen = new Set();
+  for (const item of source) {
+    const trimmed = toTrimmedString(item);
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    deduped.push(trimmed);
+  }
+  return deduped;
+}
+
+function formatPersonaScope(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => toTrimmedString(item)).filter(Boolean).join(", ");
+  }
+  if (value && typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "";
+    }
+  }
+  return toTrimmedString(value);
+}
+
+function normalizePersonaMemorySearch(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const defaultExtraPaths = normalizeTrimmedStringList(source.defaultExtraPaths);
+  const agentExtraPaths = normalizeTrimmedStringList(source.agentExtraPaths);
+  const effectiveExtraPaths = normalizeTrimmedStringList(
+    Array.isArray(source.effectiveExtraPaths)
+      ? source.effectiveExtraPaths
+      : [...defaultExtraPaths, ...agentExtraPaths]
+  );
+
+  return {
+    backend: toTrimmedString(source.backend) || "builtin",
+    defaultExtraPaths,
+    agentExtraPaths,
+    effectiveExtraPaths,
+    hasAgentOverride: source.hasAgentOverride === true
+  };
+}
+
+function unwrapPersonaPayload(payload, key) {
+  if (
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    !(key in payload) &&
+    payload.data &&
+    typeof payload.data === "object"
+  ) {
+    return payload.data;
+  }
+  return payload;
+}
+
+function isLikelyMissingPersonaFileError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  if (!message || message.includes("api endpoint not found") || message.includes("unsupported agent file")) {
+    return false;
+  }
+  return message.includes("enoent")
+    || message.includes("no such file")
+    || message.includes("missing file")
+    || (message.includes("file") && message.includes("not found"))
+    || (message.includes("workspace") && message.includes("not found"));
+}
+
+function looksLikeUrl(value) {
+  return /^(https?:\/\/|\/)/i.test(toTrimmedString(value));
+}
+
+function getPersonaFileLabel(fileName) {
+  const name = toTrimmedString(fileName);
+  return PERSONA_FILE_LABELS[name.toLowerCase()] || name.replace(/\.md$/i, "") || "未命名文件";
+}
+
+function getPersonaFileTabId(fileName) {
+  const slug = toTrimmedString(fileName)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `persona-file-tab-${slug || "item"}`;
+}
+
+function getPersonaAgentGlyph(agent) {
+  const emoji = toTrimmedString(agent?.emoji);
+  if (emoji) return Array.from(emoji).slice(0, 2).join("");
+
+  const avatar = toTrimmedString(agent?.avatar);
+  if (avatar && !looksLikeUrl(avatar)) {
+    return Array.from(avatar).slice(0, 2).join("");
+  }
+
+  const fallback = toTrimmedString(agent?.displayName || agent?.agentId || "A");
+  return Array.from(fallback).slice(0, 1).join("").toUpperCase() || "A";
+}
+
+function getPersonaDisplayName(agent) {
+  const name = toTrimmedString(agent?.displayName || agent?.agentId || "未命名 Agent");
+  const emoji = toTrimmedString(agent?.emoji);
+  return emoji ? `${emoji} ${name}` : name;
+}
+
+function resetPersonaFileState() {
+  state.persona.files = [];
+  state.persona.filesWorkspace = "";
+  state.persona.selectedFileName = "";
+  state.persona.fileContent = "";
+  state.persona.fileOriginalContent = "";
+  state.persona.fileMissing = false;
+  state.persona.filesLoading = false;
+  state.persona.fileLoading = false;
+  state.persona.fileSaving = false;
+  state.persona.filesError = "";
+  state.persona.fileError = "";
+}
+
+function normalizePersonaAgent(source, fallbackKey = "", index = 0) {
+  if (typeof source === "string") {
+    const raw = toTrimmedString(source);
+    const agentId = raw || toTrimmedString(fallbackKey) || `agent-${index + 1}`;
+    return {
+      agentId,
+      workspace: "",
+      defaultWorkspace: PERSONA_DEFAULT_WORKSPACE,
+      effectiveWorkspace: PERSONA_DEFAULT_WORKSPACE,
+      workspaceSource: "default",
+      displayName: raw || agentId,
+      emoji: "",
+      avatar: "",
+      avatarUrl: "",
+      theme: "",
+      memorySearch: normalizePersonaMemorySearch(null),
+      raw: { agentId }
+    };
+  }
+
+  const item = source && typeof source === "object" ? source : {};
+  const identity = item.identity && typeof item.identity === "object" ? item.identity : {};
+  const workspace = toTrimmedString(item.workspace || item.root || item.path || item.dir || "");
+  const defaultWorkspace = toTrimmedString(item.defaultWorkspace || "") || PERSONA_DEFAULT_WORKSPACE;
+  const effectiveWorkspace = toTrimmedString(item.effectiveWorkspace || workspace || defaultWorkspace || PERSONA_DEFAULT_WORKSPACE) || PERSONA_DEFAULT_WORKSPACE;
+  const fallbackId = toTrimmedString(fallbackKey) || workspace || `agent-${index + 1}`;
+  const agentId = toTrimmedString(item.agentId || item.id || item.key || fallbackId) || fallbackId;
+  const displayName = toTrimmedString(identity.name || item.name || item.label || item.displayName || workspace || agentId) || fallbackId;
+
+  return {
+    agentId,
+    workspace,
+    defaultWorkspace,
+    effectiveWorkspace,
+    workspaceSource: toTrimmedString(item.workspaceSource || "") || (workspace ? "agents.list.workspace" : "default"),
+    displayName,
+    emoji: toTrimmedString(identity.emoji || item.emoji || ""),
+    avatar: toTrimmedString(identity.avatar || item.avatar || ""),
+    avatarUrl: toTrimmedString(identity.avatarUrl || item.avatarUrl || ""),
+    theme: toTrimmedString(identity.theme || item.theme || ""),
+    memorySearch: normalizePersonaMemorySearch(item.memorySearch),
+    raw: item
+  };
+}
+
+function renderPersonaMemorySearchNote(agent) {
+  const info = normalizePersonaMemorySearch(agent?.memorySearch);
+  const extraPaths = info.effectiveExtraPaths;
+  const helperText = info.hasAgentOverride
+    ? "当前 Agent 追加了专属记忆检索路径。"
+    : "当前 Agent 继承默认记忆检索路径。";
+
+  return `
+    <div class="form-status-block persona-memory-note">
+      <div class="form-status-title"><i class="fa-solid fa-brain"></i>记忆检索</div>
+      <div class="persona-memory-meta">
+        <span>后端：<code class="persona-field-note-code">${escapeHtml(info.backend)}</code></span>
+        <span>${escapeHtml(helperText)}</span>
+      </div>
+      <p class="persona-inline-hint persona-memory-copy">
+        <code>MEMORY.md</code> 是当前工作区的人格长期记忆文件；如配置了额外路径，检索时还会一并纳入。
+      </p>
+      ${extraPaths.length > 0 ? `
+        <div class="persona-memory-paths" aria-label="记忆检索额外路径列表">
+          ${extraPaths.map((item) => `<code class="persona-memory-path">${escapeHtml(item)}</code>`).join("")}
+        </div>
+      ` : '<div class="persona-memory-empty">当前未配置额外检索路径。</div>'}
+    </div>
+  `;
+}
+
+function normalizePersonaListPayload(payload) {
+  const source = unwrapPersonaPayload(payload, "agents");
+  let entries = [];
+
+  if (Array.isArray(source)) {
+    entries = source.map((item, index) => [String(index), item]);
+  } else if (Array.isArray(source?.agents)) {
+    entries = source.agents.map((item, index) => [String(index), item]);
+  } else if (source?.agents && typeof source.agents === "object") {
+    entries = Object.entries(source.agents);
+  }
+
+  const defaultId = toTrimmedString(source?.defaultId || "");
+  const agents = entries
+    .map(([key, item], index) => normalizePersonaAgent(item, key, index))
+    .filter((agent) => Boolean(agent.agentId));
+
+  agents.sort((left, right) => {
+    if (left.agentId === defaultId && right.agentId !== defaultId) return -1;
+    if (right.agentId === defaultId && left.agentId !== defaultId) return 1;
+    return getPersonaDisplayName(left).localeCompare(getPersonaDisplayName(right), "zh-CN");
+  });
+
+  return {
+    defaultId,
+    mainKey: toTrimmedString(source?.mainKey || ""),
+    scope: formatPersonaScope(source?.scope),
+    agents
+  };
+}
+
+function mergePersonaFileNames(names = []) {
+  const ordered = [];
+  const seen = new Map();
+
+  const push = (value, { preferIncoming = false } = {}) => {
+    const raw = toTrimmedString(value);
+    if (!raw) return;
+    const key = raw.toLowerCase();
+    const existingIndex = seen.get(key);
+    if (existingIndex != null) {
+      if (preferIncoming) {
+        ordered[existingIndex] = raw;
+      }
+      return;
+    }
+    seen.set(key, ordered.length);
+    ordered.push(raw);
+  };
+
+  PERSONA_FALLBACK_FILES.forEach((name) => {
+    push(name);
+  });
+  for (const name of Array.isArray(names) ? names : []) {
+    push(name, { preferIncoming: true });
+  }
+  return ordered;
+}
+
+function normalizePersonaFilesPayload(payload) {
+  const source = unwrapPersonaPayload(payload, "files");
+  let rawFiles = [];
+
+  if (Array.isArray(source)) {
+    rawFiles = source;
+  } else if (Array.isArray(source?.files)) {
+    rawFiles = source.files;
+  } else if (Array.isArray(source?.items)) {
+    rawFiles = source.items;
+  } else if (Array.isArray(source?.names)) {
+    rawFiles = source.names;
+  }
+
+  const names = rawFiles
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object") {
+        if (item.name || item.fileName) {
+          return item.name || item.fileName || "";
+        }
+        if (typeof item.path === "string") {
+          const segments = item.path.split(/[\\/]/).filter(Boolean);
+          return segments[segments.length - 1] || "";
+        }
+      }
+      return "";
+    })
+    .map((item) => toTrimmedString(item))
+    .filter(Boolean);
+
+  return {
+    names: mergePersonaFileNames(names),
+    workspace: toTrimmedString(source?.workspace || "")
+  };
+}
+
+function getPersonaEffectiveWorkspace(agent = getSelectedPersonaAgent()) {
+  if (!agent) return PERSONA_DEFAULT_WORKSPACE;
+  const filesWorkspace = state.persona.selectedAgentId === agent.agentId ? toTrimmedString(state.persona.filesWorkspace) : "";
+  return filesWorkspace || toTrimmedString(agent.effectiveWorkspace || agent.workspace || agent.defaultWorkspace || PERSONA_DEFAULT_WORKSPACE) || PERSONA_DEFAULT_WORKSPACE;
+}
+
+function getPersonaWorkspaceSourceLabel(agent = getSelectedPersonaAgent()) {
+  if (!agent) return "来源：默认兜底 (~/.openclaw/workspace)";
+  const filesWorkspace = state.persona.selectedAgentId === agent.agentId ? toTrimmedString(state.persona.filesWorkspace) : "";
+  if (filesWorkspace) {
+    return "来源：agents.files.list.workspace";
+  }
+
+  const source = toTrimmedString(agent.workspaceSource || "default");
+  if (source === "agents.list.workspace") return "来源：agents.list.workspace";
+  if (source === "agents.defaults.workspace") return "来源：agents.defaults.workspace（继承）";
+  return "来源：默认兜底 (~/.openclaw/workspace)";
+}
+
+function normalizePersonaFilePayload(payload, fallbackName) {
+  const source = unwrapPersonaPayload(payload, "file");
+  const file = source?.file && typeof source.file === "object" ? source.file : source;
+
+  return {
+    name: toTrimmedString(file?.name || fallbackName) || fallbackName,
+    content: typeof file?.content === "string" ? file.content : "",
+    missing: file?.missing === true
+  };
+}
+
+function getSelectedPersonaAgent() {
+  return state.persona.agents.find((agent) => agent.agentId === state.persona.selectedAgentId) || null;
+}
+
+function resolvePersonaAgentSelection(agents, { preferredAgentId = "", preferredWorkspace = "" } = {}) {
+  const normalizedAgents = Array.isArray(agents) ? agents : [];
+  const findById = (value) => normalizedAgents.find((agent) => agent.agentId === value)?.agentId || "";
+  const findByWorkspace = (value) => normalizedAgents.find((agent) => (agent.effectiveWorkspace || agent.workspace) === value)?.agentId || "";
+
+  return (
+    findById(toTrimmedString(preferredAgentId)) ||
+    findByWorkspace(toTrimmedString(preferredWorkspace)) ||
+    findById(toTrimmedString(state.persona.selectedAgentId)) ||
+    findById(toTrimmedString(state.persona.defaultId)) ||
+    normalizedAgents[0]?.agentId ||
+    ""
+  );
+}
+
+function resolvePersonaFileSelection(files, preferredFileName = "") {
+  const normalizedFiles = Array.isArray(files) ? files : [];
+  const candidates = [preferredFileName, state.persona.selectedFileName, PERSONA_FALLBACK_FILES[0]]
+    .map((item) => toTrimmedString(item))
+    .filter(Boolean);
+
+  for (const candidate of candidates) {
+    const matched = normalizedFiles.find((name) => name.toUpperCase() === candidate.toUpperCase());
+    if (matched) return matched;
+  }
+
+  return normalizedFiles[0] || "";
+}
+
+function isPersonaFileDirty() {
+  return state.persona.fileContent !== state.persona.fileOriginalContent;
+}
+
+function isPersonaMetadataDirty() {
+  const agent = getSelectedPersonaAgent();
+  const nameInput = $("persona-agent-name");
+  const workspaceInput = $("persona-agent-workspace");
+  const avatarInput = $("persona-agent-avatar");
+  if (!agent || !nameInput || !workspaceInput || !avatarInput) return false;
+
+  const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
+  const isDefaultAgent = agent.agentId === state.persona.defaultId;
+
+  return toTrimmedString(nameInput.value) !== agent.displayName
+    || (!isDefaultAgent && toTrimmedString(workspaceInput.value) !== effectiveWorkspace)
+    || toTrimmedString(avatarInput.value) !== (agent.avatar || "");
+}
+
+function getPersonaDirtyDraftLabels({ ignore = [] } = {}) {
+  const ignored = new Set(Array.isArray(ignore) ? ignore : []);
+  const labels = [];
+
+  if (!ignored.has("metadata") && isPersonaMetadataDirty()) {
+    labels.push("Agent 元数据");
+  }
+  if (!ignored.has("file") && isPersonaFileDirty()) {
+    labels.push("文件内容");
+  }
+
+  return labels;
+}
+
+async function confirmDiscardPersonaDrafts({ ignore = [], actionLabel = "继续此操作" } = {}) {
+  const dirtyLabels = getPersonaDirtyDraftLabels({ ignore });
+  if (dirtyLabels.length === 0) return true;
+
+  return requestConfirmDialog({
+    title: "放弃未保存修改",
+    message: `以下内容尚未保存：${dirtyLabels.join("、")}。继续后将丢失这些修改，确定要${actionLabel}吗？`,
+    confirmText: "放弃修改",
+    cancelText: "继续编辑",
+    variant: "primary"
+  });
+}
+
+function renderPersonaPanelHeader({ iconClass, title, subtitle, actionsHtml = "" }) {
+  return `
+    <div class="panel-header persona-panel-header">
+      <div>
+        <div class="panel-title panel-title-foreground"><i class="${iconClass} panel-title-icon panel-title-icon-accent"></i>${title}</div>
+        <p class="persona-panel-caption">${subtitle}</p>
+      </div>
+      ${actionsHtml ? `<div class="panel-inline-list persona-panel-actions">${actionsHtml}</div>` : ""}
+    </div>
+  `;
+}
+
+function syncPersonaRefreshButtonState() {
+  const button = $("persona-refresh");
+  if (!button) return;
+  button.disabled = state.persona.loading;
+  button.innerHTML = state.persona.loading
+    ? '<i class="fa-solid fa-spinner fa-spin"></i> 载入中...'
+    : '<i class="fa-solid fa-rotate-right"></i> 重新加载';
+}
+
+function updatePersonaSummaryPills() {
+  const countPill = $("persona-agent-count-pill");
+  const defaultPill = $("persona-default-pill");
+  const scopePill = $("persona-scope-pill");
+
+  if (countPill) {
+    if (state.persona.loading) {
+      countPill.textContent = "Agent 列表载入中";
+    } else if (state.persona.listError) {
+      countPill.textContent = "列表读取失败";
+    } else if (state.persona.agents.length === 0) {
+      countPill.textContent = "暂无 Agent";
+    } else {
+      countPill.textContent = `共 ${state.persona.agents.length} 个 Agent`;
+    }
+  }
+
+  if (defaultPill) {
+    defaultPill.textContent = `默认 Agent：${state.persona.defaultId || "--"}`;
+  }
+
+  if (scopePill) {
+    scopePill.textContent = `作用域：${state.persona.scope || "--"}`;
+    scopePill.title = state.persona.mainKey ? `主入口：${state.persona.mainKey}` : "";
+  }
+}
+
+function renderPersonaAgentList() {
+  const container = $("persona-agent-list");
+  if (!container) return;
+
+  if (state.persona.loading) {
+    container.innerHTML = renderSkeleton(4);
+    return;
+  }
+
+  if (state.persona.listError) {
+    container.innerHTML = renderEmpty(
+      "fa-solid fa-circle-exclamation",
+      "Agent 列表加载失败",
+      escapeHtml(state.persona.listError)
+    );
+    return;
+  }
+
+  if (state.persona.agents.length === 0) {
+    container.innerHTML = renderEmpty(
+      "fa-solid fa-user-slash",
+      "暂无 Agent",
+      "先在左侧创建一个 Agent，再继续维护人格 / 提示词文件。"
+    );
+    return;
+  }
+
+  container.innerHTML = state.persona.agents
+    .map((agent) => {
+      const active = agent.agentId === state.persona.selectedAgentId;
+      const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
+      const isMain = state.persona.mainKey && (state.persona.mainKey === agent.agentId || state.persona.mainKey === effectiveWorkspace);
+      const badges = [];
+      if (agent.agentId === state.persona.defaultId) {
+        badges.push('<span class="status-badge status-badge-tight accent">默认</span>');
+      }
+      if (isMain) {
+        badges.push('<span class="status-badge status-badge-tight ok">主入口</span>');
+      }
+      if (agent.theme) {
+        badges.push(`<span class="status-badge status-badge-tight dynamic">${escapeHtml(agent.theme)}</span>`);
+      }
+      return `
+        <button type="button" class="persona-agent-card ${active ? "active" : ""}" data-persona-agent="${escapeHtml(agent.agentId)}" aria-pressed="${active ? "true" : "false"}">
+          <span class="persona-agent-bubble">${escapeHtml(getPersonaAgentGlyph(agent))}</span>
+          <span class="persona-agent-copy">
+            <span class="persona-agent-name">${escapeHtml(getPersonaDisplayName(agent))}</span>
+            <span class="persona-agent-workspace">${escapeHtml(getPersonaEffectiveWorkspace(agent))}</span>
+            <span class="persona-agent-id">${escapeHtml(agent.agentId)}</span>
+          </span>
+          <span class="persona-agent-badges">${badges.join("")}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderPersonaMetadataPanel() {
+  const container = $("persona-metadata-panel");
+  if (!container) return;
+
+  const headerBase = renderPersonaPanelHeader({
+    iconClass: "fa-solid fa-id-card",
+    title: "Agent 元数据",
+    subtitle: "维护当前 Agent 的名称、工作区与头像字段。"
+  });
+
+  if (state.persona.loading && state.persona.agents.length === 0) {
+    container.innerHTML = `${headerBase}<div class="persona-panel-body persona-panel-body-padding">${renderSkeleton(3)}</div>`;
+    return;
+  }
+
+  const agent = getSelectedPersonaAgent();
+  if (!agent) {
+    const subtitle = state.persona.listError
+      ? escapeHtml(state.persona.listError)
+      : "请先从左侧选择一个 Agent，或先创建新的 Agent。";
+    container.innerHTML = `${headerBase}${renderEmpty("fa-solid fa-user-astronaut", state.persona.listError ? "当前无法编辑 Agent" : "尚未选择 Agent", subtitle)}`;
+    return;
+  }
+
+  const isMain = state.persona.mainKey && (state.persona.mainKey === agent.agentId || state.persona.mainKey === getPersonaEffectiveWorkspace(agent));
+  const isDefaultAgent = agent.agentId === state.persona.defaultId;
+  const badges = [];
+  if (isDefaultAgent) {
+    badges.push('<span class="status-badge status-badge-tight accent">默认 Agent</span>');
+  }
+  if (isMain) {
+    badges.push('<span class="status-badge status-badge-tight ok">主入口</span>');
+  }
+  if (agent.theme) {
+    badges.push(`<span class="status-badge status-badge-tight dynamic">${escapeHtml(agent.theme)}</span>`);
+  }
+  if (agent.avatarUrl) {
+    badges.push('<span class="status-badge status-badge-tight warn">含头像链接</span>');
+  }
+
+  const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
+  const workspaceSourceLabel = getPersonaWorkspaceSourceLabel(agent);
+
+  container.innerHTML = `
+    ${renderPersonaPanelHeader({
+      iconClass: "fa-solid fa-id-card",
+      title: "Agent 元数据",
+      subtitle: "改动会通过现有网关桥接立即写回当前 Agent 配置。",
+      actionsHtml: badges.join("")
+    })}
+    <div class="persona-panel-body persona-detail-body">
+      <div class="persona-hero">
+        <div class="persona-hero-avatar">${escapeHtml(getPersonaAgentGlyph(agent))}</div>
+        <div class="persona-hero-copy">
+          <div class="persona-hero-title">${escapeHtml(getPersonaDisplayName(agent))}</div>
+          <div class="persona-hero-subtitle">${escapeHtml(agent.agentId)}</div>
+        </div>
+      </div>
+
+      <form id="persona-metadata-form" class="persona-form">
+        <div class="persona-form-grid">
+          <div class="config-row">
+            <label for="persona-agent-name">显示名称</label>
+            <input id="persona-agent-name" type="text" placeholder="例如：阿洛娜主控" />
+          </div>
+          <div class="config-row">
+            <label for="persona-agent-workspace">工作区</label>
+            <input id="persona-agent-workspace" type="text" class="form-control-mono" placeholder="例如：agents/arona-main" ${isDefaultAgent ? 'readonly aria-readonly="true"' : ''} />
+            <p class="persona-field-note">
+              当前生效：<code class="persona-field-note-code">${escapeHtml(effectiveWorkspace)}</code>
+              <span class="persona-field-note-source">${escapeHtml(workspaceSourceLabel)}</span>
+              ${isDefaultAgent ? '<span class="persona-field-note-warning">默认 Agent 工作区受保护，如需修改请与 🦞 沟通。</span>' : ''}
+            </p>
+          </div>
+          <div class="config-row persona-field-full">
+            <label for="persona-agent-avatar">头像字段</label>
+            <input id="persona-agent-avatar" type="text" placeholder="可选：填写头像标识或短文本" />
+          </div>
+        </div>
+
+        <p class="persona-inline-hint">
+          ${escapeHtml(effectiveWorkspace)} 中的人格 / 提示词正文请在下方文件编辑区维护；其中 <code>MEMORY.md</code> 就是长期记忆文件。
+        </p>
+
+        ${renderPersonaMemorySearchNote(agent)}
+
+        <div class="persona-detail-actions">
+          ${isDefaultAgent ? '<p class="persona-inline-hint persona-protected-note">默认 Agent 受保护：允许修改，但不提供删除操作。</p>' : `
+            <label class="persona-delete-toggle" for="persona-delete-files">
+              <input id="persona-delete-files" type="checkbox" />
+              <span>删除 Agent 时同时清理文件</span>
+            </label>
+          `}
+
+          <div class="form-inline-actions persona-inline-actions-wrap">
+            <button id="persona-agent-reset-btn" type="button" class="panel-action-btn btn-secondary btn-ghost" data-persona-agent-reset>恢复原值</button>
+            ${isDefaultAgent ? '' : `
+              <button id="persona-agent-delete-btn" type="button" class="panel-action-btn btn-secondary btn-danger" data-persona-agent-delete>
+                <i class="fa-regular fa-trash-can"></i> 删除 Agent
+              </button>
+            `}
+            <button id="persona-agent-save-btn" type="submit" class="btn-primary btn-primary-strong">
+              <i class="fa-solid fa-floppy-disk"></i> 保存元数据
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  `;
+
+  const nameInput = $("persona-agent-name");
+  const workspaceInput = $("persona-agent-workspace");
+  const avatarInput = $("persona-agent-avatar");
+  if (nameInput) nameInput.value = agent.displayName;
+  if (workspaceInput) workspaceInput.value = getPersonaEffectiveWorkspace(agent);
+  if (avatarInput) avatarInput.value = agent.avatar || "";
+  syncPersonaMetadataActionState();
+}
+
+function resetPersonaMetadataDraft() {
+  const agent = getSelectedPersonaAgent();
+  if (!agent) return;
+
+  const nameInput = $("persona-agent-name");
+  const workspaceInput = $("persona-agent-workspace");
+  const avatarInput = $("persona-agent-avatar");
+  if (nameInput) nameInput.value = agent.displayName;
+  if (workspaceInput) workspaceInput.value = getPersonaEffectiveWorkspace(agent);
+  if (avatarInput) avatarInput.value = agent.avatar || "";
+  syncPersonaMetadataActionState();
+}
+
+function getPersonaFileStatusMeta() {
+  if (state.persona.fileSaving) {
+    return { text: "正在保存", tone: "dynamic" };
+  }
+  if (state.persona.filesLoading || state.persona.fileLoading) {
+    return { text: "文件载入中", tone: "warn" };
+  }
+  if (state.persona.filesError || state.persona.fileError) {
+    return { text: "读取失败", tone: "bad" };
+  }
+  if (state.persona.fileMissing) {
+    return { text: isPersonaFileDirty() ? "待创建" : "文件未创建", tone: "warn" };
+  }
+  if (isPersonaFileDirty()) {
+    return { text: "未保存改动", tone: "dynamic" };
+  }
+  return { text: "已同步", tone: "ok" };
+}
+
+function renderPersonaFilesPanel() {
+  const container = $("persona-files-panel");
+  if (!container) return;
+
+  const headerBase = renderPersonaPanelHeader({
+    iconClass: "fa-solid fa-file-lines",
+    title: "人格 / 提示词文件",
+    subtitle: "在当前 Agent 工作区内直接维护 Identity、Soul 与系统提示词资产。"
+  });
+
+  if (state.persona.loading && state.persona.agents.length === 0) {
+    container.innerHTML = `${headerBase}<div class="persona-panel-body persona-panel-body-padding">${renderSkeleton(4)}</div>`;
+    return;
+  }
+
+  const agent = getSelectedPersonaAgent();
+  if (!agent) {
+    const subtitle = state.persona.listError
+      ? "请先恢复 Agent 列表读取，再继续编辑提示词文件。"
+      : "选择一个 Agent 后，就可以查看并编辑它的人格 / 提示词文件。";
+    container.innerHTML = `${headerBase}${renderEmpty("fa-solid fa-scroll", "暂无可编辑文件", subtitle)}`;
+    return;
+  }
+
+  const selectedFile = resolvePersonaFileSelection(state.persona.files, state.persona.selectedFileName);
+  const statusMeta = getPersonaFileStatusMeta();
+  const headerHtml = renderPersonaPanelHeader({
+    iconClass: "fa-solid fa-file-lines",
+    title: "人格 / 提示词文件",
+    subtitle: `当前 Agent：${escapeHtml(getPersonaDisplayName(agent))}`,
+    actionsHtml: `
+      <span id="persona-file-status-pill" class="status-badge status-badge-tight ${statusMeta.tone}" role="status" aria-live="polite">${statusMeta.text}</span>
+      <button id="persona-file-reload-btn" type="button" class="panel-action-btn btn-secondary" data-persona-file-reload>
+        <i class="fa-solid fa-rotate-right"></i> 重新读取
+      </button>
+      <button id="persona-file-save-btn" type="button" class="btn-primary btn-primary-strong" data-persona-file-save>
+        <i class="fa-solid fa-floppy-disk"></i> 保存文件
+      </button>
+    `
+  });
+
+  if (state.persona.filesError) {
+    container.innerHTML = `${headerHtml}${renderEmpty("fa-solid fa-file-circle-xmark", "文件列表加载失败", escapeHtml(state.persona.filesError))}`;
+    syncPersonaFileEditorState();
+    return;
+  }
+
+  const tabsHtml = state.persona.files
+    .map((fileName) => {
+      const active = fileName.toUpperCase() === selectedFile.toUpperCase();
+      const tabId = getPersonaFileTabId(fileName);
+      return `
+        <button id="${escapeHtml(tabId)}" type="button" class="persona-file-tab ${active ? "active" : ""}" data-persona-file-tab="${escapeHtml(fileName)}" title="${escapeHtml(fileName)}" role="tab" aria-selected="${active ? "true" : "false"}" aria-controls="persona-file-panel" tabindex="${active ? "0" : "-1"}">
+          ${escapeHtml(getPersonaFileLabel(fileName))}
+        </button>
+      `;
+    })
+    .join("");
+
+  const activeTabId = selectedFile ? getPersonaFileTabId(selectedFile) : "";
+
+  let bodyHtml = "";
+  if (state.persona.filesLoading || state.persona.fileLoading) {
+    bodyHtml = `<div class="persona-panel-body persona-panel-body-padding">${renderSkeleton(5)}</div>`;
+  } else if (state.persona.fileError) {
+    bodyHtml = renderEmpty("fa-solid fa-file-circle-exclamation", "文件读取失败", escapeHtml(state.persona.fileError));
+  } else {
+    const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
+    const details = [effectiveWorkspace ? `工作区：${effectiveWorkspace}` : "", agent.agentId !== effectiveWorkspace ? `Agent ID：${agent.agentId}` : ""]
+      .filter(Boolean)
+      .join(" · ");
+    const fileHint = state.persona.fileMissing
+      ? `
+        <div class="form-status-block form-status-warning persona-file-status-block">
+          <div class="form-status-title"><i class="fa-solid fa-triangle-exclamation"></i>文件尚未创建</div>
+          <div>${escapeHtml(selectedFile)} 当前不存在，保存后会按当前内容自动创建。</div>
+        </div>
+      `
+      : '<p class="persona-inline-hint persona-file-hint">支持直接编辑纯文本提示词资产，保存后将同步到网关。</p>';
+
+    bodyHtml = `
+      <div id="persona-file-panel" class="persona-panel-body persona-file-content" role="tabpanel" aria-labelledby="${escapeHtml(activeTabId)}">
+        <div class="persona-file-toolbar">
+          <div class="persona-file-copy">
+            <div class="persona-file-title">${escapeHtml(selectedFile)}</div>
+            <div class="persona-file-subtitle">${escapeHtml(getPersonaFileLabel(selectedFile))}${details ? ` · ${escapeHtml(details)}` : ""}</div>
+          </div>
+        </div>
+        ${fileHint}
+        <textarea id="persona-file-editor" class="skeuo-textarea persona-file-editor" rows="20" spellcheck="false" aria-label="${escapeHtml(selectedFile)} 文件内容"></textarea>
+      </div>
+    `;
+  }
+
+  container.innerHTML = `${headerHtml}<div class="persona-file-tabs" role="tablist" aria-label="Persona 文件列表">${tabsHtml}</div>${bodyHtml}`;
+
+  const editor = $("persona-file-editor");
+  if (editor) {
+    editor.value = state.persona.fileContent;
+  }
+  syncPersonaFileEditorState();
+}
+
+function syncPersonaMetadataActionState() {
+  const saveBtn = $("persona-agent-save-btn");
+  const deleteBtn = $("persona-agent-delete-btn");
+  const resetBtn = $("persona-agent-reset-btn");
+  const dirty = isPersonaMetadataDirty();
+
+  if (saveBtn) {
+    saveBtn.disabled = state.persona.metadataSaving || !dirty;
+    saveBtn.innerHTML = state.persona.metadataSaving
+      ? '<i class="fa-solid fa-spinner fa-spin"></i> 保存中...'
+      : '<i class="fa-solid fa-floppy-disk"></i> 保存元数据';
+  }
+  if (deleteBtn) deleteBtn.disabled = state.persona.metadataSaving;
+  if (resetBtn) resetBtn.disabled = state.persona.metadataSaving || !dirty;
+}
+
+function syncPersonaFileEditorState() {
+  const editor = $("persona-file-editor");
+  if (editor) {
+    state.persona.fileContent = editor.value;
+    editor.readOnly = state.persona.fileLoading || state.persona.fileSaving;
+  }
+
+  const statusPill = $("persona-file-status-pill");
+  const meta = getPersonaFileStatusMeta();
+  if (statusPill) {
+    statusPill.className = `status-badge status-badge-tight ${meta.tone}`;
+    statusPill.textContent = meta.text;
+  }
+
+  const reloadBtn = $("persona-file-reload-btn");
+  if (reloadBtn) {
+    reloadBtn.disabled = state.persona.filesLoading || state.persona.fileLoading || state.persona.fileSaving || !state.persona.selectedFileName;
+  }
+
+  const saveBtn = $("persona-file-save-btn");
+  if (saveBtn) {
+    const canSave = Boolean(state.persona.selectedFileName)
+      && !state.persona.filesLoading
+      && !state.persona.fileLoading
+      && !state.persona.fileSaving
+      && !state.persona.filesError
+      && !state.persona.fileError
+      && (state.persona.fileMissing || isPersonaFileDirty());
+    saveBtn.disabled = !canSave;
+    saveBtn.innerHTML = state.persona.fileSaving
+      ? '<i class="fa-solid fa-spinner fa-spin"></i> 保存中...'
+      : '<i class="fa-solid fa-floppy-disk"></i> 保存文件';
+  }
+}
+
+async function loadPersona({ preferredAgentId = "", preferredWorkspace = "", preferredFileName = "" } = {}) {
+  const requestId = ++state.persona.listRequestId;
+  state.persona.loading = true;
+  state.persona.listError = "";
+  state.persona.metadataSaving = false;
+  updatePersonaSummaryPills();
+  syncPersonaRefreshButtonState();
+  renderPersonaAgentList();
+  renderPersonaMetadataPanel();
+  renderPersonaFilesPanel();
+
+  try {
+    const data = await api("/api/agents");
+    if (requestId !== state.persona.listRequestId) return;
+
+    const normalized = normalizePersonaListPayload(data);
+    state.persona.agents = normalized.agents;
+    state.persona.defaultId = normalized.defaultId;
+    state.persona.mainKey = normalized.mainKey;
+    state.persona.scope = normalized.scope;
+    state.persona.loading = false;
+    state.persona.selectedAgentId = resolvePersonaAgentSelection(normalized.agents, {
+      preferredAgentId,
+      preferredWorkspace
+    });
+
+    if (!state.persona.selectedAgentId) {
+      resetPersonaFileState();
+    }
+
+    updatePersonaSummaryPills();
+    syncPersonaRefreshButtonState();
+    renderPersonaAgentList();
+    renderPersonaMetadataPanel();
+    renderPersonaFilesPanel();
+
+    if (state.persona.selectedAgentId) {
+      await loadPersonaFiles(state.persona.selectedAgentId, { preferredFileName });
+    }
+  } catch (err) {
+    if (requestId !== state.persona.listRequestId) return;
+    state.persona.loading = false;
+    state.persona.listError = err.message || String(err);
+    state.persona.agents = [];
+    state.persona.defaultId = "";
+    state.persona.mainKey = "";
+    state.persona.scope = "";
+    state.persona.selectedAgentId = "";
+    resetPersonaFileState();
+    updatePersonaSummaryPills();
+    syncPersonaRefreshButtonState();
+    renderPersonaAgentList();
+    renderPersonaMetadataPanel();
+    renderPersonaFilesPanel();
+  }
+}
+
+async function selectPersonaAgent(agentId) {
+  const nextId = toTrimmedString(agentId);
+  if (!nextId || nextId === state.persona.selectedAgentId) return;
+
+  const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "切换 Agent" });
+  if (!shouldContinue) return;
+
+  const preferredFileName = state.persona.selectedFileName;
+  state.persona.selectedAgentId = nextId;
+  resetPersonaFileState();
+  renderPersonaAgentList();
+  renderPersonaMetadataPanel();
+  renderPersonaFilesPanel();
+  await loadPersonaFiles(nextId, { preferredFileName });
+}
+
+async function loadPersonaFiles(agentId, { preferredFileName = "" } = {}) {
+  const currentAgentId = toTrimmedString(agentId);
+  if (!currentAgentId) return;
+
+  const requestId = ++state.persona.filesRequestId;
+  state.persona.filesLoading = true;
+  state.persona.filesError = "";
+  state.persona.fileError = "";
+  state.persona.fileLoading = false;
+  state.persona.fileSaving = false;
+  state.persona.files = mergePersonaFileNames([]);
+  state.persona.filesWorkspace = "";
+  state.persona.selectedFileName = resolvePersonaFileSelection(state.persona.files, preferredFileName);
+  state.persona.fileContent = "";
+  state.persona.fileOriginalContent = "";
+  state.persona.fileMissing = false;
+  renderPersonaFilesPanel();
+
+  try {
+    const data = await api(`/api/agents/files?agentId=${encodeURIComponent(currentAgentId)}`);
+    if (requestId !== state.persona.filesRequestId || state.persona.selectedAgentId !== currentAgentId) return;
+
+    const normalized = normalizePersonaFilesPayload(data);
+    state.persona.files = normalized.names;
+    state.persona.filesWorkspace = normalized.workspace;
+    state.persona.filesLoading = false;
+    state.persona.selectedFileName = resolvePersonaFileSelection(state.persona.files, preferredFileName);
+    renderPersonaFilesPanel();
+
+    if (state.persona.selectedFileName) {
+      await loadPersonaFile(currentAgentId, state.persona.selectedFileName);
+    }
+  } catch (err) {
+    if (requestId !== state.persona.filesRequestId || state.persona.selectedAgentId !== currentAgentId) return;
+    state.persona.filesLoading = false;
+    if (isLikelyMissingPersonaFileError(err)) {
+      state.persona.files = mergePersonaFileNames([]);
+      state.persona.filesWorkspace = "";
+      state.persona.selectedFileName = resolvePersonaFileSelection(state.persona.files, preferredFileName);
+      state.persona.filesError = "";
+      renderPersonaFilesPanel();
+
+      if (state.persona.selectedFileName) {
+        await loadPersonaFile(currentAgentId, state.persona.selectedFileName);
+      }
+      return;
+    }
+    state.persona.files = [];
+    state.persona.filesWorkspace = "";
+    state.persona.selectedFileName = "";
+    state.persona.filesError = err.message || String(err);
+    renderPersonaFilesPanel();
+  }
+}
+
+async function loadPersonaFile(agentId, fileName) {
+  const currentAgentId = toTrimmedString(agentId);
+  const targetFileName = toTrimmedString(fileName);
+  if (!currentAgentId || !targetFileName) return;
+
+  const requestId = ++state.persona.fileRequestId;
+  state.persona.selectedFileName = targetFileName;
+  state.persona.fileLoading = true;
+  state.persona.fileSaving = false;
+  state.persona.fileError = "";
+  renderPersonaFilesPanel();
+
+  try {
+    const data = await api(`/api/agents/file?agentId=${encodeURIComponent(currentAgentId)}&name=${encodeURIComponent(targetFileName)}`);
+    if (
+      requestId !== state.persona.fileRequestId ||
+      state.persona.selectedAgentId !== currentAgentId ||
+      state.persona.selectedFileName.toUpperCase() !== targetFileName.toUpperCase()
+    ) {
+      return;
+    }
+
+    const normalized = normalizePersonaFilePayload(data, targetFileName);
+    if (!state.persona.files.some((name) => name.toUpperCase() === normalized.name.toUpperCase())) {
+      state.persona.files = mergePersonaFileNames([...state.persona.files, normalized.name]);
+    }
+    state.persona.selectedFileName = normalized.name;
+    state.persona.fileContent = normalized.content;
+    state.persona.fileOriginalContent = normalized.content;
+    state.persona.fileMissing = normalized.missing === true;
+    state.persona.fileLoading = false;
+    renderPersonaFilesPanel();
+  } catch (err) {
+    if (requestId !== state.persona.fileRequestId || state.persona.selectedAgentId !== currentAgentId) return;
+    state.persona.fileLoading = false;
+    if (isLikelyMissingPersonaFileError(err)) {
+      if (!state.persona.files.some((name) => name.toLowerCase() === targetFileName.toLowerCase())) {
+        state.persona.files = mergePersonaFileNames([...state.persona.files, targetFileName]);
+      }
+      state.persona.fileContent = "";
+      state.persona.fileOriginalContent = "";
+      state.persona.fileMissing = true;
+      state.persona.fileError = "";
+      renderPersonaFilesPanel();
+      return;
+    }
+    state.persona.fileContent = "";
+    state.persona.fileOriginalContent = "";
+    state.persona.fileMissing = false;
+    state.persona.fileError = err.message || String(err);
+    renderPersonaFilesPanel();
+  }
+}
+
+async function createPersonaAgent() {
+  const form = $("persona-create-form");
+  const submitBtn = $("persona-create-submit");
+  const name = toTrimmedString($("persona-create-name")?.value);
+  const workspace = toTrimmedString($("persona-create-workspace")?.value);
+  const emoji = toTrimmedString($("persona-create-emoji")?.value);
+  const avatar = toTrimmedString($("persona-create-avatar")?.value);
+
+  if (!name) {
+    showToast("请先填写 Agent 名称", "warning");
+    return;
+  }
+  if (!workspace) {
+    showToast("请先填写工作区路径", "warning");
+    return;
+  }
+
+  const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "创建并切换到新 Agent" });
+  if (!shouldContinue) return;
+
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 创建中...';
+  }
+
+  try {
+    const body = { name, workspace };
+    if (emoji) body.emoji = emoji;
+    if (avatar) body.avatar = avatar;
+
+    const result = await api("/api/agents/create", {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
+    const createdAgentId = toTrimmedString(result?.data?.agentId || result?.agentId || "");
+
+    showToast(`Agent ${name} 已创建`, "success");
+    form?.reset();
+    await loadPersona({
+      preferredAgentId: createdAgentId,
+      preferredWorkspace: workspace,
+      preferredFileName: PERSONA_FALLBACK_FILES[0]
+    });
+  } catch (err) {
+    showToast(err.message || String(err), "error");
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = '<i class="fa-solid fa-plus"></i> 创建 Agent';
+    }
+  }
+}
+
+async function saveSelectedPersonaAgent() {
+  const agent = getSelectedPersonaAgent();
+  if (!agent) return;
+
+  const draftName = toTrimmedString($("persona-agent-name")?.value);
+  const draftWorkspace = toTrimmedString($("persona-agent-workspace")?.value);
+  const draftAvatar = toTrimmedString($("persona-agent-avatar")?.value);
+  const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
+  const isDefaultAgent = agent.agentId === state.persona.defaultId;
+
+  if (!draftName) {
+    showToast("Agent 名称不能为空", "warning");
+    return;
+  }
+  if (!draftWorkspace) {
+    showToast("工作区不能为空", "warning");
+    return;
+  }
+  if (isDefaultAgent && draftWorkspace !== effectiveWorkspace) {
+    showToast("默认 Agent 工作区受保护，如需修改请与 🦞 沟通", "warning");
+    return;
+  }
+
+  const payload = { agentId: agent.agentId };
+  if (draftName !== agent.displayName) payload.name = draftName;
+  if (!isDefaultAgent && draftWorkspace !== effectiveWorkspace) payload.workspace = draftWorkspace;
+  if (draftAvatar !== (agent.avatar || "")) payload.avatar = draftAvatar;
+
+  if (Object.keys(payload).length === 1) {
+    showToast("当前没有需要保存的元数据改动", "warning");
+    return;
+  }
+
+  const shouldContinue = await confirmDiscardPersonaDrafts({
+    ignore: ["metadata"],
+    actionLabel: "保存元数据并刷新 Agent"
+  });
+  if (!shouldContinue) return;
+
+  state.persona.metadataSaving = true;
+  syncPersonaMetadataActionState();
+
+  try {
+    await api("/api/agents/update", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    showToast(`Agent ${draftName} 已更新`, "success");
+    await loadPersona({
+      preferredAgentId: agent.agentId,
+      preferredWorkspace: draftWorkspace,
+      preferredFileName: state.persona.selectedFileName
+    });
+  } catch (err) {
+    showToast(err.message || String(err), "error");
+  } finally {
+    state.persona.metadataSaving = false;
+    syncPersonaMetadataActionState();
+  }
+}
+
+async function deleteSelectedPersonaAgent() {
+  const agent = getSelectedPersonaAgent();
+  if (!agent) return;
+  if (agent.agentId === state.persona.defaultId) {
+    showToast("默认 Agent 受保护，不能删除", "warning");
+    return;
+  }
+
+  const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "删除当前 Agent" });
+  if (!shouldContinue) return;
+
+  const deleteFiles = $("persona-delete-files")?.checked === true;
+  const label = getPersonaDisplayName(agent);
+  const confirmed = await requestConfirmDialog({
+    title: "删除 Agent",
+    message: deleteFiles
+      ? `确定删除 ${label} 吗？\n这会同时删除该 Agent 关联的人格 / 提示词文件。`
+      : `确定删除 ${label} 吗？\nAgent 配置会被删除，文件会保留在工作区中。`,
+    confirmText: deleteFiles ? "删除 Agent 与文件" : "删除 Agent",
+    cancelText: "取消",
+    variant: "danger"
+  });
+  if (!confirmed) return;
+
+  state.persona.metadataSaving = true;
+  syncPersonaMetadataActionState();
+
+  try {
+    await api("/api/agents/delete", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.agentId, deleteFiles })
+    });
+    showToast(`Agent ${label} 已删除`, "success");
+    await loadPersona();
+  } catch (err) {
+    showToast(err.message || String(err), "error");
+  } finally {
+    state.persona.metadataSaving = false;
+    syncPersonaMetadataActionState();
+  }
+}
+
+async function savePersonaFile() {
+  const agent = getSelectedPersonaAgent();
+  const fileName = toTrimmedString(state.persona.selectedFileName);
+  if (!agent || !fileName) return;
+
+  const editor = $("persona-file-editor");
+  if (editor) {
+    state.persona.fileContent = editor.value;
+  }
+
+  if (!state.persona.fileMissing && !isPersonaFileDirty()) {
+    showToast("当前文件没有新的改动", "warning");
+    return;
+  }
+
+  state.persona.fileSaving = true;
+  syncPersonaFileEditorState();
+
+  try {
+    await api("/api/agents/file", {
+      method: "POST",
+      body: JSON.stringify({
+        agentId: agent.agentId,
+        name: fileName,
+        content: state.persona.fileContent
+      })
+    });
+    showToast(`${fileName} 已保存`, "success");
+    await loadPersonaFile(agent.agentId, fileName);
+  } catch (err) {
+    showToast(err.message || String(err), "error");
+  } finally {
+    state.persona.fileSaving = false;
+    syncPersonaFileEditorState();
+  }
+}
+
 function setChatViewActive(active) {
   state.chat.viewActive = active === true;
   if (!state.chat.viewActive) {
@@ -4367,9 +5651,17 @@ function bindEvents() {
   $("models-provider-delete-current")?.addEventListener("click", deleteCurrentProvider);
 
   for (const nav of document.querySelectorAll("#nav-menu .nav-item")) {
-    nav.addEventListener("click", (event) => {
+    nav.addEventListener("click", async (event) => {
       event.preventDefault();
-      setView(nav.dataset.view);
+      const nextView = nav.dataset.view || "";
+      if (!nextView) return;
+
+      if (state.currentView === "persona" && nextView !== "persona") {
+        const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "切换到其他视图" });
+        if (!shouldContinue) return;
+      }
+
+      setView(nextView);
       $("sidebar")?.classList.remove("active");
     });
   }
@@ -4398,6 +5690,88 @@ function bindEvents() {
       }
     });
   }
+
+  $("persona-refresh")?.addEventListener("click", async () => {
+    const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "重新加载 Persona 数据" });
+    if (!shouldContinue) return;
+
+    await loadPersona({
+      preferredAgentId: state.persona.selectedAgentId,
+      preferredFileName: state.persona.selectedFileName
+    });
+  });
+
+  $("persona-create-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await createPersonaAgent();
+  });
+
+  $("persona-agent-list")?.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-persona-agent]");
+    if (!button) return;
+    const agentId = button.getAttribute("data-persona-agent") || "";
+    await selectPersonaAgent(agentId);
+  });
+
+  $("persona-metadata-panel")?.addEventListener("submit", async (event) => {
+    if (!event.target.closest("#persona-metadata-form")) return;
+    event.preventDefault();
+    await saveSelectedPersonaAgent();
+  });
+
+  $("persona-metadata-panel")?.addEventListener("click", async (event) => {
+    if (event.target.closest("[data-persona-agent-reset]")) {
+      resetPersonaMetadataDraft();
+      return;
+    }
+    if (event.target.closest("[data-persona-agent-delete]")) {
+      await deleteSelectedPersonaAgent();
+    }
+  });
+
+  $("persona-metadata-panel")?.addEventListener("input", (event) => {
+    if (["persona-agent-name", "persona-agent-workspace", "persona-agent-avatar"].includes(event.target.id)) {
+      syncPersonaMetadataActionState();
+    }
+  });
+
+  $("persona-files-panel")?.addEventListener("click", async (event) => {
+    const tab = event.target.closest("[data-persona-file-tab]");
+    if (tab) {
+      const fileName = tab.getAttribute("data-persona-file-tab") || "";
+      const agent = getSelectedPersonaAgent();
+      if (!agent || !fileName || fileName.toUpperCase() === state.persona.selectedFileName.toUpperCase()) return;
+      const shouldContinue = await confirmDiscardPersonaDrafts({
+        ignore: ["metadata"],
+        actionLabel: "切换到其他文件"
+      });
+      if (!shouldContinue) return;
+      await loadPersonaFile(agent.agentId, fileName);
+      return;
+    }
+
+    if (event.target.closest("[data-persona-file-reload]")) {
+      const agent = getSelectedPersonaAgent();
+      if (!agent || !state.persona.selectedFileName) return;
+      const shouldContinue = await confirmDiscardPersonaDrafts({
+        ignore: ["metadata"],
+        actionLabel: "重新读取当前文件"
+      });
+      if (!shouldContinue) return;
+      await loadPersonaFile(agent.agentId, state.persona.selectedFileName);
+      return;
+    }
+
+    if (event.target.closest("[data-persona-file-save]")) {
+      await savePersonaFile();
+    }
+  });
+
+  $("persona-files-panel")?.addEventListener("input", (event) => {
+    if (event.target.id !== "persona-file-editor") return;
+    state.persona.fileContent = event.target.value;
+    syncPersonaFileEditorState();
+  });
 
   const providerMatrix = $("models-provider-matrix");
   providerMatrix?.addEventListener("click", (event) => {
