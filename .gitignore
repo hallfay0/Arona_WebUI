@@ -48,7 +48,20 @@ CLAUDE.md
 .sisyphus/
 docs/
 openclaw-src/
-.trellis/
+
+# trellis: keep project-level specs/workflow/scripts, ignore local runtime state
+.trellis/*
+!.trellis/.gitignore
+!.trellis/.version
+!.trellis/config.yaml
+!.trellis/workflow.md
+!.trellis/worktree.yaml
+!.trellis/spec/
+!.trellis/spec/**
+!.trellis/scripts/
+!.trellis/scripts/**
+.trellis/tasks/
+.trellis/workspace/
 .opencode/
 .agents/
 AGENTS.md
