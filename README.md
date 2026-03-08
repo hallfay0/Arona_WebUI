@@ -1,13 +1,16 @@
 # OpenClaw MVP Console
 
-A minimal single-page dashboard for OpenClaw with six modules:
+A minimal single-page dashboard for OpenClaw with these primary modules:
 
 - Overview
 - Models
 - Skills
 - Cron
-- Nodes
+- Chat
+- Persona
 - Logs
+
+Node management APIs and the retained `#view-nodes` implementation still exist in the codebase, but the unfinished Nodes surface is not currently exposed from the main sidebar.
 
 ## Runtime
 

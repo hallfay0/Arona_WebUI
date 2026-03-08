@@ -48,10 +48,11 @@ Rendered into `index.html` sections by `app.js`:
 | 模型管理 (Models) | `#view-models` | `GET /api/models`, `POST /api/models/save` |
 | 技能状态 (Skills) | `#view-skills` | `GET /api/skills`, `POST /api/skills/update`, `POST /api/skills/install` |
 | 任务计划 (Cron) | `#view-cron` | `GET /api/cron/list`, `GET /api/cron/runs`, `POST /api/cron/add\|update\|remove\|run` |
-| 节点拓扑 (Nodes) | `#view-nodes` | `GET /api/nodes`, `GET /api/nodes/describe`, `POST /api/nodes/invoke` |
 | 实时日志 (Logs) | `#view-logs` | `GET /api/logs` (polled) |
 | Playground (Chat) | `#view-chat` | `GET /api/gateway-auth` + Gateway WS RPC (`sessions.list`, `sessions.patch`, `chat.history`, `chat.send`) |
 | 人格与提示词 (Persona) | `#view-persona` | `GET /api/agents`, `POST /api/agents/*`, `GET /api/agents/files`, `GET/POST /api/agents/file` |
+
+- Retained hidden surface: `#view-nodes` still exists in `public/index.html`, and its loader continues to use `GET /api/nodes`, `GET /api/nodes/describe`, and `POST /api/nodes/invoke`, but it is not currently exposed in the main sidebar.
 
 ---
 
