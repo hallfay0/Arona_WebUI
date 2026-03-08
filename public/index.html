@@ -84,6 +84,14 @@
           <i class="fa-solid fa-user-gear"></i>
           <span>人格与提示词</span>
         </a>
+        <a data-view="nodes" class="nav-item">
+          <i class="fa-solid fa-diagram-project"></i>
+          <span>节点拓扑</span>
+        </a>
+        <a data-view="usage" class="nav-item">
+          <i class="fa-solid fa-chart-simple"></i>
+          <span>用量统计</span>
+        </a>
         <a data-view="logs" class="nav-item">
           <i class="fa-solid fa-terminal"></i>
           <span>实时日志</span>
@@ -412,16 +420,43 @@
             <h2 class="view-shell-title">节点拓扑</h2>
             <p class="view-shell-subtitle">实时监控和控制网络中配对的设备终端。</p>
           </div>
+          <button type="button" id="nodes-refresh" class="panel-action-btn btn-secondary"><i class="fa-solid fa-rotate-right"></i>
+            刷新节点</button>
         </div>
-        <div class="glass-panel" id="nodes-list"></div>
-        <div class="glass-panel node-invoke-panel">
-          <div class="config-row"><label>Node ID</label><input id="node-id" type="text" /></div>
-          <div class="config-row"><label>Command</label><input id="node-command" type="text"
-              list="node-command-options" /></div>
-          <datalist id="node-command-options"></datalist>
-          <div class="config-row"><label>Params (JSON)</label><textarea id="node-params" rows="3">{}</textarea></div>
-          <div class="node-invoke-actions"><button type="button" id="node-invoke" class="btn-primary">执行命令</button></div>
-          <pre id="node-result" class="result node-result-panel"></pre>
+        <div id="nodes-list"></div>
+        <div id="nodes-pairing"></div>
+        <div id="nodes-detail" class="glass-panel node-detail-panel" data-spotlight hidden>
+          <div class="node-detail-head">
+            <div>
+              <h3 id="node-detail-title" class="node-detail-title">节点详情</h3>
+              <p id="node-detail-subtitle" class="node-detail-subtitle">--</p>
+            </div>
+            <button type="button" id="node-detail-close" class="panel-action-btn btn-secondary btn-size-sm" title="收起详情">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+          <div id="node-detail-body" class="node-detail-body"></div>
+          <div class="node-invoke-section">
+            <div class="node-invoke-head">
+              <span class="node-invoke-head-label"><i class="fa-solid fa-terminal"></i> 命令调用</span>
+            </div>
+            <div class="node-invoke-form">
+              <input id="node-id" type="hidden" />
+              <div class="config-row config-row-inline">
+                <label for="node-command">命令</label>
+                <input id="node-command" type="text" list="node-command-options" placeholder="选择或输入命令" />
+                <datalist id="node-command-options"></datalist>
+              </div>
+              <div class="config-row config-row-inline">
+                <label for="node-params">参数 (JSON)</label>
+                <textarea id="node-params" rows="2">{}</textarea>
+              </div>
+              <div class="node-invoke-actions">
+                <button type="button" id="node-invoke" class="btn-primary btn-size-sm"><i class="fa-solid fa-play"></i> 执行命令</button>
+              </div>
+            </div>
+            <pre id="node-result" class="result node-result-panel"></pre>
+          </div>
         </div>
       </section>
 
@@ -556,6 +591,18 @@
             </div>
           </section>
         </div>
+      </section>
+
+      <section id="view-usage" class="view">
+        <div class="view-shell-head">
+          <div class="view-shell-copy">
+            <h2 class="view-shell-title">用量统计</h2>
+            <p class="view-shell-subtitle">一览模型调用、渠道消耗与会话使用情况。</p>
+          </div>
+          <button type="button" id="usage-refresh" class="panel-action-btn btn-secondary"><i class="fa-solid fa-rotate-right"></i>
+            刷新数据</button>
+        </div>
+        <div id="usage-content"></div>
       </section>
 
       <section id="view-logs" class="view">

@@ -81,6 +81,19 @@
     "timeoutMs": 15000
   }
   ```
+- `GET /api/nodes/pairing` — list pending pairing requests
+- `POST /api/nodes/pairing/approve`
+  ```json
+  { "requestId": "<request id>" }
+  ```
+- `POST /api/nodes/pairing/reject`
+  ```json
+  { "requestId": "<request id>" }
+  ```
+- `POST /api/nodes/rename`
+  ```json
+  { "nodeId": "<node id>", "displayName": "<new name>" }
+  ```
 
 #### Logs
 - `GET /api/logs?cursor=<number>&limit=<number>`
@@ -127,6 +140,9 @@
 - `/api/nodes` returns raw gateway payload; browser reads `nodeId`, `displayName`, `platform`, `remoteIp`, `caps`, `commands`, `connected`.
 - `/api/nodes/describe` requires `nodeId` at HTTP layer.
 - `/api/nodes/invoke` forwards `nodeId`, `command`, `params`, `timeoutMs`, and injects a fresh `idempotencyKey` server-side.
+- `/api/nodes/pairing` returns raw gateway `node.pair.list` payload.
+- `/api/nodes/pairing/approve` and `/api/nodes/pairing/reject` require `requestId`; return `{ ok: true, data }`.
+- `/api/nodes/rename` requires `nodeId` and `displayName`; returns `{ ok: true, data }`. Only works for online (connected) nodes — gateway rejects unknown nodeId.
 - HTTP layer does **not** currently validate `nodeId` / `command`; the browser validates before calling and gateway may still reject.
 
 #### Logs contract
@@ -143,6 +159,9 @@
 | `/api/skills/install` missing `name` or `installId` | 400 | `{ "ok": false, "error": "name and installId are required" }` |
 | `/api/cron/runs` missing `jobId` | 400 | `{ "ok": false, "error": "jobId required" }` |
 | `/api/nodes/describe` missing `nodeId` | 400 | `{ "ok": false, "error": "nodeId required" }` |
+| `/api/nodes/pairing/approve` missing `requestId` | 400 | `{ "ok": false, "error": "requestId is required" }` |
+| `/api/nodes/pairing/reject` missing `requestId` | 400 | `{ "ok": false, "error": "requestId is required" }` |
+| `/api/nodes/rename` missing `nodeId` or `displayName` | 400 | `{ "ok": false, "error": "nodeId and displayName are required" }` |
 | Unknown route | 404 | `{ "ok": false, "error": "API endpoint not found" }` |
 | Gateway/runtime failure after validation | 500 unless route sets a status code | `{ "ok": false, "error": "..." }` |
 

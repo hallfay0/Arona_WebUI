@@ -205,6 +205,7 @@ const viewLoaders = {
   skills: loadSkills,
   cron: loadCron,
   nodes: loadNodes,
+  usage: loadUsage,
   persona: loadPersona,
   chat: loadChat,
   logs: initLogsView
@@ -465,6 +466,65 @@ function requestConfirmDialog({
     modal.setAttribute("aria-hidden", "false");
     document.body.classList.add("confirm-modal-open");
     captureModalFocus("global-confirm-modal", { initialSelector: "#confirm-modal-accept" });
+  });
+}
+
+function requestPromptDialog({
+  title = "请输入",
+  message = "",
+  placeholder = "",
+  defaultValue = "",
+  confirmText = "确认",
+  cancelText = "取消"
+} = {}) {
+  const modal = $("global-confirm-modal");
+  const titleEl = $("confirm-modal-title");
+  const messageEl = $("confirm-modal-message");
+  const confirmBtn = $("confirm-modal-accept");
+  const cancelBtn = modal?.querySelector(".confirm-modal-cancel-btn");
+
+  if (!modal || !titleEl || !messageEl || !confirmBtn || !cancelBtn) {
+    const result = window.prompt(message || title, defaultValue);
+    return Promise.resolve(result);
+  }
+
+  if (state.confirmDialog.open) {
+    return Promise.resolve(null);
+  }
+
+  titleEl.textContent = String(title);
+  const inputId = "confirm-modal-prompt-input";
+  messageEl.innerHTML = `${message ? `<span>${escapeHtml(message)}</span>` : ""}
+    <input id="${inputId}" type="text" class="prompt-dialog-input" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(defaultValue)}" />`;
+  confirmBtn.textContent = String(confirmText);
+  cancelBtn.textContent = String(cancelText);
+  applyConfirmAcceptVariant(confirmBtn, "primary");
+
+  return new Promise((resolve) => {
+    state.confirmDialog.open = true;
+    state.confirmDialog.resolver = (confirmed) => {
+      const input = $(inputId);
+      const value = input ? input.value.trim() : "";
+      messageEl.textContent = "确认继续执行该操作吗？";
+      resolve(confirmed && value ? value : null);
+    };
+    state.confirmDialog.lastActiveElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+    document.body.classList.add("confirm-modal-open");
+    captureModalFocus("global-confirm-modal", { initialSelector: `#${inputId}` });
+
+    const input = $(inputId);
+    if (input) {
+      input.select();
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          settleConfirmDialog(true);
+        }
+      });
+    }
   });
 }
 
@@ -2761,19 +2821,142 @@ function updateNodeCommandOptions(commands) {
   }
 }
 
-function selectNode(nodeId, commands) {
-  const id = String(nodeId || "").trim();
-  if (!id) return;
-  const nodeInput = $("node-id");
-  if (nodeInput) nodeInput.value = id;
-  updateNodeCommandOptions(commands);
-  for (const row of document.querySelectorAll("#nodes-list tbody tr")) {
-    row.classList.toggle("node-row-selected", row.getAttribute("data-node-id") === id);
+// =========================================
+// 用量统计 (Usage / Metrics)
+// =========================================
+
+function renderUsageBarSection(title, icon, items, valueKey, labelKey, formatValue) {
+  if (!items || items.length === 0) {
+    return `
+      <div class="glass-panel usage-section" data-spotlight>
+        <div class="usage-section-head">
+          <i class="${escapeHtml(icon)} usage-section-icon"></i>
+          <span class="usage-section-title">${escapeHtml(title)}</span>
+        </div>
+        ${renderEmpty("fa-solid fa-inbox", "暂无数据", "该模块数据暂时不可用。")}
+      </div>`;
+  }
+  const max = Math.max(...items.map((item) => Number(item[valueKey]) || 0), 1);
+  const bars = items.map((item) => {
+    const raw = Number(item[valueKey]) || 0;
+    const pct = Math.min(100, Math.max(1, (raw / max) * 100));
+    const label = escapeHtml(String(item[labelKey] || "-"));
+    const display = formatValue ? escapeHtml(formatValue(raw)) : escapeHtml(String(raw));
+    return `
+      <div class="usage-bar-row">
+        <span class="usage-bar-label">${label}</span>
+        <div class="usage-bar-track">
+          <div class="usage-bar-fill" style="width:${pct.toFixed(1)}%"></div>
+        </div>
+        <span class="usage-bar-value">${display}</span>
+      </div>`;
+  }).join("");
+  return `
+    <div class="glass-panel usage-section" data-spotlight>
+      <div class="usage-section-head">
+        <i class="${escapeHtml(icon)} usage-section-icon"></i>
+        <span class="usage-section-title">${escapeHtml(title)}</span>
+      </div>
+      <div class="usage-bar-list">${bars}</div>
+    </div>`;
+}
+
+function renderUsageStatCards(title, icon, stats) {
+  if (!stats || stats.length === 0) {
+    return `
+      <div class="glass-panel usage-section" data-spotlight>
+        <div class="usage-section-head">
+          <i class="${escapeHtml(icon)} usage-section-icon"></i>
+          <span class="usage-section-title">${escapeHtml(title)}</span>
+        </div>
+        ${renderEmpty("fa-solid fa-inbox", "暂无数据", "该模块数据暂时不可用。")}
+      </div>`;
+  }
+  const cards = stats.map((s) => `
+    <div class="usage-stat-card">
+      <span class="usage-stat-value">${escapeHtml(s.value)}</span>
+      <span class="usage-stat-label">${escapeHtml(s.label)}</span>
+    </div>`).join("");
+  return `
+    <div class="glass-panel usage-section" data-spotlight>
+      <div class="usage-section-head">
+        <i class="${escapeHtml(icon)} usage-section-icon"></i>
+        <span class="usage-section-title">${escapeHtml(title)}</span>
+      </div>
+      <div class="usage-stat-grid">${cards}</div>
+    </div>`;
+}
+
+function formatCost(v) {
+  return "$" + Number(v).toFixed(2);
+}
+
+function formatCount(v) {
+  const n = Number(v);
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+
+async function loadUsage() {
+  const container = $("usage-content");
+  container.innerHTML = renderSkeleton(5);
+
+  try {
+    const data = await api("/api/usage");
+
+    let html = "";
+
+    // 每日用量趋势 — cost.daily[] → { date, totalTokens }
+    const daily = (data.cost?.daily || []).slice(-14);
+    const dailyItems = daily.map(d => ({
+      name: d.date ? d.date.slice(5) : "-",
+      value: d.totalTokens || 0
+    }));
+    html += renderUsageBarSection(
+      "每日用量趋势", "fa-solid fa-chart-bar",
+      dailyItems, "value", "name", formatCount
+    );
+
+    // 模型用量 — sessions.aggregates.byModel[]
+    // { provider?, model?, count, totals: { totalTokens, ... } }
+    const byModel = data.sessions?.aggregates?.byModel || [];
+    const modelItems = byModel
+      .filter(m => m.totals && m.totals.totalTokens > 0)
+      .map(m => ({
+        name: m.model || [m.provider, m.model].filter(Boolean).join("/") || "-",
+        value: m.totals.totalTokens
+      }))
+      .sort((a, b) => b.value - a.value);
+    html += renderUsageBarSection(
+      "模型用量", "fa-solid fa-microchip",
+      modelItems, "value", "name", formatCount
+    );
+
+    // 会话统计 — 综合 sessions + cost 数据
+    const totals = data.sessions?.totals || data.cost?.totals || {};
+    const msgs = data.sessions?.aggregates?.messages || {};
+    const tools = data.sessions?.aggregates?.tools || {};
+    const sessionCount = (data.sessions?.sessions || []).length;
+    const sessionStats = [];
+    if (sessionCount > 0) sessionStats.push({ label: "总会话数", value: formatCount(sessionCount) });
+    if (msgs.total > 0) sessionStats.push({ label: "消息总数", value: formatCount(msgs.total) });
+    if (tools.totalCalls > 0) sessionStats.push({ label: "工具调用", value: formatCount(tools.totalCalls) });
+    if (totals.totalTokens > 0) sessionStats.push({ label: "Token 总量", value: formatCount(totals.totalTokens) });
+    if (totals.totalCost > 0) sessionStats.push({ label: "累计费用", value: formatCost(totals.totalCost) });
+    html += renderUsageStatCards("会话统计", "fa-solid fa-chart-pie", sessionStats);
+
+    container.innerHTML = `<div class="usage-layout">${html}</div>`;
+    refreshSpotlightsAfterLayout();
+  } catch (err) {
+    container.innerHTML = renderEmpty("fa-solid fa-triangle-exclamation", "加载失败", escapeHtml(err.message));
   }
 }
 
 async function loadNodes() {
   const target = $("nodes-list");
+  const detailPanel = $("nodes-detail");
+  if (detailPanel) detailPanel.hidden = true;
 
   target.innerHTML = renderSkeleton(3);
   try {
@@ -2787,18 +2970,27 @@ async function loadNodes() {
     const rows = nodes.map((node) => ({
       ...node,
       commandList: Array.isArray(node.commands) ? node.commands : [],
-      caps: (node.caps || []).join(", "),
-      commands: (node.commands || []).join(", ")
+      capsList: Array.isArray(node.caps) ? node.caps : [],
+      capsDisplay: (node.caps || []).join(", ")
     }));
-    const commandMap = new Map(rows.map((row) => [String(row.nodeId || ""), row.commandList]));
+    const nodeDataMap = new Map(rows.map((row) => [String(row.nodeId || ""), row]));
 
-    const html = `<div class="dashboard-grid dashboard-grid-compact">` + rows.map((r) => {
+    const onlineCount = rows.filter((r) => r.connected).length;
+    const offlineCount = rows.length - onlineCount;
+    const summaryHtml = `
+      <div class="node-summary-bar">
+        <span class="status-badge status-badge-tight ok"><i class="fa-solid fa-circle icon-prefix-sm"></i>${onlineCount} 在线</span>
+        <span class="status-badge status-badge-tight ${offlineCount > 0 ? 'warn' : 'ok'}"><i class="fa-regular fa-circle icon-prefix-sm"></i>${offlineCount} 离线</span>
+        <span class="status-badge status-badge-tight dynamic">${rows.length} 总节点</span>
+      </div>`;
+
+    const cardsHtml = rows.map((r) => {
       const statusClass = r.connected ? 'ok' : 'warn';
       const statusText = r.connected ? '在线' : '离线';
+      const capsCount = r.capsList.length;
 
       return `
         <div class="glass-panel node-row node-card glass-panel-card" data-node-id="${escapeHtml(r.nodeId)}" data-spotlight>
-          
           <div class="panel-head">
             <div class="panel-head-main">
               <strong class="panel-head-title">${escapeHtml(r.displayName || r.nodeId)}</strong>
@@ -2808,7 +3000,6 @@ async function loadNodes() {
                <i class="${r.connected ? 'fa-solid fa-link' : 'fa-solid fa-link-slash'} icon-prefix-sm"></i>${statusText}
             </span>
           </div>
-          
           <div class="node-meta-grid">
             <div class="node-meta-item">
               <span class="node-meta-label">运行平台</span>
@@ -2818,49 +3009,115 @@ async function loadNodes() {
               <span class="node-meta-label">远程 IP</span>
               <span class="node-meta-value">${escapeHtml(r.remoteIp || "-")}</span>
             </div>
-            <div class="node-meta-item node-meta-item-full">
-              <span class="node-meta-label">能力 (Caps)</span>
-              <span class="node-meta-value-subtle">${escapeHtml(r.caps || "-")}</span>
+            <div class="node-meta-item">
+              <span class="node-meta-label">能力数</span>
+              <span class="node-meta-value">${capsCount}</span>
+            </div>
+            <div class="node-meta-item">
+              <span class="node-meta-label">命令数</span>
+              <span class="node-meta-value">${r.commandList.length}</span>
             </div>
           </div>
-          
-          <div class="action-btn-row-end">
-            <button type="button" class="action-btn log-btn action-btn-horizontal" data-node-describe="${escapeHtml(r.nodeId)}" title="详情信息">
-               <i class="fa-solid fa-circle-info icon-prefix-md"></i>详细节点信息
-            </button>
-          </div>
-        </div>
-      `;
-    }).join("") + `</div>`;
+        </div>`;
+    }).join("");
 
-    target.innerHTML = html;
+    target.innerHTML = summaryHtml + `<div class="dashboard-grid dashboard-grid-compact">${cardsHtml}</div>`;
 
-    const tableRows = Array.from(target.querySelectorAll(".node-row"));
-    for (const row of tableRows) {
-      const rowNodeId = row.getAttribute("data-node-id");
-      if (!rowNodeId) continue;
-      row.addEventListener("click", (event) => {
-        if (event.target.closest("[data-node-describe]")) return;
-        selectNode(rowNodeId, commandMap.get(rowNodeId) || []);
+    for (const card of target.querySelectorAll(".node-card")) {
+      const nodeId = card.getAttribute("data-node-id");
+      if (!nodeId) continue;
+      card.addEventListener("click", () => {
+        const nodeData = nodeDataMap.get(nodeId);
+        if (nodeData) selectNode(nodeData);
       });
     }
 
-    for (const btn of target.querySelectorAll("[data-node-describe]")) {
-      btn.addEventListener("click", async () => {
-        const nodeId = btn.getAttribute("data-node-describe");
-        if (!nodeId) return;
-        selectNode(nodeId, commandMap.get(nodeId) || []);
-        try {
-          const result = await api(`/api/nodes/describe?nodeId=${encodeURIComponent(nodeId)}`);
-          $("node-result").textContent = JSON.stringify(result, null, 2);
-        } catch (err) {
-          showError("node-result", err);
-        }
-      });
-    }
+    refreshSpotlightsAfterLayout();
   } catch (err) {
-    target.textContent = err.message;
+    target.innerHTML = renderEmpty("fa-solid fa-triangle-exclamation", "加载失败", escapeHtml(err.message));
   }
+  loadNodePairing();
+}
+
+function selectNode(nodeData) {
+  const nodeId = String(nodeData.nodeId || "").trim();
+  if (!nodeId) return;
+
+  // Highlight selected card
+  for (const card of document.querySelectorAll("#nodes-list .node-card")) {
+    card.classList.toggle("node-card-selected", card.getAttribute("data-node-id") === nodeId);
+  }
+
+  // Populate hidden input + command options
+  const nodeInput = $("node-id");
+  if (nodeInput) nodeInput.value = nodeId;
+  updateNodeCommandOptions(nodeData.commandList || []);
+
+  // Render detail panel
+  renderNodeDetail(nodeData);
+}
+
+function renderNodeDetail(nodeData) {
+  const panel = $("nodes-detail");
+  if (!panel) return;
+
+  const nodeId = String(nodeData.nodeId || "");
+  const title = $("node-detail-title");
+  const subtitle = $("node-detail-subtitle");
+  if (title) title.textContent = nodeData.displayName || nodeId;
+  if (subtitle) {
+    const renameDisabled = !nodeData.connected;
+    subtitle.innerHTML = `${escapeHtml(nodeId)} <button type="button" class="node-rename-btn${renameDisabled ? ' disabled' : ''}" ${renameDisabled ? 'disabled title="节点离线时无法重命名"' : `onclick="renameNode('${escapeHtml(nodeId)}','${escapeHtml(String(nodeData.displayName || nodeId).replace(/'/g, "\\'"))}')" title="重命名"`}><i class="fa-solid fa-pen"></i></button>`;
+  }
+
+  const body = $("node-detail-body");
+  if (!body) return;
+
+  const capsList = Array.isArray(nodeData.capsList) ? nodeData.capsList : [];
+  const commandList = Array.isArray(nodeData.commandList) ? nodeData.commandList : [];
+
+  const capsHtml = capsList.length > 0
+    ? capsList.map((c) => `<span class="node-tag node-tag-cap">${escapeHtml(c)}</span>`).join("")
+    : '<span class="node-detail-empty">无已注册能力</span>';
+
+  const cmdsHtml = commandList.length > 0
+    ? commandList.map((c) => `<span class="node-tag node-tag-cmd">${escapeHtml(c)}</span>`).join("")
+    : '<span class="node-detail-empty">无可用命令</span>';
+
+  body.innerHTML = `
+    <div class="node-detail-section">
+      <div class="node-meta-grid">
+        <div class="node-meta-item">
+          <span class="node-meta-label">运行平台</span>
+          <span class="node-meta-value">${escapeHtml(nodeData.platform || "-")}</span>
+        </div>
+        <div class="node-meta-item">
+          <span class="node-meta-label">远程 IP</span>
+          <span class="node-meta-value">${escapeHtml(nodeData.remoteIp || "-")}</span>
+        </div>
+        <div class="node-meta-item">
+          <span class="node-meta-label">连接状态</span>
+          <span class="status-badge status-badge-tight ${nodeData.connected ? 'ok' : 'warn'}">
+            <i class="${nodeData.connected ? 'fa-solid fa-link' : 'fa-solid fa-link-slash'} icon-prefix-sm"></i>${nodeData.connected ? '在线' : '离线'}
+          </span>
+        </div>
+        <div class="node-meta-item">
+          <span class="node-meta-label">版本</span>
+          <span class="node-meta-value">${escapeHtml(nodeData.version || "-")}</span>
+        </div>
+      </div>
+    </div>
+    <div class="node-detail-section">
+      <span class="node-detail-section-title">能力 (${capsList.length})</span>
+      <div class="node-tag-list">${capsHtml}</div>
+    </div>
+    <div class="node-detail-section">
+      <span class="node-detail-section-title">命令 (${commandList.length})</span>
+      <div class="node-tag-list">${cmdsHtml}</div>
+    </div>`;
+
+  panel.hidden = false;
+  refreshSpotlightsAfterLayout();
 }
 
 async function invokeNodeCommand() {
@@ -2868,7 +3125,7 @@ async function invokeNodeCommand() {
     const nodeId = $("node-id").value.trim();
     const command = $("node-command").value.trim();
     const params = JSON.parse($("node-params").value || "{}");
-    if (!nodeId || !command) throw new Error("nodeId and command are required");
+    if (!nodeId || !command) throw new Error("请选中节点并填写命令");
 
     const result = await api("/api/nodes/invoke", {
       method: "POST",
@@ -2879,6 +3136,173 @@ async function invokeNodeCommand() {
     showError("node-result", err);
   }
 }
+
+async function loadNodePairing() {
+  const container = $("nodes-pairing");
+  if (!container) return;
+
+  try {
+    const data = await api("/api/nodes/pairing");
+    const pending = Array.isArray(data.pending) ? data.pending : [];
+    const paired = Array.isArray(data.paired) ? data.paired : [];
+
+    let html = "";
+
+    // 配对指引 — 始终显示，折叠式
+    html += `
+      <details class="glass-panel node-guide-panel" data-spotlight>
+        <summary class="node-guide-summary">
+          <i class="fa-solid fa-circle-question node-guide-icon"></i>
+          <span>如何添加新节点？</span>
+          <i class="fa-solid fa-chevron-down node-guide-chevron"></i>
+        </summary>
+        <div class="node-guide-body">
+          <div class="node-guide-steps">
+            <div class="node-guide-step">
+              <span class="node-guide-step-num">1</span>
+              <div class="node-guide-step-content">
+                <strong>在远端机器上安装 OpenClaw</strong>
+                <code class="node-guide-code">npm i -g openclaw@latest</code>
+              </div>
+            </div>
+            <div class="node-guide-step">
+              <span class="node-guide-step-num">2</span>
+              <div class="node-guide-step-content">
+                <strong>配置网关地址和认证</strong>
+                <code class="node-guide-code">openclaw config set gateway.url ws://&lt;网关IP&gt;:18789</code>
+                <code class="node-guide-code">openclaw config set gateway.auth.password &lt;密码&gt;</code>
+                <p class="node-guide-hint">网关 IP 和密码请在服务器 .env.local 文件中查看。</p>
+              </div>
+            </div>
+            <div class="node-guide-step">
+              <span class="node-guide-step-num">3</span>
+              <div class="node-guide-step-content">
+                <strong>启动网关节点</strong>
+                <code class="node-guide-code">openclaw gateway run --bind loopback --port 18789</code>
+                <p class="node-guide-hint">节点启动后会自动连接主网关并发起配对请求。</p>
+              </div>
+            </div>
+            <div class="node-guide-step">
+              <span class="node-guide-step-num">4</span>
+              <div class="node-guide-step-content">
+                <strong>在本页面批准配对</strong>
+                <p class="node-guide-hint">待配对请求会出现在下方列表，点击「批准」即可完成配对。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>`;
+
+    // 待配对请求
+    if (pending.length > 0) {
+      const pendingCards = pending.map((req) => {
+        const name = escapeHtml(req.displayName || req.nodeId || "未命名节点");
+        const nodeId = escapeHtml(req.nodeId || "-");
+        const platform = escapeHtml(req.platform || "-");
+        const ip = escapeHtml(req.remoteIp || "-");
+        const requestId = escapeHtml(req.requestId || "");
+        const timeAgo = req.ts ? formatTimeAgo(req.ts) : "";
+        return `
+          <div class="glass-panel node-pairing-card" data-spotlight>
+            <div class="panel-head">
+              <div class="panel-head-main">
+                <strong class="panel-head-title">${name}</strong>
+                <span class="panel-head-subtitle">${nodeId}</span>
+              </div>
+              <span class="status-badge status-badge-tight accent"><i class="fa-solid fa-clock icon-prefix-sm"></i>待配对</span>
+            </div>
+            <div class="node-meta-grid">
+              <div class="node-meta-item">
+                <span class="node-meta-label">平台</span>
+                <span class="node-meta-value">${platform}</span>
+              </div>
+              <div class="node-meta-item">
+                <span class="node-meta-label">远程 IP</span>
+                <span class="node-meta-value">${ip}</span>
+              </div>
+              ${timeAgo ? `<div class="node-meta-item"><span class="node-meta-label">请求时间</span><span class="node-meta-value">${escapeHtml(timeAgo)}</span></div>` : ""}
+            </div>
+            <div class="node-pairing-actions">
+              <button type="button" class="btn-primary btn-size-sm" onclick="approveNodePairing('${requestId}')"><i class="fa-solid fa-check"></i> 批准</button>
+              <button type="button" class="btn-danger btn-size-sm" onclick="rejectNodePairing('${requestId}')"><i class="fa-solid fa-xmark"></i> 拒绝</button>
+            </div>
+          </div>`;
+      }).join("");
+      html += `
+        <div class="node-pairing-section">
+          <h3 class="node-pairing-section-title"><i class="fa-solid fa-handshake"></i> 待配对请求 (${pending.length})</h3>
+          <div class="dashboard-grid dashboard-grid-compact">${pendingCards}</div>
+        </div>`;
+    }
+
+    container.innerHTML = html;
+    refreshSpotlightsAfterLayout();
+  } catch {
+    // 配对功能非关键路径，静默失败
+  }
+}
+
+function formatTimeAgo(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 60000) return "刚刚";
+  if (diff < 3600000) return Math.floor(diff / 60000) + " 分钟前";
+  if (diff < 86400000) return Math.floor(diff / 3600000) + " 小时前";
+  return Math.floor(diff / 86400000) + " 天前";
+}
+
+async function approveNodePairing(requestId) {
+  if (!requestId) return;
+  try {
+    await api("/api/nodes/pairing/approve", {
+      method: "POST",
+      body: JSON.stringify({ requestId })
+    });
+    showToast("配对已批准", "success");
+    await loadNodes();
+  } catch (err) {
+    showToast("批准失败: " + (err.message || err), "error");
+  }
+}
+
+async function rejectNodePairing(requestId) {
+  if (!requestId) return;
+  try {
+    await api("/api/nodes/pairing/reject", {
+      method: "POST",
+      body: JSON.stringify({ requestId })
+    });
+    showToast("配对已拒绝", "success");
+    await loadNodePairing();
+  } catch (err) {
+    showToast("拒绝失败: " + (err.message || err), "error");
+  }
+}
+
+async function renameNode(nodeId, currentName) {
+  if (!nodeId) return;
+  const newName = await requestPromptDialog({
+    title: "重命名节点",
+    message: "请输入新的节点显示名称",
+    placeholder: "节点名称",
+    defaultValue: currentName || "",
+    confirmText: "保存",
+    cancelText: "取消"
+  });
+  if (!newName) return;
+  try {
+    await api("/api/nodes/rename", {
+      method: "POST",
+      body: JSON.stringify({ nodeId, displayName: newName })
+    });
+    showToast("重命名成功", "success");
+    await loadNodes();
+  } catch (err) {
+    showToast("重命名失败: " + (err.message || err), "error");
+  }
+}
+window.approveNodePairing = approveNodePairing;
+window.rejectNodePairing = rejectNodePairing;
+window.renameNode = renameNode;
 
 function toTrimmedString(value) {
   if (value == null) return "";
@@ -5833,6 +6257,22 @@ function bindEvents() {
     });
   }
 
+  const usageRefreshBtn = $("usage-refresh");
+  if (usageRefreshBtn) {
+    usageRefreshBtn.addEventListener("click", async () => {
+      if (usageRefreshBtn.disabled) return;
+      const label = usageRefreshBtn.innerHTML;
+      usageRefreshBtn.disabled = true;
+      usageRefreshBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 刷新中';
+      try {
+        await loadUsage();
+      } finally {
+        usageRefreshBtn.disabled = false;
+        usageRefreshBtn.innerHTML = label;
+      }
+    });
+  }
+
   $("persona-refresh")?.addEventListener("click", async () => {
     const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "重新加载 Persona 数据" });
     if (!shouldContinue) return;
@@ -6143,6 +6583,28 @@ function bindEvents() {
     $("cron-job-json").value = JSON.stringify(cronTemplate(), null, 2);
   });
   $("node-invoke")?.addEventListener("click", invokeNodeCommand);
+  $("node-detail-close")?.addEventListener("click", () => {
+    const panel = $("nodes-detail");
+    if (panel) panel.hidden = true;
+    for (const card of document.querySelectorAll("#nodes-list .node-card")) {
+      card.classList.remove("node-card-selected");
+    }
+  });
+  const nodesRefreshBtn = $("nodes-refresh");
+  if (nodesRefreshBtn) {
+    nodesRefreshBtn.addEventListener("click", async () => {
+      if (nodesRefreshBtn.disabled) return;
+      const label = nodesRefreshBtn.innerHTML;
+      nodesRefreshBtn.disabled = true;
+      nodesRefreshBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 刷新中';
+      try {
+        await loadNodes();
+      } finally {
+        nodesRefreshBtn.disabled = false;
+        nodesRefreshBtn.innerHTML = label;
+      }
+    });
+  }
 }
 
 async function bootstrap() {

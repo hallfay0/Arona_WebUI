@@ -354,7 +354,7 @@ class GatewaySession {
         mode: "ui"
       },
       role: "operator",
-      scopes: ["operator.read", "operator.write", "operator.admin"],
+      scopes: ["operator.read", "operator.write", "operator.admin", "operator.pairing", "operator.approvals"],
       caps: []
     };
 
@@ -1111,6 +1111,62 @@ async function handleApi(req, res, pathname, query) {
           idempotencyKey: crypto.randomUUID()
         })
       );
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/nodes/refresh-capabilities") {
+      const body = await parseBody(req);
+      const nodeId = body.nodeId;
+      if (!nodeId) return jsonResponse(res, 400, { ok: false, error: "nodeId is required" });
+      const data = await withGateway((gateway) =>
+        gateway.request("node.canvas.capability.refresh", { nodeId })
+      );
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "GET" && pathname === "/api/nodes/pairing") {
+      const data = await withGateway((gateway) =>
+        gateway.request("node.pair.list", {})
+      );
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/nodes/pairing/approve") {
+      const body = await parseBody(req);
+      if (!body.requestId) return jsonResponse(res, 400, { ok: false, error: "requestId is required" });
+      const data = await withGateway((gateway) =>
+        gateway.request("node.pair.approve", { requestId: body.requestId })
+      );
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "POST" && pathname === "/api/nodes/pairing/reject") {
+      const body = await parseBody(req);
+      if (!body.requestId) return jsonResponse(res, 400, { ok: false, error: "requestId is required" });
+      const data = await withGateway((gateway) =>
+        gateway.request("node.pair.reject", { requestId: body.requestId })
+      );
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "POST" && pathname === "/api/nodes/rename") {
+      const body = await parseBody(req);
+      if (!body.nodeId || !body.displayName) return jsonResponse(res, 400, { ok: false, error: "nodeId and displayName are required" });
+      const data = await withGateway((gateway) =>
+        gateway.request("node.rename", { nodeId: body.nodeId, displayName: body.displayName })
+      );
+      return jsonResponse(res, 200, { ok: true, data });
+    }
+
+    if (req.method === "GET" && pathname === "/api/usage") {
+      const data = await withGateway(async (gateway) => {
+        const [status, cost, sessions] = await Promise.all([
+          gateway.request("usage.status", {}).catch(() => null),
+          gateway.request("usage.cost", {}).catch(() => null),
+          gateway.request("sessions.usage", {}).catch(() => null)
+        ]);
+        return { status, cost, sessions };
+      });
       return jsonResponse(res, 200, data);
     }
 
