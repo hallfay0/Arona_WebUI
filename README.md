@@ -10,14 +10,30 @@ Monitor, configure, and interact with your OpenClaw instance from the browser.
 ## Features
 
 - **Dashboard** — system overview with real-time CPU / memory monitoring
+<img width="2560" height="1347" alt="image" src="https://github.com/user-attachments/assets/8d5aacdd-a6a7-4f95-a69f-b81b2440c8e3" />
+
 - **Model Management** — configure AI model providers and routing
+<img width="2560" height="1346" alt="image" src="https://github.com/user-attachments/assets/ff37b8bf-d063-4be2-b7e9-6895b45834eb" />
 - **Skills** — manage agent skills and API keys
+<img width="2560" height="1339" alt="image" src="https://github.com/user-attachments/assets/53f10f4d-44b9-475a-bef1-bfc0834a184c" />
+
 - **Cron Jobs** — scheduled tasks (cron / at / interval) with run history
+<img width="2560" height="1344" alt="image" src="https://github.com/user-attachments/assets/60ad6ed1-a8b0-4aa2-8e8b-5195c70b53f5" />
+
 - **Chat Playground** — real-time chat with gateway sessions via WebSocket
+<img width="2560" height="1337" alt="image" src="https://github.com/user-attachments/assets/cbeae770-23e4-41cb-a43e-8b58eda9fc9d" />
+
 - **Persona & Prompts** — agent identity and prompt file management
+<img width="2560" height="1341" alt="image" src="https://github.com/user-attachments/assets/c907776d-184c-42d2-9b40-b710506b09b4" />
+
 - **Node Topology** — device and node monitoring
+<img width="2560" height="1340" alt="image" src="https://github.com/user-attachments/assets/dfb43347-cc8a-4b84-aad5-f0e1bfb71180" />
+
 - **Usage Stats** — model and channel usage analytics
+<img width="2560" height="1337" alt="image" src="https://github.com/user-attachments/assets/31846c72-a3dc-420b-9003-8e62fa6d2c70" />
+
 - **Live Logs** — real-time log streaming with keyword search
+<img width="2560" height="1331" alt="image" src="https://github.com/user-attachments/assets/a28898bd-bc5f-4e9e-86d7-845e2694c94b" />
 
 ## Prerequisites
 
