@@ -26,6 +26,8 @@
   ```json
   {
     "models": { "providers": { "<providerKey>": { "...": "..." } } },
+    "agentsDefaultsModels": { "<provider/model>": { "...": "..." } },
+    "agentsDefaultModel": { "primary": "<provider/model>", "fallbacks": ["<provider/model>"] },
     "baseHash": "<config hash>"
   }
   ```
@@ -113,14 +115,22 @@
   {
     "modelList": "<gateway payload>",
     "configHash": "<hash>",
-    "modelsConfig": { "providers": { "...": {} } }
+    "modelsConfig": { "providers": { "...": {} } },
+    "agentsDefaultsModels": { "<provider/model>": { "...": "..." } },
+    "agentsDefaultModel": { "primary": "<provider/model>", "fallbacks": ["<provider/model>"] }
   }
   ```
-- `/api/models/save` forwards to `config.patch({ raw, baseHash, note })` with note `"MVP dashboard updated model/provider config"`.
+- `/api/models/save` forwards one combined `config.patch({ raw, baseHash, note })` with note `"MVP dashboard updated model/provider config"`.
+- Browser currently uses that combined patch to update three config slices together:
+  - `models.providers`
+  - `agents.defaults.models`
+  - `agents.defaults.model`
 - Browser editor depends on provider config round-tripping extra fields. Managed keys are `baseUrl|baseURL|url|apiKey|api|apiType|type|models`; everything else must survive save.
 - Browser provider save normalizes legacy adapter fields `apiType` / `type` into gateway-schema `api` before calling `/api/models/save`.
 - Browser provider delete / rename emits `models.providers.<key> = null` tombstones so `config.patch` actually removes old provider keys instead of merging them back.
 - Browser provider model rows always serialize as object entries; when `name` is omitted in the form, save falls back to `name = id` to satisfy gateway schema.
+- Browser model allowlist save emits `agents.defaults.models.<provider/model> = null` tombstones for refs that were unchecked or removed, so stale allowlist entries do not merge back.
+- Browser “设为默认” UI writes `agents.defaults.model.primary`; when the selected default is cleared by draft changes, save may send `agentsDefaultModel = null` to remove the config key.
 - `__OPENCLAW_REDACTED__` is a browser-only placeholder; save callers must remove it before sending.
 
 #### Skills contract
@@ -185,11 +195,15 @@
   - 404 route => `{ ok:false, error }`
 - Models
   - `/api/models` returns `configHash` and `modelsConfig`
+  - `/api/models` also returns `agentsDefaultsModels` and `agentsDefaultModel`
   - `/api/models/save` forwards `baseHash`
+  - `/api/models/save` can patch `models.providers`, `agents.defaults.models`, and `agents.defaults.model` in one request
   - provider extra fields survive round-trip save
   - legacy provider `apiType` / `type` backfills and saves as `api`
   - deleting or renaming a provider removes the old provider key after reload
   - newly added provider models save as `{ id, name, ... }` objects instead of invalid string entries
+  - unchecking a previously-allowlisted model removes the old `agents.defaults.models.<ref>` key after reload
+  - selecting a default model persists `agents.defaults.model.primary`
 - Skills
   - `/api/skills/install` default `timeoutMs=120000`
   - `/api/skills/update` accepts enable-only and env/apiKey payloads

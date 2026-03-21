@@ -18,7 +18,7 @@
   ```
 - `POST /api/agents/update`
   ```json
-  { "agentId": "<string>", "name": "<optional>", "workspace": "<optional>", "avatar": "<optional>" }
+  { "agentId": "<string>", "name": "<optional>", "workspace": "<optional>", "model": "<optional>", "avatar": "<optional>" }
   ```
 - `POST /api/agents/delete`
   ```json
@@ -70,11 +70,12 @@
 
 #### Create / update / delete rules
 - Create requires non-empty `name` and `workspace`.
-- Update requires non-empty `agentId` and at least one of `name | workspace | avatar`.
-- Provided `name` / `workspace` values must be strings and remain non-empty after trimming.
+- Update requires non-empty `agentId` and at least one of `name | workspace | model | avatar`.
+- Provided `name` / `workspace` / `model` values must be strings and remain non-empty after trimming.
 - Default agent cannot have its workspace changed. Backend returns `409` with a protection error.
 - Default agent cannot be deleted. Backend returns `409` with a protection error.
 - `deleteFiles` is optional input. Only `true` is forwarded downstream as “also remove files”; `false` / absence omits the field.
+- `model` is passed through to gateway `agents.update` as a plain `provider/model` string; the current Persona UI does not surface it yet, but the browser route contract supports it.
 
 #### Persona file whitelist and missing-file behavior
 - `/api/agents/files` may also return a `workspace` field alongside `files[]`.
@@ -109,7 +110,7 @@
 | Create missing `name` or `workspace` | 400 | `{ "ok": false, "error": "name and workspace are required" }` |
 | Update missing `agentId` | 400 | `{ "ok": false, "error": "agentId is required" }` |
 | Update provides no mutable field | 400 | `{ "ok": false, "error": "at least one field to update is required" }` |
-| `emoji`, `avatar`, `name`, `workspace` provided with wrong type | 400 | `{ "ok": false, "error": "... must be a string ..." }` |
+| `emoji`, `avatar`, `name`, `workspace`, `model` provided with wrong type | 400 | `{ "ok": false, "error": "... must be a string ..." }` |
 | Update tries to change default-agent workspace | 409 | protection error |
 | Delete targets default agent | 409 | protection error |
 | File name not in whitelist | 400 | `{ "ok": false, "error": "unsupported agent file name" }` |
@@ -136,6 +137,9 @@
 - Protection rules
   - updating default-agent workspace returns 409
   - deleting default agent returns 409
+- Update contract
+  - `model`-only updates are accepted and forwarded to gateway `agents.update`
+  - omitted `model` preserves legacy `name/workspace/avatar` update behavior
 - File contract
   - whitelist allows only documented file names
   - missing file/list errors become HTTP 200 success payloads with `missing:true` / `files:[]`

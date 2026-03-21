@@ -4,7 +4,10 @@ const state = {
   currentView: "overview",
   modelsHash: "",
   modelProvidersDraft: {},
+  agentsDefaultsModelsDraft: {},
+  agentsDefaultModelDraft: null,
   deletedModelProviderKeys: new Set(),
+  deletedAllowlistModelRefs: new Set(),
   modelsApply: {
     phase: "idle",
     message: ""
@@ -348,6 +351,8 @@ function isLikelyGatewayHotRestartError(error) {
   const message = String(error?.message || error || "").toLowerCase();
   return (
     message.includes("econnrefused")
+    || message.includes("econnreset")
+    || message.includes("read econnreset")
     || message.includes("socket hang up")
     || message.includes("fetch failed")
     || message.includes("gateway websocket is not connected")
@@ -357,6 +362,39 @@ function isLikelyGatewayHotRestartError(error) {
     || message.includes("temporarily unavailable")
     || (message.includes("gateway") && message.includes("not connected"))
   );
+}
+
+async function verifyModelsSaveApplied(expectedState, {
+  initialDelayMs = 1200,
+  retryDelayMs = 900,
+  maxAttempts = 14
+} = {}) {
+  let lastError = null;
+  if (initialDelayMs > 0) await wait(initialDelayMs);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    setModelsApplyState("restarting", `保存响应中断，正在核对配置（第 ${attempt}/${maxAttempts} 次）`);
+    try {
+      const data = await api("/api/models");
+      if (modelsStateMatchesExpected(data, expectedState)) {
+        applyLoadedModelsData(data);
+        setModelsApplyState("idle");
+        return { verified: true, data };
+      }
+      lastError = new Error("保存后读取成功，但配置尚未达到预期状态");
+    } catch (error) {
+      lastError = error;
+      if (!isLikelyGatewayHotRestartError(error)) {
+        break;
+      }
+    }
+
+    if (attempt < maxAttempts) {
+      await wait(retryDelayMs);
+    }
+  }
+
+  return { verified: false, error: lastError };
 }
 
 async function waitForModelsGatewayRecovery({
@@ -383,7 +421,7 @@ async function waitForModelsGatewayRecovery({
     }
   }
 
-  setModelsApplyState("error", "网关热重启时间过长，请稍后手动重试");
+  setModelsApplyState("error", "网关热重启超时，配置已保存但可能未生效。请手动重启网关后重试。");
   throw lastError || new Error("网关热重启恢复失败");
 }
 
@@ -1259,6 +1297,168 @@ function cloneProviderConfig(value) {
   }
 }
 
+function cloneAgentModelsConfig(value) {
+  return cloneProviderConfig(value);
+}
+
+function sortKeysDeep(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => sortKeysDeep(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const sorted = {};
+  for (const key of Object.keys(value).sort()) {
+    sorted[key] = sortKeysDeep(value[key]);
+  }
+  return sorted;
+}
+
+function cloneAgentDefaultModelConfig(value) {
+  if (typeof value === "string") {
+    const primary = value.trim();
+    return primary ? { primary } : null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+
+  const source = cloneProviderConfig(value);
+  const primary = typeof source.primary === "string" ? source.primary.trim() : "";
+  const fallbacks = Array.isArray(source.fallbacks)
+    ? source.fallbacks.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+
+  if (primary) source.primary = primary;
+  else delete source.primary;
+
+  if (fallbacks.length > 0) source.fallbacks = fallbacks;
+  else delete source.fallbacks;
+
+  return Object.keys(source).length > 0 ? source : null;
+}
+
+function getAgentDefaultModelPrimary(value = state.agentsDefaultModelDraft) {
+  if (typeof value === "string") return value.trim();
+  return typeof value?.primary === "string" ? value.primary.trim() : "";
+}
+
+function buildProviderModelRef(providerKey, modelId) {
+  const provider = String(providerKey || "").trim();
+  const model = String(modelId || "").trim();
+  if (!provider || !model) return "";
+  if (model.toLowerCase().startsWith(`${provider.toLowerCase()}/`)) {
+    return model;
+  }
+  return `${provider}/${model}`;
+}
+
+function getProviderModelRefs(providerKey, provider) {
+  return getProviderModelRows(provider)
+    .map((row) => buildProviderModelRef(providerKey, row.id))
+    .filter(Boolean);
+}
+
+function isAllowlistedModelRef(modelRef) {
+  return Boolean(modelRef && Object.prototype.hasOwnProperty.call(state.agentsDefaultsModelsDraft, modelRef));
+}
+
+function isDefaultModelRef(modelRef) {
+  return Boolean(modelRef && modelRef === getAgentDefaultModelPrimary());
+}
+
+function clearAgentDefaultModelForRefs(defaultModelDraft, refs = []) {
+  const targets = new Set((Array.isArray(refs) ? refs : []).map((item) => String(item || "").trim()).filter(Boolean));
+  if (targets.size === 0) return cloneAgentDefaultModelConfig(defaultModelDraft);
+
+  const nextDraft = cloneAgentDefaultModelConfig(defaultModelDraft);
+  if (!nextDraft) return null;
+
+  const currentPrimary = getAgentDefaultModelPrimary(nextDraft);
+  if (!currentPrimary || !targets.has(currentPrimary)) {
+    return nextDraft;
+  }
+
+  const remainingFallbacks = Array.isArray(nextDraft.fallbacks)
+    ? nextDraft.fallbacks.map((item) => String(item).trim()).filter((item) => item && !targets.has(item))
+    : [];
+
+  if (remainingFallbacks.length > 0) {
+    nextDraft.primary = remainingFallbacks.shift();
+    if (remainingFallbacks.length > 0) nextDraft.fallbacks = remainingFallbacks;
+    else delete nextDraft.fallbacks;
+    return nextDraft;
+  }
+
+  delete nextDraft.primary;
+  delete nextDraft.fallbacks;
+  return Object.keys(nextDraft).length > 0 ? nextDraft : null;
+}
+
+function buildAgentsDefaultsModelsPatchForSave(modelsMap, deletedRefs = []) {
+  const patch = cloneAgentModelsConfig(modelsMap);
+  for (const ref of deletedRefs) {
+    const modelRef = String(ref || "").trim();
+    if (!modelRef) continue;
+    patch[modelRef] = null;
+  }
+  return patch;
+}
+
+function getConfiguredProviderModelCount(providers = state.modelProvidersDraft) {
+  let count = 0;
+  for (const provider of Object.values(providers || {})) {
+    count += getProviderModelRows(provider).length;
+  }
+  return count;
+}
+
+function normalizeComparableProviders(providers = {}) {
+  const normalized = {};
+  for (const [providerKey, rawProvider] of Object.entries(providers || {})) {
+    if (!rawProvider || typeof rawProvider !== "object" || Array.isArray(rawProvider)) continue;
+    const provider = cloneProviderConfig(rawProvider);
+    const apiKey = typeof provider.apiKey === "string" ? provider.apiKey.trim() : "";
+    if (!apiKey || apiKey === REDACTED_API_KEY_TOKEN) {
+      delete provider.apiKey;
+    }
+    normalized[providerKey] = sortKeysDeep(provider);
+  }
+  return sortKeysDeep(normalized);
+}
+
+function normalizeComparableAllowlist(models = {}) {
+  return sortKeysDeep(cloneAgentModelsConfig(models));
+}
+
+function normalizeComparableDefaultModelConfig(value) {
+  return sortKeysDeep(cloneAgentDefaultModelConfig(value));
+}
+
+function captureExpectedModelsState() {
+  return {
+    providers: cloneProviderConfig(state.modelProvidersDraft),
+    agentsDefaultsModels: cloneAgentModelsConfig(state.agentsDefaultsModelsDraft),
+    agentsDefaultModel: cloneAgentDefaultModelConfig(state.agentsDefaultModelDraft)
+  };
+}
+
+function modelsStateMatchesExpected(data, expected) {
+  if (!data || !expected) return false;
+
+  const currentProviders = normalizeComparableProviders(data.modelsConfig?.providers || {});
+  const currentAllowlist = normalizeComparableAllowlist(data.agentsDefaultsModels || {});
+  const currentDefaultModel = normalizeComparableDefaultModelConfig(data.agentsDefaultModel);
+
+  const expectedProviders = normalizeComparableProviders(expected.providers || {});
+  const expectedAllowlist = normalizeComparableAllowlist(expected.agentsDefaultsModels || {});
+  const expectedDefaultModel = normalizeComparableDefaultModelConfig(expected.agentsDefaultModel);
+
+  return JSON.stringify(currentProviders) === JSON.stringify(expectedProviders)
+    && JSON.stringify(currentAllowlist) === JSON.stringify(expectedAllowlist)
+    && JSON.stringify(currentDefaultModel) === JSON.stringify(expectedDefaultModel);
+}
+
 function normalizeProviderEditorData(provider) {
   const source = provider && typeof provider === "object" && !Array.isArray(provider) ? provider : {};
   const modelsValue = Object.prototype.hasOwnProperty.call(source, "models") ? source.models : [];
@@ -1435,24 +1635,53 @@ function providerModelRowTemplate(rowData = {}) {
     contextWindow: rowData.contextWindow || "",
     reasoning: rowData.reasoning === true,
     input: rowData.input || "",
-    extras: rowData.extras && typeof rowData.extras === "object" && !Array.isArray(rowData.extras) ? rowData.extras : {}
+    extras: rowData.extras && typeof rowData.extras === "object" && !Array.isArray(rowData.extras) ? rowData.extras : {},
+    allowlisted: rowData.allowlisted !== false,
+    isDefaultModel: rowData.isDefaultModel === true
   };
 
   const uniqueId = "reasoning-" + Math.random().toString(36).substring(2, 9);
+  const allowlistId = "allowlist-" + Math.random().toString(36).substring(2, 9);
+  const defaultId = "default-model-" + Math.random().toString(36).substring(2, 9);
 
   return `
     <div class="provider-model-row" data-provider-model-row>
-      <input type="text" class="provider-model-id" placeholder="模型 ID（如 gpt-4o-mini）" value="${escapeHtml(row.id)}" />
-      <input type="number" min="1" step="1" class="provider-model-context" placeholder="上下文窗口" value="${escapeHtml(row.contextWindow)}" />
-      <label class="provider-model-reasoning" for="${uniqueId}">
-        <input type="checkbox" id="${uniqueId}" class="provider-model-reasoning-toggle" ${row.reasoning ? "checked" : ""} />
-        <span class="provider-model-reasoning-label">推理模式</span>
-      </label>
-      <input type="text" class="provider-model-input" placeholder="输入类型（逗号分隔，可留空）" value="${escapeHtml(row.input)}" />
+      <div class="provider-model-fields">
+        <label class="provider-model-field">
+          <span class="provider-model-field-label">模型 ID</span>
+          <input type="text" class="provider-model-id form-control-mono" placeholder="如 gpt-4o-mini" value="${escapeHtml(row.id)}" spellcheck="false" />
+        </label>
+        <label class="provider-model-field">
+          <span class="provider-model-field-label">上下文窗口</span>
+          <input type="number" min="1" step="1" class="provider-model-context" placeholder="可留空" value="${escapeHtml(row.contextWindow)}" />
+        </label>
+        <label class="provider-model-field provider-model-field-wide">
+          <span class="provider-model-field-label">输入类型</span>
+          <input type="text" class="provider-model-input" placeholder="逗号分隔，可留空" value="${escapeHtml(row.input)}" spellcheck="false" />
+        </label>
+        <button type="button" class="provider-model-remove danger-action-btn btn-danger" data-provider-model-remove title="移除模型" aria-label="移除模型">
+          <i class="fa-solid fa-minus"></i>
+        </button>
+      </div>
+      <div class="provider-model-options" role="group" aria-label="模型策略">
+        <span class="provider-model-options-label">策略</span>
+        <div class="provider-model-options-list">
+          <label class="provider-model-option" for="${uniqueId}">
+            <input type="checkbox" id="${uniqueId}" class="provider-model-reasoning-toggle" ${row.reasoning ? "checked" : ""} />
+            <span>推理模式</span>
+          </label>
+          <label class="provider-model-option" for="${allowlistId}">
+            <input type="checkbox" id="${allowlistId}" class="provider-model-allowlist-toggle" ${row.allowlisted ? "checked" : ""} />
+            <span>允许 Agent 使用</span>
+          </label>
+          <label class="provider-model-option provider-model-option-default" for="${defaultId}">
+            <input type="radio" id="${defaultId}" name="provider-default-model" class="provider-model-default-toggle" ${row.isDefaultModel ? "checked" : ""} />
+            <span>设为默认</span>
+            <span class="provider-model-option-hint">单选</span>
+          </label>
+        </div>
+      </div>
       <input type="hidden" class="provider-model-extras" value="${escapeHtml(JSON.stringify(row.extras))}" />
-      <button type="button" class="provider-model-remove danger-action-btn btn-danger" data-provider-model-remove title="移除模型" aria-label="移除模型">
-        <i class="fa-solid fa-minus"></i>
-      </button>
     </div>
   `;
 }
@@ -1466,7 +1695,16 @@ function providerCardTemplate(providerKey = "", provider = {}, originalKey = "")
   const optionsHtml = apiTypeOptions
     .map((option) => `<option value="${option.value}"${option.value === info.apiType ? " selected" : ""}>${option.label}</option>`)
     .join("");
-  const modelRowsHtml = info.modelRows.map((row) => providerModelRowTemplate(row)).join("");
+  const modelRowsHtml = info.modelRows
+    .map((row) => {
+      const modelRef = buildProviderModelRef(providerKey, row.id);
+      return providerModelRowTemplate({
+        ...row,
+        allowlisted: modelRef ? (isAllowlistedModelRef(modelRef) || isDefaultModelRef(modelRef)) : row.allowlisted !== false,
+        isDefaultModel: modelRef ? isDefaultModelRef(modelRef) : row.isDefaultModel === true
+      });
+    })
+    .join("");
 
   const providerFullConfig = cloneProviderConfig(provider);
   const initialJsonStr = Object.keys(providerFullConfig).length > 0
@@ -1485,12 +1723,12 @@ function providerCardTemplate(providerKey = "", provider = {}, originalKey = "")
       <div class="provider-card-grid">
         <div class="config-row">
           <label>Provider Key (唯一标识)</label>
-          <input type="text" class="provider-key skeuo-input" placeholder="如 openrouter" value="${escapeHtml(providerKey)}" />
+          <input type="text" class="provider-key skeuo-input form-control-mono" placeholder="如 openrouter" value="${escapeHtml(providerKey)}" spellcheck="false" />
         </div>
 
         <div class="config-row">
           <label>Base URL</label>
-          <input type="text" class="provider-base-url skeuo-input" placeholder="https://openrouter.ai/api/v1 (可为空)" value="${escapeHtml(info.baseUrl)}" />
+          <input type="text" class="provider-base-url skeuo-input form-control-mono" placeholder="https://openrouter.ai/api/v1 (可为空)" value="${escapeHtml(info.baseUrl)}" spellcheck="false" />
         </div>
 
         <div class="config-row">
@@ -1515,6 +1753,7 @@ function providerCardTemplate(providerKey = "", provider = {}, originalKey = "")
           <button type="button" class="provider-model-add panel-action-btn btn-secondary btn-block btn-dashed btn-mt-sm" data-provider-model-add>
             <i class="fa-solid fa-plus"></i> 追加一个模型
           </button>
+          <small class="form-hint">勾选“允许 Agent 使用”会把该模型加入白名单；勾选“设为默认”会同时更新全局默认主模型。</small>
         </div>
 
         <div class="config-row provider-json-row">
@@ -1552,6 +1791,133 @@ function getProviderModelRows(provider) {
   return rows.filter((row) => row.id);
 }
 
+function renderModelsBaseLayout() {
+  const container = $("models-content");
+  if (!container) return false;
+  container.innerHTML = `
+    <div id="models-policy-summary" class="models-policy-summary"></div>
+    <div class="provider-matrix-wrapper provider-matrix-wrapper-compact">
+      <div id="models-provider-matrix" class="provider-matrix-grid"></div>
+    </div>
+  `;
+  return true;
+}
+
+function clearModelsPolicySummary() {
+  const container = $("models-policy-summary");
+  if (!container) return;
+  container.innerHTML = "";
+}
+
+function renderModelsPolicySummary() {
+  const container = $("models-policy-summary");
+  if (!container) return;
+
+  const configuredCount = getConfiguredProviderModelCount(state.modelProvidersDraft);
+  const allowlistCount = Object.keys(state.agentsDefaultsModelsDraft || {}).length;
+  const defaultPrimary = getAgentDefaultModelPrimary();
+
+  if (configuredCount === 0) {
+    container.innerHTML = "";
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="models-policy-inline" aria-live="polite">
+      <div class="models-policy-inline-copy">
+        <span class="models-policy-inline-title">生效说明</span>
+        <span class="models-policy-inline-text">“允许 Agent 使用”会把模型加入白名单；“设为默认”只会修改全局默认模型，不会改动某个 Agent 已经单独指定的模型。</span>
+      </div>
+      <div class="models-policy-inline-meta">
+        <span class="status-badge dynamic">已配置模型 ${configuredCount}</span>
+        <span class="status-badge dynamic">已入白名单 ${allowlistCount}</span>
+        <span class="models-policy-inline-default">
+          <span class="models-policy-inline-default-label">默认模型</span>
+          <code class="models-policy-inline-code">${escapeHtml(defaultPrimary || "未设置")}</code>
+        </span>
+      </div>
+    </div>
+  `;
+}
+
+function renderModelsDraftSurface() {
+  renderModelsBaseLayout();
+  if (Object.keys(state.modelProvidersDraft || {}).length === 0) {
+    clearModelsPolicySummary();
+  } else {
+    renderModelsPolicySummary();
+  }
+  renderProviderMatrix(state.modelProvidersDraft);
+}
+
+function applyLoadedModelsData(data) {
+  state.modelsHash = data.configHash;
+  state.deletedModelProviderKeys = new Set();
+  state.deletedAllowlistModelRefs = new Set();
+
+  const cfg = data.modelsConfig || {};
+  const providers = cfg.providers || {};
+  state.modelProvidersDraft = {};
+  for (const [key, provider] of Object.entries(providers)) {
+    state.modelProvidersDraft[key] = cloneProviderConfig(provider);
+  }
+  state.agentsDefaultsModelsDraft = cloneAgentModelsConfig(data.agentsDefaultsModels || {});
+  state.agentsDefaultModelDraft = cloneAgentDefaultModelConfig(data.agentsDefaultModel);
+
+  renderProviderEditor("", {}, "");
+  renderModelsDraftSurface();
+}
+
+function applyProviderPolicyDraft({
+  previousKey = "",
+  previousProvider = null,
+  nextKey = "",
+  nextProvider = null,
+  allowlistedModelRefs = [],
+  defaultModelRef = ""
+} = {}) {
+  const normalizedPreviousKey = String(previousKey || "").trim();
+  const normalizedNextKey = String(nextKey || "").trim();
+  const nextAllowlist = cloneAgentModelsConfig(state.agentsDefaultsModelsDraft);
+  const nextDeletedRefs = new Set(state.deletedAllowlistModelRefs);
+  const previousRefs = previousProvider && normalizedPreviousKey
+    ? getProviderModelRefs(normalizedPreviousKey, previousProvider)
+    : [];
+
+  for (const ref of previousRefs) {
+    delete nextAllowlist[ref];
+    nextDeletedRefs.add(ref);
+  }
+
+  for (const ref of Array.from(new Set(allowlistedModelRefs.filter(Boolean)))) {
+    const existingEntry = cloneProviderConfig(state.agentsDefaultsModelsDraft[ref]);
+    nextAllowlist[ref] = existingEntry;
+    nextDeletedRefs.delete(ref);
+  }
+
+  const normalizedDefaultRef = String(defaultModelRef || "").trim();
+  if (normalizedDefaultRef) {
+    const existingEntry = cloneProviderConfig(state.agentsDefaultsModelsDraft[normalizedDefaultRef]);
+    nextAllowlist[normalizedDefaultRef] = existingEntry;
+    nextDeletedRefs.delete(normalizedDefaultRef);
+  }
+
+  state.agentsDefaultsModelsDraft = nextAllowlist;
+  state.deletedAllowlistModelRefs = nextDeletedRefs;
+
+  const clearedDefault = clearAgentDefaultModelForRefs(state.agentsDefaultModelDraft, previousRefs);
+  state.agentsDefaultModelDraft = normalizedDefaultRef
+    ? { ...(clearedDefault || {}), primary: normalizedDefaultRef }
+    : clearedDefault;
+
+  if (!normalizedNextKey || !nextProvider) {
+    renderModelsDraftSurface();
+    return;
+  }
+
+  renderModelsDraftSurface();
+}
+
 function renderProviderMatrix(providers) {
   const matrix = $("models-provider-matrix");
   if (!matrix) return;
@@ -1583,7 +1949,11 @@ function renderProviderMatrix(providers) {
       // 生成内部模型标签块（移除小圆点）
       const modelChips = rows.map((r, i) => {
         if (i >= 8) return ""; // 最多展示前8个，防撑爆
-        return `<span class="model-chip">${escapeHtml(r.id)}</span>`;
+        const modelRef = buildProviderModelRef(key, r.id);
+        const allowlisted = isAllowlistedModelRef(modelRef);
+        const isDefault = isDefaultModelRef(modelRef);
+        const chipLabel = isDefault ? "当前默认模型" : allowlisted ? "已加入 allowlist" : "仅接入目录";
+        return `<span class="model-chip" title="${escapeHtml(`${r.id} · ${chipLabel}`)}">${escapeHtml(r.id)}</span>`;
       }).join('');
 
       const overCount = modelCount > 8 ? `<span class="model-chip model-chip-muted">+${modelCount - 8}</span>` : "";
@@ -1759,6 +2129,7 @@ function parseProviderJsonConfig(card, { strict = true, allowEmpty = true } = {}
 function collectProviderModelsFromCard(card, { strict = true, keyForError = "未命名" } = {}) {
   const modelRows = Array.from(card.querySelectorAll("[data-provider-model-row]"));
   const models = [];
+  const rowPolicies = [];
 
   for (let rowIndex = 0; rowIndex < modelRows.length; rowIndex += 1) {
     const modelRow = modelRows[rowIndex];
@@ -1766,6 +2137,8 @@ function collectProviderModelsFromCard(card, { strict = true, keyForError = "未
     const contextWindowRaw = modelRow.querySelector(".provider-model-context")?.value.trim() || "";
     const reasoning = modelRow.querySelector(".provider-model-reasoning-toggle")?.checked === true;
     const inputText = modelRow.querySelector(".provider-model-input")?.value.trim() || "";
+    const allowlisted = modelRow.querySelector(".provider-model-allowlist-toggle")?.checked !== false;
+    const isDefault = modelRow.querySelector(".provider-model-default-toggle")?.checked === true;
     const extrasRaw = modelRow.querySelector(".provider-model-extras")?.value || "{}";
 
     if (!modelId && !contextWindowRaw && !reasoning && !inputText) continue;
@@ -1811,9 +2184,14 @@ function collectProviderModelsFromCard(card, { strict = true, keyForError = "未
     if (contextWindow !== null) modelPayload.contextWindow = contextWindow;
     if (inputValues.length > 0) modelPayload.input = inputValues;
     models.push(modelPayload);
+    rowPolicies.push({
+      id: modelId,
+      allowlisted,
+      isDefault
+    });
   }
 
-  return models;
+  return { models, rowPolicies };
 }
 
 function collectProviderFormState(card, { strict = true } = {}) {
@@ -1821,7 +2199,7 @@ function collectProviderFormState(card, { strict = true } = {}) {
   const baseUrl = card.querySelector(".provider-base-url")?.value.trim() || "";
   const apiKey = card.querySelector(".provider-api-key")?.value.trim() || "";
   const apiType = normalizeProviderApiKind(card.querySelector(".provider-api-type")?.value.trim() || "");
-  const models = collectProviderModelsFromCard(card, { strict, keyForError: key || "未命名" });
+  const { models, rowPolicies } = collectProviderModelsFromCard(card, { strict, keyForError: key || "未命名" });
 
   if (strict) {
     if (!key && !baseUrl && !apiKey && models.length === 0) {
@@ -1838,7 +2216,25 @@ function collectProviderFormState(card, { strict = true } = {}) {
     models
   };
 
-  return { key, providerConfig };
+  const allowlistedModelRefs = [];
+  let defaultModelRef = "";
+  for (const row of rowPolicies) {
+    const modelRef = buildProviderModelRef(key, row.id);
+    if (!modelRef) continue;
+    if (row.allowlisted || row.isDefault) {
+      allowlistedModelRefs.push(modelRef);
+    }
+    if (row.isDefault) {
+      defaultModelRef = modelRef;
+    }
+  }
+
+  return {
+    key,
+    providerConfig,
+    allowlistedModelRefs,
+    defaultModelRef
+  };
 }
 
 function mergeProviderConfigWithJson(formConfig, jsonConfig) {
@@ -1885,6 +2281,22 @@ function syncProviderJsonFromForm(card) {
   card.dataset.jsonSyncLock = "0";
 }
 
+function captureProviderModelPolicySelections(card) {
+  const selections = new Map();
+  const rows = Array.from(card?.querySelectorAll("[data-provider-model-row]") || []);
+
+  for (const row of rows) {
+    const modelId = row.querySelector(".provider-model-id")?.value.trim() || "";
+    if (!modelId) continue;
+    selections.set(modelId, {
+      allowlisted: row.querySelector(".provider-model-allowlist-toggle")?.checked !== false,
+      isDefaultModel: row.querySelector(".provider-model-default-toggle")?.checked === true
+    });
+  }
+
+  return selections;
+}
+
 function fillProviderFormFromJson(card, { silent = false } = {}) {
   const jsonConfig = parseProviderJsonConfig(card, { strict: true, allowEmpty: true });
   if (!jsonConfig || Object.keys(jsonConfig).length === 0) {
@@ -1905,6 +2317,7 @@ function fillProviderFormFromJson(card, { silent = false } = {}) {
   const apiKeyInput = card.querySelector(".provider-api-key");
   const apiTypeSelect = card.querySelector(".provider-api-type");
   const modelList = card.querySelector(".provider-model-list");
+  const currentPolicySelections = captureProviderModelPolicySelections(card);
 
   if (baseUrlInput) baseUrlInput.value = baseUrl;
   if (apiKeyInput) apiKeyInput.value = apiKey;
@@ -1918,7 +2331,20 @@ function fillProviderFormFromJson(card, { silent = false } = {}) {
 
   const normalizedRows = normalizeProviderModels(jsonConfig.models, true);
   if (modelList) {
-    modelList.innerHTML = normalizedRows.map((row) => providerModelRowTemplate(row)).join("");
+    const providerKey = keyInput?.value.trim() || card.getAttribute("data-original-key") || "";
+    modelList.innerHTML = normalizedRows.map((row) => {
+      const modelRef = buildProviderModelRef(providerKey, row.id);
+      const currentPolicy = row.id ? currentPolicySelections.get(row.id) : null;
+      return providerModelRowTemplate({
+        ...row,
+        allowlisted: currentPolicy
+          ? currentPolicy.allowlisted
+          : modelRef ? (isAllowlistedModelRef(modelRef) || isDefaultModelRef(modelRef)) : true,
+        isDefaultModel: currentPolicy
+          ? currentPolicy.isDefaultModel
+          : modelRef ? isDefaultModelRef(modelRef) : false
+      });
+    }).join("");
   }
 
   if (keyInput && !keyInput.value.trim()) {
@@ -1937,18 +2363,31 @@ function collectCurrentProvider() {
     throw new Error("未找到当前 Provider 编辑表单");
   }
 
-  fillProviderFormFromJson(card, { silent: true });
-
-  const { key, providerConfig } = collectProviderFormState(card, { strict: true });
+  const {
+    key,
+    providerConfig,
+    allowlistedModelRefs,
+    defaultModelRef
+  } = collectProviderFormState(card, { strict: true });
   const jsonConfig = parseProviderJsonConfig(card, { strict: true, allowEmpty: true });
   const mergedConfig = mergeProviderConfigWithJson(providerConfig, jsonConfig);
 
-  return { key, providerConfig: mergedConfig };
+  return {
+    key,
+    providerConfig: mergedConfig,
+    allowlistedModelRefs,
+    defaultModelRef
+  };
 }
 
 async function saveCurrentProvider() {
   try {
-    const { key, providerConfig } = collectCurrentProvider();
+    const {
+      key,
+      providerConfig,
+      allowlistedModelRefs,
+      defaultModelRef
+    } = collectCurrentProvider();
     const originalKey = state.providerEditor.originalKey;
     const previousProvider = originalKey ? state.modelProvidersDraft[originalKey] : null;
     const previousApiKey = typeof previousProvider?.apiKey === "string" ? previousProvider.apiKey.trim() : "";
@@ -1975,7 +2414,14 @@ async function saveCurrentProvider() {
 
     state.deletedModelProviderKeys.delete(key);
     state.modelProvidersDraft[key] = providerConfig;
-    renderProviderMatrix(state.modelProvidersDraft);
+    applyProviderPolicyDraft({
+      previousKey: originalKey,
+      previousProvider,
+      nextKey: key,
+      nextProvider: providerConfig,
+      allowlistedModelRefs,
+      defaultModelRef
+    });
     setProviderEditorDirty(false);
     await closeProviderModal({ force: true });
     showToast(`Provider ${key} 已保存到草稿，点击顶部“保存并应用”后生效`, "success");
@@ -2001,9 +2447,17 @@ async function deleteCurrentProvider() {
   if (!confirmed) return;
 
   if (Object.prototype.hasOwnProperty.call(state.modelProvidersDraft, targetKey)) {
+    const targetProvider = state.modelProvidersDraft[targetKey];
     delete state.modelProvidersDraft[targetKey];
     state.deletedModelProviderKeys.add(targetKey);
-    renderProviderMatrix(state.modelProvidersDraft);
+    applyProviderPolicyDraft({
+      previousKey: targetKey,
+      previousProvider: targetProvider,
+      nextKey: "",
+      nextProvider: null,
+      allowlistedModelRefs: [],
+      defaultModelRef: ""
+    });
   }
 
   setProviderEditorDirty(false);
@@ -2014,28 +2468,21 @@ async function deleteCurrentProvider() {
 // （模型选择器和绑定逻辑已移除）
 
 async function loadModels({ silent = false, rethrow = false } = {}) {
+  const content = $("models-content");
+  if (!silent && content) {
+    content.innerHTML = renderSkeleton(5);
+  }
+
   try {
     const data = await api("/api/models");
-    state.modelsHash = data.configHash;
-    state.deletedModelProviderKeys = new Set();
-
-    const cfg = data.modelsConfig || {};
-    const providers = cfg.providers || {};
-    state.modelProvidersDraft = {};
-    for (const [key, provider] of Object.entries(providers)) {
-      state.modelProvidersDraft[key] = cloneProviderConfig(provider);
-    }
-
-    renderProviderEditor("", {}, "");
-    renderProviderMatrix(state.modelProvidersDraft);
+    applyLoadedModelsData(data);
     setModelsApplyState("idle");
   } catch (err) {
     if (!silent) {
       showToast(err.message || String(err), "error");
     }
-    const matrix = $("models-provider-matrix");
-    if (matrix && !matrix.innerHTML.trim()) {
-      matrix.innerHTML = renderEmpty(
+    if (content) {
+      content.innerHTML = renderEmpty(
         "fa-solid fa-plug-circle-xmark",
         "无法加载模型配置",
         '请检查网关连接后点击「重新加载」'
@@ -2048,6 +2495,7 @@ async function loadModels({ silent = false, rethrow = false } = {}) {
 }
 
 async function saveModels() {
+  let expectedModelsState = null;
   try {
     if (state.providerModalOpen && state.providerEditor.dirty) {
       showToast("请先保存当前供应商，或取消本次编辑后再执行“保存并应用”", "warning");
@@ -2064,6 +2512,10 @@ async function saveModels() {
       state.modelProvidersDraft,
       Array.from(state.deletedModelProviderKeys)
     );
+    const agentsDefaultsModels = buildAgentsDefaultsModelsPatchForSave(
+      state.agentsDefaultsModelsDraft,
+      Array.from(state.deletedAllowlistModelRefs)
+    );
 
     if (
       Object.keys(state.modelProvidersDraft).length === 0
@@ -2077,8 +2529,11 @@ async function saveModels() {
       models: {
         providers
       },
+      agentsDefaultsModels,
+      agentsDefaultModel: cloneAgentDefaultModelConfig(state.agentsDefaultModelDraft),
       baseHash: state.modelsHash
     };
+    expectedModelsState = captureExpectedModelsState();
 
     const btn = $("models-save");
     if (btn) {
@@ -2091,13 +2546,32 @@ async function saveModels() {
       body: JSON.stringify(payload)
     });
 
-    showToast("配置已成功下发，正在等待网关热重启...", "info", 1800);
     await closeProviderModal({ force: true });
 
-    const restartDelayMs = Math.max(800, Number(saveResult?.result?.restart?.delayMs || 0) + 400);
-    setModelsApplyState("restarting", "网关热重启中，正在等待重新连接...");
+    const restart = saveResult?.result?.restart;
+    const restartDelayMs = Math.max(800, Number(restart?.delayMs || 0) + 400);
+
+    if (restart?.coalesced) {
+      showToast("配置已保存。网关重启已合并到先前的请求中，模型变更可能需要网关完成重启后才会生效。", "warning", 5000);
+      setModelsApplyState("restarting", "等待网关完成合并重启...");
+    } else {
+      showToast("配置已成功下发，正在等待网关热重启...", "info", 1800);
+      setModelsApplyState("restarting", "网关热重启中，正在等待重新连接...");
+    }
     await waitForModelsGatewayRecovery({ initialDelayMs: restartDelayMs });
   } catch (err) {
+    if (expectedModelsState && isLikelyGatewayHotRestartError(err)) {
+      showToast("保存响应在网关重启时中断，正在核对配置是否已生效...", "warning", 2600);
+      const verification = await verifyModelsSaveApplied(expectedModelsState);
+      if (verification.verified) {
+        await closeProviderModal({ force: true });
+        showToast("配置已确认生效，刚才的断线来自网关热重启。", "success", 2600);
+        return;
+      }
+      setModelsApplyState("error", "网关已断开，但暂时无法确认配置是否生效。请重新加载后核对。");
+      showToast("保存结果暂时无法确认，请重新加载后核对配置。", "error", 4000);
+      return;
+    }
     showToast(err.message || String(err), "error");
   } finally {
     if (state.modelsApply.phase === "idle") {
@@ -6452,8 +6926,8 @@ function bindEvents() {
     }
   });
 
-  const providerMatrix = $("models-provider-matrix");
-  providerMatrix?.addEventListener("click", (event) => {
+  const modelsContent = $("models-content");
+  modelsContent?.addEventListener("click", (event) => {
     if (event.target.closest("[data-provider-matrix-add]")) {
       openProviderModal({ mode: "create" });
       return;
@@ -6582,6 +7056,16 @@ function bindEvents() {
   providerEditor?.addEventListener("change", (event) => {
     const card = event.target.closest("[data-provider-card]");
     if (!card) return;
+    if (event.target.classList.contains("provider-model-default-toggle") && event.target.checked) {
+      const row = event.target.closest("[data-provider-model-row]");
+      const allowlistToggle = row?.querySelector(".provider-model-allowlist-toggle");
+      if (allowlistToggle) allowlistToggle.checked = true;
+    }
+    if (event.target.classList.contains("provider-model-allowlist-toggle") && !event.target.checked) {
+      const row = event.target.closest("[data-provider-model-row]");
+      const defaultToggle = row?.querySelector(".provider-model-default-toggle");
+      if (defaultToggle) defaultToggle.checked = false;
+    }
     setProviderEditorDirty(true);
     if (event.target.classList.contains("provider-json-config")) return;
     syncProviderJsonFromForm(card);
