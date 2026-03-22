@@ -66,6 +66,9 @@ Session-token auth stored in a `SESSIONS` Map.
 | `/api/nodes/describe` | GET | Yes | Fetch node details |
 | `/api/nodes/invoke` | POST | Yes | Invoke node action |
 | `/api/logs` | GET | Yes | Fetch logs (polled by frontend) |
+| `/api/gateway/restart` | POST | Partial | Restart gateway: hot (via config.patch RPC) or hard (SIGTERM via shell) |
+| `/api/gateway/doctor` | GET | Yes | Run diagnostics (health, channels, memory status) |
+| `/api/gateway/doctor/fix` | POST | No | Execute auto-fix (placeholder) |
 
 ---
 

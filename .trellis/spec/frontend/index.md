@@ -44,7 +44,7 @@ Rendered into `index.html` sections by `app.js`:
 
 | Nav item | Section ID | API used |
 |---|---|---|
-| 仪表盘 (Overview) | `#view-overview` | `GET /api/overview` + `GET /api/system-load` |
+| 仪表盘 (Overview) | `#view-overview` | `GET /api/overview` + `GET /api/system-load` + `POST /api/gateway/restart` + `GET /api/gateway/doctor` |
 | 模型管理 (Models) | `#view-models` | `GET /api/models`, `POST /api/models/save` |
 | 技能状态 (Skills) | `#view-skills` | `GET /api/skills`, `POST /api/skills/update`, `POST /api/skills/install` |
 | 任务计划 (Cron) | `#view-cron` | `GET /api/cron/list`, `GET /api/cron/runs`, `POST /api/cron/add\|update\|remove\|run` |

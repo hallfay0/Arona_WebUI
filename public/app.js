@@ -1324,6 +1324,242 @@ async function loadOverview() {
 
 // （别名和默认模型相关控制已被移除）
 
+// ── Gateway Restart & Doctor ─────────────────────────────────────
+
+async function waitForGatewayRecovery({
+  initialDelayMs = 1200,
+  preRestartDelayMs = 0,
+  retryDelayMs = 900,
+  maxAttempts = 15,
+  onStatus = () => {}
+} = {}) {
+  // Phase 0: wait for the scheduled restart delay (from gateway response)
+  if (preRestartDelayMs > 0) {
+    onStatus("scheduled", `网关计划在 ${Math.ceil(preRestartDelayMs / 1000)} 秒后重启...`);
+    await wait(preRestartDelayMs);
+  }
+
+  if (initialDelayMs > 0) await wait(initialDelayMs);
+
+  // Helper: check if gateway is actually up (doctor returns ok: true)
+  async function isGatewayUp() {
+    try {
+      const result = await api("/api/gateway/doctor");
+      return result?.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Phase 1: wait for gateway to actually go down (probe until disconnect)
+  onStatus("waiting-down", "等待网关开始重启...");
+  for (let i = 0; i < 12; i++) {
+    if (!(await isGatewayUp())) break;
+    await wait(800);
+  }
+
+  // Phase 2: wait for gateway to come back up
+  onStatus("waiting-up", "网关正在重启，等待恢复...");
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    onStatus("recovering", `回连中 (${attempt}/${maxAttempts})`);
+    if (await isGatewayUp()) return true;
+    if (attempt < maxAttempts) await wait(retryDelayMs);
+  }
+  return false;
+}
+
+async function handleGatewayRestart() {
+  const restartBtn = $("overview-restart");
+  if (!restartBtn || restartBtn.disabled) return;
+
+  // Pre-restart doctor check
+  restartBtn.disabled = true;
+  const origLabel = restartBtn.innerHTML;
+  restartBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 预检中...';
+
+  let doctorOk = true;
+  try {
+    const doctorResult = await api("/api/gateway/doctor");
+    const errors = (doctorResult?.issues || []).filter((i) => i.severity === "error");
+    if (errors.length > 0) {
+      restartBtn.disabled = false;
+      restartBtn.innerHTML = origLabel;
+      showToast("检测到严重问题，请先修复后再重启", "error", 3000);
+      showDoctorModal(doctorResult.issues, doctorResult.info || {});
+      return;
+    }
+  } catch {
+    doctorOk = false;
+  }
+
+  restartBtn.innerHTML = origLabel;
+  restartBtn.disabled = false;
+
+  const confirmed = await requestConfirmDialog({
+    title: "重启网关",
+    message: doctorOk
+      ? "预检通过，将执行热重启（in-process reload）。网关会先等待进行中的任务完成，再平滑重载配置并恢复服务，整个过程通常需要几秒到半分钟。"
+      : "预检未能连接网关，网关可能已无响应。将执行硬重启（终止进程并由系统服务重新拉起），恢复时间视进程管理器而定，通常需要十几秒到一分钟。",
+    confirmText: doctorOk ? "确认热重启" : "确认硬重启",
+    cancelText: "取消",
+    variant: "danger"
+  });
+  if (!confirmed) return;
+
+  const mode = doctorOk ? "hot" : "hard";
+  await executeGatewayRestart(restartBtn, origLabel, mode);
+}
+
+async function executeGatewayRestart(restartBtn, origLabel, mode) {
+  restartBtn.disabled = true;
+  const isHot = mode === "hot";
+  restartBtn.innerHTML = isHot
+    ? '<i class="fa-solid fa-spinner fa-spin"></i> 热重启中...'
+    : '<i class="fa-solid fa-spinner fa-spin"></i> 硬重启中...';
+
+  try {
+    const result = await api("/api/gateway/restart", {
+      method: "POST",
+      body: JSON.stringify({ mode })
+    });
+
+    // Use timing from gateway response for hot restart
+    const delayMs = Number(result?.restart?.delayMs || 0);
+    const cooldownMs = Number(result?.restart?.cooldownMsApplied || 0);
+    const preRestartDelayMs = isHot ? Math.max(0, delayMs + cooldownMs) : 0;
+
+    const recovered = await waitForGatewayRecovery({
+      preRestartDelayMs,
+      initialDelayMs: isHot ? 500 : 3000,
+      retryDelayMs: isHot ? 900 : 1500,
+      maxAttempts: isHot ? 20 : 25,
+      onStatus: (phase, msg) => {
+        restartBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${msg}`;
+      }
+    });
+
+    if (recovered) {
+      showToast(`网关${isHot ? "热" : "硬"}重启完成`, "success", 2000);
+      loadOverview();
+    } else {
+      showToast(`网关${isHot ? "热" : "硬"}重启后未能恢复连接，请检查网关状态`, "error", 5000);
+    }
+  } catch (err) {
+    // Restart request may fail because the gateway disconnects during the RPC call
+    // (timeout, connection reset, etc.) — this is expected behavior during restart.
+    // Always attempt recovery instead of immediately showing failure.
+    if (isHot) {
+      restartBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 网关正在重启...';
+      const recovered = await waitForGatewayRecovery({
+        initialDelayMs: 2500,
+        maxAttempts: 20,
+        onStatus: (phase, msg) => {
+          restartBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${msg}`;
+        }
+      });
+      if (recovered) {
+        showToast("网关热重启完成", "success", 2000);
+        loadOverview();
+      } else {
+        showToast("网关热重启后未能恢复连接，请检查网关状态", "error", 5000);
+      }
+    } else {
+      showToast(`重启失败: ${err.message || err}`, "error", 4000);
+    }
+  } finally {
+    restartBtn.disabled = false;
+    restartBtn.innerHTML = origLabel;
+  }
+}
+
+async function handleGatewayDoctor() {
+  const doctorBtn = $("overview-doctor");
+  if (!doctorBtn || doctorBtn.disabled) return;
+
+  const origLabel = doctorBtn.innerHTML;
+  doctorBtn.disabled = true;
+  doctorBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 诊断中...';
+
+  try {
+    const result = await api("/api/gateway/doctor");
+    const issues = result?.issues || [];
+
+    if (issues.length === 0) {
+      showToast("一切正常！网关运行状态良好", "success", 3000);
+      return;
+    }
+
+    showDoctorModal(issues, result?.info || {});
+  } catch (err) {
+    showDoctorModal([{
+      id: "request-failed",
+      severity: "error",
+      title: "诊断请求失败",
+      detail: err.message || String(err),
+      autoFixable: false,
+      hint: "请检查 WebUI 后端与网关的连接"
+    }], {});
+  } finally {
+    doctorBtn.disabled = false;
+    doctorBtn.innerHTML = origLabel;
+  }
+}
+
+function showDoctorModal(issues, info) {
+  const modal = $("doctor-modal");
+  const content = $("doctor-modal-content");
+  if (!modal || !content) return;
+
+  const infoHtml = (info.version || info.uptime) ? `
+    <div style="padding:.8em 1.2em;border-bottom:1px solid var(--glass-border);display:flex;gap:1.2em;flex-wrap:wrap;font-size:.85em;color:var(--text-secondary)">
+      ${info.version ? `<span><i class="fa-solid fa-code-branch" style="margin-right:.3em"></i>版本: ${escapeHtml(String(info.version))}</span>` : ""}
+      ${info.uptime != null ? `<span><i class="fa-regular fa-clock" style="margin-right:.3em"></i>运行时长: ${formatUptime(info.uptime)}</span>` : ""}
+      ${info.platform ? `<span><i class="fa-solid fa-desktop" style="margin-right:.3em"></i>${escapeHtml(String(info.platform))}</span>` : ""}
+    </div>
+  ` : "";
+
+  const issuesHtml = issues.map((issue) => {
+    const sevIcon = issue.severity === "error"
+      ? '<i class="fa-solid fa-circle-xmark" style="color:var(--danger-text)"></i>'
+      : '<i class="fa-solid fa-triangle-exclamation" style="color:var(--warning-text)"></i>';
+    const sevLabel = issue.severity === "error" ? "错误" : "警告";
+
+    return `
+      <div class="doctor-issue" style="padding:.8em 1.2em;border-bottom:1px solid var(--glass-border)">
+        <div style="display:flex;align-items:center;gap:.5em;margin-bottom:.3em">
+          ${sevIcon}
+          <strong style="flex:1">${escapeHtml(issue.title)}</strong>
+          <span class="status-badge status-badge-tight ${issue.severity === 'error' ? 'bad' : 'warn'}">${sevLabel}</span>
+        </div>
+        <div style="font-size:.85em;color:var(--text-secondary);margin-bottom:.4em">${escapeHtml(issue.detail)}</div>
+        ${issue.hint ? `<div style="font-size:.82em;color:var(--text-tertiary)"><i class="fa-solid fa-lightbulb" style="margin-right:.3em;color:var(--warning-text)"></i>${escapeHtml(issue.hint)}</div>` : ""}
+      </div>
+    `;
+  }).join("");
+
+  content.innerHTML = infoHtml + issuesHtml;
+
+  modal.classList.add("open");
+  modal.setAttribute("aria-hidden", "false");
+}
+
+function closeDoctorModal() {
+  const modal = $("doctor-modal");
+  if (!modal) return;
+  modal.classList.remove("open");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function formatUptime(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "-";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  if (d > 0) return `${d}天${h}小时`;
+  if (h > 0) return `${h}小时${m}分钟`;
+  return `${m}分钟`;
+}
+
 function cloneProviderConfig(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   try {
@@ -6854,6 +7090,24 @@ function bindEvents() {
         overviewRefreshBtn.disabled = false;
         overviewRefreshBtn.innerHTML = label;
       }
+    });
+  }
+
+  const overviewRestartBtn = $("overview-restart");
+  if (overviewRestartBtn) {
+    overviewRestartBtn.addEventListener("click", handleGatewayRestart);
+  }
+
+  const overviewDoctorBtn = $("overview-doctor");
+  if (overviewDoctorBtn) {
+    overviewDoctorBtn.addEventListener("click", handleGatewayDoctor);
+  }
+
+  // Doctor modal close handlers
+  const doctorModal = $("doctor-modal");
+  if (doctorModal) {
+    doctorModal.querySelectorAll("[data-doctor-close]").forEach((el) => {
+      el.addEventListener("click", closeDoctorModal);
     });
   }
 

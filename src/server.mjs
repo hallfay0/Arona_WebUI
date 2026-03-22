@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
+import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // Load .env.local if it exists (local dev config, not committed to git)
@@ -1315,6 +1316,200 @@ async function handleApi(req, res, pathname, query) {
       if (limitRaw !== null && limitRaw !== "") params.limit = Number.parseInt(limitRaw, 10);
       const data = await withGateway((gateway) => gateway.request("logs.tail", params));
       return jsonResponse(res, 200, data);
+    }
+
+    // ── Gateway restart ──────────────────────────────────────────────
+    if (req.method === "POST" && pathname === "/api/gateway/restart") {
+      const body = await parseBody(req);
+      const mode = body.mode || "hot";
+
+      if (mode === "hot") {
+        try {
+          const data = await withGateway(async (gateway) => {
+            const snapshot = await gateway.request("config.get", {});
+            const baseHash = snapshot?.hash || snapshot?.baseHash;
+            const result = await gateway.request("config.patch", {
+              raw: "{}",
+              baseHash,
+            });
+            return { restart: result?.restart || { scheduled: true } };
+          });
+          return jsonResponse(res, 200, { ok: true, mode: "hot", ...data });
+        } catch (error) {
+          return jsonResponse(res, 502, {
+            ok: false,
+            mode: "hot",
+            error: `热重启失败: ${error instanceof Error ? error.message : String(error)}`,
+            hint: "可尝试硬重启",
+          });
+        }
+      }
+
+      if (mode === "hard") {
+        const isDocker = fs.existsSync("/.dockerenv");
+        if (isDocker) {
+          return jsonResponse(res, 400, {
+            ok: false,
+            mode: "hard",
+            error: "Docker 容器内无法执行硬重启",
+            hint: "请在宿主机执行: docker restart <container>",
+          });
+        }
+        try {
+          const gwUrl = new URL(gatewayConfig.url.replace(/^ws/, "http"));
+          const port = gwUrl.port || "18789";
+          let pid;
+          try {
+            pid = execSync(`lsof -ti tcp:${port}`, { encoding: "utf8" }).trim().split("\n")[0];
+          } catch {
+            // lsof not available or no process found, try ss + /proc
+            try {
+              const ssOut = execSync(`ss -tlnp sport = :${port}`, { encoding: "utf8" });
+              const pidMatch = ssOut.match(/pid=(\d+)/);
+              pid = pidMatch ? pidMatch[1] : null;
+            } catch { pid = null; }
+          }
+          if (!pid || !/^\d+$/.test(pid)) {
+            return jsonResponse(res, 404, {
+              ok: false,
+              mode: "hard",
+              error: `未找到监听端口 ${port} 的网关进程`,
+              hint: "请确认网关正在运行，或手动重启网关进程",
+            });
+          }
+          process.kill(Number(pid), "SIGTERM");
+          return jsonResponse(res, 200, {
+            ok: true,
+            mode: "hard",
+            pid: Number(pid),
+            message: "已发送 SIGTERM 信号，网关将由进程管理器重新拉起",
+          });
+        } catch (error) {
+          return jsonResponse(res, 500, {
+            ok: false,
+            mode: "hard",
+            error: `硬重启失败: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      }
+
+      return jsonResponse(res, 400, { ok: false, error: `不支持的重启模式: ${mode}` });
+    }
+
+    // ── Gateway doctor ───────────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/gateway/doctor") {
+      const issues = [];
+      let info = {};
+
+      try {
+        const data = await withGateway(async (gateway) => {
+          const [health, status, channels, memoryStatus] = await Promise.all([
+            gateway.request("health", { probe: true }).catch((e) => ({ _error: e })),
+            gateway.request("status", {}).catch((e) => ({ _error: e })),
+            gateway.request("channels.status", {}).catch((e) => ({ _error: e })),
+            gateway.request("doctor.memory.status", {}).catch((e) => ({ _error: e })),
+          ]);
+          return { health, status, channels, memoryStatus };
+        });
+
+        // Health check
+        if (data.health?._error) {
+          issues.push({
+            id: "health-failed",
+            severity: "error",
+            title: "网关健康检查失败",
+            detail: String(data.health._error.message || data.health._error),
+            autoFixable: false,
+            hint: "请检查网关进程是否正常运行，可尝试重启网关",
+          });
+        }
+
+        // Status info
+        if (data.status && !data.status._error) {
+          info = {
+            version: data.status.runtimeVersion,
+          };
+        }
+
+        // Uptime from health probe
+        if (data.health && !data.health._error) {
+          if (data.health.uptime != null) info.uptime = data.health.uptime;
+          if (data.health.platform) info.platform = data.health.platform;
+          if (data.health.nodeVersion) info.nodeVersion = data.health.nodeVersion;
+        }
+
+        // Channels check
+        if (data.channels && !data.channels._error) {
+          const channelMap = data.channels.channels || {};
+          const channelAccounts = data.channels.channelAccounts || {};
+          for (const [name, ch] of Object.entries(channelMap)) {
+            if (!ch?.configured) continue;
+            const accounts = Array.isArray(channelAccounts[name]) ? channelAccounts[name] : [];
+            const hasConnected = ch.connected === true || accounts.some((a) => a?.connected === true);
+            const hasRunning = ch.running === true || accounts.some((a) => a?.running === true);
+            if (!hasConnected && !hasRunning) {
+              issues.push({
+                id: `channel-offline-${name}`,
+                severity: "warning",
+                title: `频道 ${name} 离线`,
+                detail: ch.lastError || "频道已配置但未连接",
+                autoFixable: false,
+                hint: `请检查 ${name} 频道配置和凭证是否正确，或尝试重启网关`,
+              });
+            }
+          }
+        }
+
+        // Memory/Embedding check
+        if (data.memoryStatus && !data.memoryStatus._error) {
+          if (!data.memoryStatus.embedding?.ok) {
+            issues.push({
+              id: "memory-embedding-unavailable",
+              severity: "warning",
+              title: "Memory/Embedding 服务不可用",
+              detail: data.memoryStatus.embedding?.error || "Embedding 服务未就绪",
+              autoFixable: false,
+              hint: "请检查 embedding 模型配置是否正确，确认 API Key 有效",
+            });
+          }
+        } else if (data.memoryStatus?._error) {
+          issues.push({
+            id: "memory-probe-failed",
+            severity: "warning",
+            title: "Memory 状态探测失败",
+            detail: String(data.memoryStatus._error.message || data.memoryStatus._error),
+            autoFixable: false,
+            hint: "网关可能不支持 doctor.memory.status 方法，可忽略此项",
+          });
+        }
+
+        return jsonResponse(res, 200, { ok: true, issues, info });
+      } catch (error) {
+        // Gateway completely unreachable
+        issues.push({
+          id: "gateway-unreachable",
+          severity: "error",
+          title: "网关无法连接",
+          detail: error instanceof Error ? error.message : String(error),
+          autoFixable: false,
+          hint: "请确认网关进程正在运行，或尝试硬重启",
+        });
+        return jsonResponse(res, 200, { ok: false, issues, info });
+      }
+    }
+
+    if (req.method === "POST" && pathname === "/api/gateway/doctor/fix") {
+      const body = await parseBody(req);
+      const fixId = body.fixId;
+      if (!fixId) {
+        return jsonResponse(res, 400, { ok: false, error: "缺少 fixId 参数" });
+      }
+      // Placeholder for future auto-fix capabilities
+      return jsonResponse(res, 200, {
+        ok: false,
+        fixId,
+        error: "该问题暂不支持自动修复，请参考诊断建议手动处理",
+      });
     }
 
     return jsonResponse(res, 404, { ok: false, error: "API endpoint not found" });

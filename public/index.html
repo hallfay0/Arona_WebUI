@@ -146,13 +146,19 @@
     <!-- 主内容区 -->
     <main class="admin-main">
       <section id="view-overview" class="view active">
-        <div class="view-shell-head">
+        <div class="view-shell-head view-shell-head-wrap">
           <div class="view-shell-copy">
             <h2 class="view-shell-title">仪表盘</h2>
             <p class="view-shell-subtitle">欢迎回来，阿洛娜随时为您待命！</p>
           </div>
-          <button type="button" id="overview-refresh" class="panel-action-btn btn-secondary"><i class="fa-solid fa-rotate-right"></i>
-            立即刷新</button>
+          <div class="view-shell-actions">
+            <button type="button" id="overview-doctor" class="panel-action-btn btn-secondary"><i class="fa-solid fa-stethoscope"></i>
+              诊断</button>
+            <button type="button" id="overview-refresh" class="panel-action-btn btn-secondary"><i class="fa-solid fa-rotate-right"></i>
+              刷新</button>
+            <button type="button" id="overview-restart" class="panel-action-btn btn-secondary overview-restart-btn"><i class="fa-solid fa-power-off"></i>
+              重启网关</button>
+          </div>
         </div>
         <div id="overview-content"></div>
       </section>
@@ -637,6 +643,24 @@
       <div class="provider-modal-foot confirm-modal-foot">
         <button type="button" class="panel-action-btn btn-secondary btn-ghost confirm-modal-cancel-btn" data-confirm-cancel>取消</button>
         <button type="button" id="confirm-modal-accept" class="btn-primary btn-primary-strong confirm-modal-confirm-btn" data-confirm-accept>确认</button>
+      </div>
+    </section>
+  </div>
+  <div id="doctor-modal" class="provider-modal-shell doctor-modal-shell" aria-hidden="true">
+    <div class="provider-modal-backdrop" data-doctor-close></div>
+    <section class="provider-modal-panel doctor-modal-panel" role="dialog" aria-modal="true"
+      aria-labelledby="doctor-modal-title">
+      <div class="provider-modal-head">
+        <h3 id="doctor-modal-title" class="provider-modal-title"><i class="fa-solid fa-stethoscope" style="margin-right:.4em"></i>网关诊断报告</h3>
+        <button type="button" class="provider-modal-close" data-doctor-close aria-label="关闭">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+      <div class="provider-modal-body" style="padding:0">
+        <div id="doctor-modal-content"></div>
+      </div>
+      <div class="provider-modal-foot">
+        <button type="button" class="panel-action-btn btn-secondary btn-ghost" data-doctor-close>关闭</button>
       </div>
     </section>
   </div>

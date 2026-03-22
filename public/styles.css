@@ -5040,6 +5040,29 @@ select option {
   overflow-y: auto;
 }
 
+.doctor-modal-shell {
+  z-index: 1100;
+}
+
+.doctor-modal-panel {
+  max-width: 560px;
+}
+
+.doctor-modal-panel .provider-modal-body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.overview-restart-btn {
+  color: var(--danger-text, #f87171);
+  border-color: color-mix(in srgb, var(--danger-text, #f87171) 30%, transparent);
+}
+
+.overview-restart-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger-text, #f87171) 12%, transparent);
+  border-color: var(--danger-text, #f87171);
+}
+
 .cron-run-item {
   padding: 12px 16px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
