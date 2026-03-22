@@ -1763,8 +1763,46 @@ body {
 }
 
 .chat-bubble-content-streaming {
-  white-space: pre-wrap;
   word-break: break-word;
+}
+
+.chat-bubble-content-streaming::after {
+  content: "";
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  background: var(--accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  opacity: 1;
+  animation: cursor-blink calc(var(--motion-duration-slow) * 3) steps(2) infinite;
+  transition: opacity var(--motion-duration-slow) var(--motion-ease-out);
+}
+
+.chat-bubble-content-stream-finished::after {
+  animation: none;
+  opacity: 0;
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* "思考中..." placeholder — pulsing animation, no typing cursor */
+.chat-bubble-thinking {
+  word-break: break-word;
+}
+
+.chat-bubble-thinking .thinking-dots {
+  color: var(--foreground-muted, var(--foreground));
+  opacity: 0.7;
+  animation: thinking-pulse calc(var(--motion-duration-slow) * 5) ease-in-out infinite;
+}
+
+@keyframes thinking-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
 }
 
 .chat-markdown p,
@@ -6316,7 +6354,9 @@ body.confirm-modal-open {
 
   .ambient-blob,
   .empty-icon,
-  .skeleton-text::after {
+  .skeleton-text::after,
+  .chat-bubble-content-streaming::after,
+  .chat-bubble-thinking .thinking-dots {
     animation: none;
   }
 

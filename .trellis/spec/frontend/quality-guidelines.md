@@ -89,6 +89,13 @@ function stopOverviewTimers() {
 - `npm start` 启动后在浏览器中验证各视图功能
 - 安全编码模式（escapeHtml 等）从源头防止漏洞
 
+如果改动了 Chat / Playground 流式渲染，还应额外验证：
+- 流式阶段文本长度会持续增长，而不是只在结束时整块跳变
+- pending 状态下 Markdown 已经开始渲染（至少覆盖标题 / 列表 / 代码块其中几项）
+- final 时光标进入淡出过渡，而不是瞬间消失
+- 中途切换会话、断开连接、重新加载历史后，不会残留旧 streaming DOM / 定时器
+- 亮色 / 暗色主题和 `prefers-reduced-motion` 下都可读且不会出现异常闪烁
+
 ---
 
 ## Code Review Checklist

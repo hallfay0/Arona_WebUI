@@ -76,13 +76,13 @@ const state = {
     sending: false,
     manualAuthSecret: "",
     lastStatusReason: "",
-    deltaFlushTimer: null,
-    deltaFlushIsRaf: false,
-    pendingDeltaByRun: new Map(),
     streamTargetByMessage: new Map(),
     streamAnimationTimer: null,
     streamAnimationIsRaf: false,
     streamAnimationLastTs: 0,
+    streamLastDomUpdateTs: 0,
+    streamCursorFadeIds: new Set(),
+    streamCursorFadeTimers: new Map(),
     historyLimit: 10,
     historyBatchSize: 10,
     historyMaxLimit: 1000,
@@ -92,6 +92,7 @@ const state = {
 };
 
 const REDACTED_API_KEY_TOKEN = "__OPENCLAW_REDACTED__";
+const CHAT_STREAM_CURSOR_FADE_MS = 320;
 
 // Skills 缓存，供配置弹窗读取
 let _skillsCache = [];
@@ -929,6 +930,41 @@ function renderMarkdown(value) {
   }
 
   return chunks.join("");
+}
+
+function autoCloseMarkdown(text) {
+  let result = String(text || "");
+  if (!result) return result;
+
+  // Close unclosed code fences (``` blocks)
+  const fenceMatches = result.match(/^```/gm);
+  if (fenceMatches && fenceMatches.length % 2 !== 0) {
+    return `${result}\n\`\`\``;
+  }
+
+  // For the last line, close unclosed inline markers
+  const lines = result.split("\n");
+  const lastLine = lines[lines.length - 1];
+
+  // Close unclosed backticks
+  const backtickCount = (lastLine.match(/(?<!\\)`/g) || []).length;
+  if (backtickCount % 2 !== 0) {
+    result += "`";
+  }
+
+  const starRuns = [...lastLine.matchAll(/(?<!\\)\*+/g)].map((match) => match[0].length);
+  const boldCount = starRuns.reduce((total, count) => total + Math.floor(count / 2), 0);
+  if (boldCount % 2 !== 0) {
+    result += "**";
+  }
+
+  // Close unclosed italic markers (*)
+  const singleStarCount = starRuns.reduce((total, count) => total + (count % 2), 0);
+  if (singleStarCount > 0 && singleStarCount % 2 !== 0) {
+    result += "*";
+  }
+
+  return result;
 }
 
 function escapeRegExp(value) {
@@ -5036,9 +5072,8 @@ async function savePersonaFile() {
 function setChatViewActive(active) {
   state.chat.viewActive = active === true;
   if (!state.chat.viewActive) {
-    clearChatDeltaFlushScheduler();
-    state.chat.pendingDeltaByRun.clear();
     clearChatStreamAnimationScheduler();
+    clearChatStreamCursorFadeState();
     toggleChatSessionsPanel(false);
     return;
   }
@@ -5151,42 +5186,6 @@ function joinStreamTextFromSegments(segments) {
     .join("");
 }
 
-function clearChatDeltaFlushScheduler() {
-  if (!state.chat.deltaFlushTimer) return;
-
-  if (state.chat.deltaFlushIsRaf && typeof cancelAnimationFrame === "function") {
-    cancelAnimationFrame(state.chat.deltaFlushTimer);
-  } else {
-    clearTimeout(state.chat.deltaFlushTimer);
-  }
-
-  state.chat.deltaFlushTimer = null;
-  state.chat.deltaFlushIsRaf = false;
-}
-
-function scheduleChatDeltaFlushScheduler() {
-  if (state.chat.deltaFlushTimer) return;
-
-  if (typeof requestAnimationFrame === "function") {
-    state.chat.deltaFlushIsRaf = true;
-    state.chat.deltaFlushTimer = requestAnimationFrame(() => {
-      state.chat.deltaFlushTimer = null;
-      state.chat.deltaFlushIsRaf = false;
-      flushPendingRunDeltas();
-      if (state.chat.pendingDeltaByRun.size > 0) {
-        scheduleChatDeltaFlushScheduler();
-      }
-    });
-    return;
-  }
-
-  state.chat.deltaFlushIsRaf = false;
-  state.chat.deltaFlushTimer = setTimeout(() => {
-    state.chat.deltaFlushTimer = null;
-    flushPendingRunDeltas();
-  }, 16);
-}
-
 function clearChatStreamAnimationScheduler({ clearTargets = true } = {}) {
   if (state.chat.streamAnimationTimer) {
     if (state.chat.streamAnimationIsRaf && typeof cancelAnimationFrame === "function") {
@@ -5199,30 +5198,98 @@ function clearChatStreamAnimationScheduler({ clearTargets = true } = {}) {
   state.chat.streamAnimationTimer = null;
   state.chat.streamAnimationIsRaf = false;
   state.chat.streamAnimationLastTs = 0;
+  state.chat.streamLastDomUpdateTs = 0;
 
   if (clearTargets) {
     state.chat.streamTargetByMessage.clear();
   }
 }
 
-function advanceStreamDisplayText(currentText, targetText, charBudget) {
+function clearChatStreamCursorFadeState(messageId = "") {
+  const clearOne = (id) => {
+    const key = String(id || "").trim();
+    if (!key) return;
+
+    const timer = state.chat.streamCursorFadeTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    state.chat.streamCursorFadeTimers.delete(key);
+    state.chat.streamCursorFadeIds.delete(key);
+  };
+
+  const key = String(messageId || "").trim();
+  if (key) {
+    clearOne(key);
+    return;
+  }
+
+  for (const id of state.chat.streamCursorFadeTimers.keys()) {
+    clearOne(id);
+  }
+  state.chat.streamCursorFadeIds.clear();
+}
+
+function startChatStreamCursorFade(messageId) {
+  const key = String(messageId || "").trim();
+  if (!key) return;
+
+  clearChatStreamCursorFadeState(key);
+  state.chat.streamCursorFadeIds.add(key);
+
+  const timer = setTimeout(() => {
+    state.chat.streamCursorFadeTimers.delete(key);
+    if (!state.chat.streamCursorFadeIds.delete(key)) return;
+
+    const updated = updateChatMessageRows([key], { scrollOnUpdate: false, forceFull: true });
+    if (!updated) {
+      renderChatMessages({ autoScroll: false });
+    }
+  }, CHAT_STREAM_CURSOR_FADE_MS);
+
+  state.chat.streamCursorFadeTimers.set(key, timer);
+}
+
+function advanceStreamText(currentText, targetText, deltaMs) {
   const current = String(currentText || "") === "思考中..." ? "" : String(currentText || "");
   const target = String(targetText || "");
-  const budget = Math.max(1, Number(charBudget) || 1);
 
   if (!target) return current;
   if (current === target) return current;
-  if (!current) return target.slice(0, budget);
+  if (!current) return target.slice(0, Math.min(3, target.length));
 
-  if (target.startsWith(current)) {
-    return `${current}${target.slice(current.length, current.length + budget)}`;
-  }
-
-  if (current.startsWith(target)) {
+  if (!target.startsWith(current)) {
+    if (current.startsWith(target)) return target;
     return target;
   }
 
-  return target;
+  const gap = target.length - current.length;
+  if (gap <= 0) return target;
+
+  // Inspired by OpenWebUI: randomized chunk sizes for natural feel
+  // Target ~80-150 chars/s visible speed (rAF fires ~60fps, DOM throttled to ~80ms)
+  let charBudget;
+  if (gap < 10) {
+    // Almost caught up — slow natural finish, 1-2 chars
+    charBudget = 1 + Math.floor(Math.random() * 2);
+  } else if (gap < 40) {
+    // Gentle pace — 2-5 chars per frame
+    charBudget = 2 + Math.floor(Math.random() * 4);
+  } else if (gap < 120) {
+    // Normal streaming — 5-10 chars per frame
+    charBudget = 5 + Math.floor(Math.random() * 6);
+  } else if (gap < 300) {
+    // Catch-up — 10-18 chars per frame
+    charBudget = 10 + Math.floor(Math.random() * 9);
+  } else {
+    // Big backlog — 18-30 chars per frame
+    charBudget = 18 + Math.floor(Math.random() * 13);
+  }
+
+  const frameScale = Math.max(0.75, Math.min(2.5, (Number(deltaMs) || 16) / 16));
+  charBudget = Math.max(1, Math.min(gap, Math.round(charBudget * frameScale)));
+
+  return current + target.slice(current.length, current.length + charBudget);
 }
 
 function scheduleChatStreamAnimation() {
@@ -5238,9 +5305,9 @@ function scheduleChatStreamAnimation() {
     const lastTs = state.chat.streamAnimationLastTs || nowTs;
     const deltaMs = Math.max(8, Math.min(48, nowTs - lastTs));
     state.chat.streamAnimationLastTs = nowTs;
-    const charBudget = Math.max(8, Math.min(56, Math.round(deltaMs * 1.4)));
 
     const touched = [];
+    let anyCompleted = false;
     for (const [messageId, targetText] of state.chat.streamTargetByMessage.entries()) {
       const id = String(messageId || "").trim();
       if (!id) {
@@ -5255,7 +5322,7 @@ function scheduleChatStreamAnimation() {
       }
 
       const currentText = String(message.text || "");
-      const nextText = advanceStreamDisplayText(currentText, targetText, charBudget);
+      const nextText = advanceStreamText(currentText, targetText, deltaMs);
       if (nextText !== currentText) {
         message.text = nextText;
         syncMessageTextSegment(message);
@@ -5264,13 +5331,19 @@ function scheduleChatStreamAnimation() {
 
       if (nextText === String(targetText || "")) {
         state.chat.streamTargetByMessage.delete(messageId);
+        anyCompleted = true;
       }
     }
 
+    // Throttle DOM updates: only flush to DOM every ~80ms, or immediately when a stream completes
     if (touched.length > 0) {
-      const incrementalUpdated = updateChatMessageRows(touched, { scrollOnUpdate: true });
-      if (!incrementalUpdated) {
-        renderChatMessages();
+      const lastDomTs = state.chat.streamLastDomUpdateTs || 0;
+      if (anyCompleted || (nowTs - lastDomTs) >= 80) {
+        state.chat.streamLastDomUpdateTs = nowTs;
+        const incrementalUpdated = updateChatMessageRows(touched, { scrollOnUpdate: true });
+        if (!incrementalUpdated) {
+          renderChatMessages();
+        }
       }
     }
 
@@ -5278,6 +5351,7 @@ function scheduleChatStreamAnimation() {
       scheduleChatStreamAnimation();
     } else {
       state.chat.streamAnimationLastTs = 0;
+      state.chat.streamLastDomUpdateTs = 0;
     }
   };
 
@@ -5295,75 +5369,21 @@ function queuePendingRunDelta(runId, delta) {
   const key = String(runId || "").trim();
   if (!key || !delta) return;
 
-  const queue = Array.isArray(state.chat.pendingDeltaByRun.get(key))
-    ? state.chat.pendingDeltaByRun.get(key)
-    : [];
-  queue.push(String(delta));
-  state.chat.pendingDeltaByRun.set(key, queue);
+  const pendingId = String(state.chat.pendingRuns.get(key) || "").trim();
+  if (!pendingId) return;
 
-  scheduleChatDeltaFlushScheduler();
-}
+  patchPendingAssistantByRun(key, (message) => {
+    if (!message || typeof message.text !== "string") return;
+    const currentTarget = String(state.chat.streamTargetByMessage.get(pendingId) ?? message.text ?? "");
+    const mergedText = mergeStreamingText(currentTarget, String(delta));
+    const nextTarget = stripChatControlDirectives(mergedText, { trim: false });
 
-function flushPendingRunDeltas(targetRunId = "") {
-  if (!(state.chat.pendingDeltaByRun instanceof Map) || state.chat.pendingDeltaByRun.size === 0) {
-    return false;
-  }
-
-  const key = String(targetRunId || "").trim();
-  const entries = key
-    ? [[key, state.chat.pendingDeltaByRun.get(key) || []]]
-    : Array.from(state.chat.pendingDeltaByRun.entries());
-
-  let updated = false;
-  let fallbackImmediateUpdated = false;
-  for (const [runId, chunks] of entries) {
-    if (!Array.isArray(chunks) || chunks.length === 0) {
-      state.chat.pendingDeltaByRun.delete(runId);
-      continue;
+    if (nextTarget !== currentTarget) {
+      state.chat.streamTargetByMessage.set(pendingId, nextTarget);
     }
+  });
 
-    const pendingId = String(state.chat.pendingRuns.get(runId) || "").trim();
-
-    patchPendingAssistantByRun(runId, (message) => {
-      if (!message || typeof message.text !== "string") return;
-      const currentTarget = String(state.chat.streamTargetByMessage.get(pendingId) ?? message.text ?? "");
-      let mergedText = currentTarget;
-      for (const chunk of chunks) {
-        mergedText = mergeStreamingText(mergedText, chunk);
-      }
-      const nextTarget = stripChatControlDirectives(mergedText, { trim: false });
-
-      if (pendingId) {
-        if (nextTarget !== currentTarget) {
-          state.chat.streamTargetByMessage.set(pendingId, nextTarget);
-          updated = true;
-        }
-        return;
-      }
-
-      if (nextTarget !== message.text) {
-        message.text = nextTarget;
-        syncMessageTextSegment(message);
-        updated = true;
-        fallbackImmediateUpdated = true;
-      }
-    });
-
-    state.chat.pendingDeltaByRun.delete(runId);
-  }
-
-  if (state.chat.pendingDeltaByRun.size === 0) {
-    clearChatDeltaFlushScheduler();
-  }
-
-  if (updated) {
-    scheduleChatStreamAnimation();
-    if (fallbackImmediateUpdated && state.chat.streamTargetByMessage.size === 0) {
-      renderChatMessages();
-    }
-  }
-
-  return updated;
+  scheduleChatStreamAnimation();
 }
 
 function toggleChatSessionsPanel(forceOpen) {
@@ -5723,7 +5743,16 @@ function renderChatSegment(segment, messageId, segmentIndex, options = {}) {
   if (!String(text).trim()) return "";
 
   if (options.streamingText === true) {
-    return `<div class="chat-bubble-content chat-bubble-content-streaming">${escapeHtml(text).replaceAll("\n", "<br>")}</div>`;
+    // "思考中..." placeholder gets a pulsing style, not the typing cursor
+    if (text === "思考中..." || text === "思考中") {
+      return `<div class="chat-bubble-content chat-bubble-thinking"><span class="thinking-dots">${escapeHtml(text)}</span></div>`;
+    }
+    const safeText = autoCloseMarkdown(text);
+    const html = renderMarkdown(safeText);
+    const streamingClass = options.streamCursorFade === true
+      ? "chat-bubble-content-streaming chat-bubble-content-stream-finished"
+      : "chat-bubble-content-streaming";
+    return `<div class="chat-bubble-content ${streamingClass} chat-markdown">${html || escapeHtml(text).replaceAll("\n", "<br>")}</div>`;
   }
 
   const html = renderMarkdown(text);
@@ -5749,7 +5778,8 @@ function buildRenderableChatSegments(message, options = {}) {
     .map(({ segment, index }) => ({
       html: renderChatSegment(segment, message?.id || "", index, {
         autoOpenThinking: options.autoOpenThinking === true && segment?.type === "thinking",
-        streamingText: options.streaming === true && segment?.type === "text"
+        streamingText: (options.streaming === true || options.streamCursorFade === true) && segment?.type === "text",
+        streamCursorFade: options.streamCursorFade === true && segment?.type === "text"
       }),
       segment
     }))
@@ -5790,7 +5820,8 @@ function renderChatMessageRow(message, index, latestThinkingMessageId = "") {
   const metaRole = role === "user" ? "你" : role === "tool" ? "工具" : role === "system" ? "系统" : "助手";
   const segmentsHtml = buildRenderableChatSegments(message, {
     autoOpenThinking: role === "assistant" && (message?.pending === true || message?.id === latestThinkingMessageId),
-    streaming: message?.pending === true
+    streaming: message?.pending === true,
+    streamCursorFade: state.chat.streamCursorFadeIds.has(message?.id || "")
   });
   const timeText = formatChatTime(message?.ts);
   const pending = message?.pending === true ? "<span class=\"chat-message-pending\">生成中</span>" : "";
@@ -5831,7 +5862,8 @@ function updateChatMessageRows(messageIds, { scrollOnUpdate = false, forceFull =
     const row = container.querySelector(`.chat-message-row[data-msg-id="${escapeSelectorAttrValue(messageId)}"]`);
     if (!row) continue;
 
-    if (!forceFull && message?.pending === true) {
+    const shouldStreamPatch = !forceFull && (message?.pending === true || state.chat.streamCursorFadeIds.has(messageId));
+    if (shouldStreamPatch) {
       const textSegment = Array.isArray(message.segments)
         ? message.segments.find((segment) => segment?.type === "text")
         : null;
@@ -5839,9 +5871,15 @@ function updateChatMessageRows(messageIds, { scrollOnUpdate = false, forceFull =
       const contentNode = row.querySelector(".chat-bubble-content-streaming");
 
       if (contentNode) {
-        const nextHtml = escapeHtml(nextText).replaceAll("\n", "<br>");
+        const safeText = autoCloseMarkdown(nextText);
+        const nextHtml = renderMarkdown(safeText) || escapeHtml(nextText).replaceAll("\n", "<br>");
         if (contentNode.innerHTML !== nextHtml) {
           contentNode.innerHTML = nextHtml;
+          updated = true;
+        }
+        const shouldFadeCursor = state.chat.streamCursorFadeIds.has(messageId) && message?.pending !== true;
+        if (contentNode.classList.contains("chat-bubble-content-stream-finished") !== shouldFadeCursor) {
+          contentNode.classList.toggle("chat-bubble-content-stream-finished", shouldFadeCursor);
           updated = true;
         }
         continue;
@@ -6201,9 +6239,8 @@ async function ensureChatClientConnected() {
     client.onStatusChange((info) => {
       setChatStatus(info.status, info);
       if (info.status === "disconnected") {
-        clearChatDeltaFlushScheduler();
-        state.chat.pendingDeltaByRun.clear();
         clearChatStreamAnimationScheduler();
+        clearChatStreamCursorFadeState();
       }
       if (info.status === "connected" && state.chat.viewActive) {
         loadChatSessions({ preserveSelection: true }).catch((error) => {
@@ -6247,7 +6284,7 @@ async function ensureChatClientConnected() {
           }
 
           if (eventState === "final" || eventState === "aborted" || eventState === "error") {
-            flushPendingRunDeltas(runId);
+            // Pipeline simplified: no more delta flush queue, just snap target text
           }
 
           if (eventState === "error") {
@@ -6255,6 +6292,7 @@ async function ensureChatClientConnected() {
             message.text = payload.errorMessage || "模型回复失败";
             message.segments = [{ type: "text", text: message.text }];
             state.chat.streamTargetByMessage.delete(message.id);
+            clearChatStreamCursorFadeState(message.id);
             return;
           }
 
@@ -6263,6 +6301,7 @@ async function ensureChatClientConnected() {
             message.text = "本次回复已中止";
             message.segments = [{ type: "text", text: message.text }];
             state.chat.streamTargetByMessage.delete(message.id);
+            clearChatStreamCursorFadeState(message.id);
             return;
           }
 
@@ -6275,6 +6314,7 @@ async function ensureChatClientConnected() {
             syncMessageTextSegment(message);
             message.pending = false;
             state.chat.streamTargetByMessage.delete(message.id);
+            startChatStreamCursorFade(message.id);
           }
         });
 
@@ -6286,7 +6326,13 @@ async function ensureChatClientConnected() {
         }
 
         if (eventState !== "delta") {
-          renderChatMessages();
+          if (pendingMessageId && (eventState === "final")) {
+            // Keep the existing node for one brief fade-out before the final non-streaming render lands.
+            const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: true });
+            if (!updated) renderChatMessages();
+          } else {
+            renderChatMessages();
+          }
         } else if (structuredChanged && pendingMessageId) {
           const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: false, forceFull: true });
           if (!updated) {
@@ -6296,7 +6342,8 @@ async function ensureChatClientConnected() {
       }
 
       if (eventState === "final" || eventState === "aborted" || eventState === "error") {
-        scheduleChatHistoryRefresh(eventSessionKey, 120);
+        // Delay history refresh so the streaming→final transition is seamless
+        scheduleChatHistoryRefresh(eventSessionKey, 1500);
         loadChatSessions({ preserveSelection: true }).catch((error) => {
           console.error(error);
         });
@@ -6361,6 +6408,7 @@ async function loadChatHistory(sessionKey, { silent = false, limit, preserveScro
     state.chat.hasOlderMessages = false;
     state.chat.loadingOlderMessages = false;
     clearChatStreamAnimationScheduler();
+    clearChatStreamCursorFadeState();
     renderChatMessages();
     return { count: 0, limit: 0 };
   }
@@ -6381,9 +6429,8 @@ async function loadChatHistory(sessionKey, { silent = false, limit, preserveScro
   const previousHeight = preserveScroll && container ? container.scrollHeight : 0;
   const previousTop = preserveScroll && container ? container.scrollTop : 0;
 
-  clearChatDeltaFlushScheduler();
-  state.chat.pendingDeltaByRun.clear();
   clearChatStreamAnimationScheduler();
+  clearChatStreamCursorFadeState();
 
   const payload = await chatRequest("chat.history", {
     sessionKey,

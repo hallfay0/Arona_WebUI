@@ -82,6 +82,31 @@ let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
 - `modelsApply.phase`：`"idle" | "restarting" | "error"`，驱动“网关热重启中”状态徽标和按钮禁用 / 重试连接状态。
 - `modelsApply.message`：当前热重启提示文案；在轮询恢复期间动态更新。
 
+### 7. Chat 流式渲染运行态
+
+- `state.chat.streamTargetByMessage`：按 `messageId` 记录“目标文本”；WebSocket delta 到达时直接更新这里，不再维护额外的 delta flush 队列。
+- `state.chat.streamAnimationTimer` / `streamAnimationIsRaf` / `streamAnimationLastTs`：单一动画循环的调度状态；由一个 rAF / timeout 驱动逐字推进。
+- `state.chat.streamLastDomUpdateTs`：流式 DOM 更新节流时间戳；用于把 Markdown 解析和 `innerHTML` 更新控制在约 80ms 一次。
+- `state.chat.streamCursorFadeIds` / `streamCursorFadeTimers`：记录哪些消息处于“流式结束、光标淡出”过渡态；过渡完成后必须移除，避免旧消息长期停留在 streaming 样式上。
+
+#### Chat 流式约束
+
+- 流式阶段使用 `message.text` 作为当前已显示文本，`streamTargetByMessage.get(message.id)` 作为待追赶目标。
+- 流式 Markdown 必须走与完成态一致的 `renderMarkdown()` 路径；如果内容暂时不完整，先通过 `autoCloseMarkdown()` 补齐未闭合 fence / inline marker，再渲染。
+- 打字动画只允许存在一条主循环；不要再引入“delta flush rAF + stream rAF”双管线。
+- 视图停用、连接断开、切换会话、重载历史时，必须同时清理：
+  - `streamAnimationTimer`
+  - `streamTargetByMessage`
+  - `streamCursorFadeIds`
+  - `streamCursorFadeTimers`
+  - `streamAnimationLastTs`
+  - `streamLastDomUpdateTs`
+
+#### Chat 流式完成态
+
+- final 事件到达时，先保留当前 streaming 节点，把光标切到淡出类，再延迟回到普通消息渲染；不要直接整行替换，否则看起来会像“闪一下就结束”。
+- aborted / error 事件必须同步移除该消息的 streaming target 和 cursor fade 状态，避免后续会话残留旧动画。
+
 ---
 
 ## State Update Patterns
