@@ -46,29 +46,29 @@ jobs:
           CURRENT_TAG="${GITHUB_REF_NAME}"
           PREV_TAG="$(git tag --sort=-version:refname | grep '^v' | grep -vx "${CURRENT_TAG}" | head -n1 || true)"
 
+          cat > release-body.md <<'EOF'
+          ## Quick Start / 快速开始
+
+          **Windows**: Download `.zip` → Extract → Double-click `start.bat`
+
+          **macOS / Linux**:
+          ```bash
+          curl -fsSL https://github.com/lingshichat/Arona_WebUI/releases/latest/download/arona-webui-latest.tar.gz | tar xz
+          cd arona-webui-*/
+          ./start.sh
+          ```
+
+          **Docker**:
+          ```bash
+          GATEWAY_URL=ws://your-gateway:18789 GATEWAY_PASSWORD=xxx docker compose up -d
+          ```
+
+          首次启动浏览器会自动打开配置向导，按提示填入网关地址和密码即可。
+
+          详见 [README](https://github.com/lingshichat/Arona_WebUI#readme)。
+          EOF
+
           {
-            cat <<'EOF'
-            ## Quick Start / 快速开始
-
-            **Windows**: Download `.zip` → Extract → Double-click `start.bat`
-
-            **macOS / Linux**:
-            ```bash
-            curl -fsSL https://github.com/lingshichat/Arona_WebUI/releases/latest/download/arona-webui-latest.tar.gz | tar xz
-            cd arona-webui-*/
-            ./start.sh
-            ```
-
-            **Docker**:
-            ```bash
-            GATEWAY_URL=ws://your-gateway:18789 GATEWAY_PASSWORD=xxx docker compose up -d
-            ```
-
-            首次启动浏览器会自动打开配置向导，按提示填入网关地址和密码即可。
-
-            详见 [README](https://github.com/lingshichat/Arona_WebUI#readme)。
-            EOF
-
             echo
             echo "## Changelog / 更新日志"
             echo
@@ -86,7 +86,7 @@ jobs:
             else
               echo "- No non-.trellis commits found in this release range."
             fi
-          } > release-body.md
+          } >> release-body.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
