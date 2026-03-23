@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import https from "node:https";
 
 // Load .env.local if it exists (local dev config, not committed to git)
 const __filename = fileURLToPath(import.meta.url);
@@ -27,6 +28,24 @@ const __dirname = path.dirname(__filename);
     // .env.local not found — use environment variables or defaults
   }
 })();
+
+const pkgJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+const CURRENT_VERSION = pkgJson.version;
+const GITHUB_REPO = "lingshichat/Arona_WebUI";
+const SIX_HOURS = 6 * 60 * 60 * 1000;
+const PROJECT_SYNC_EXCLUDES = new Set([
+  "node_modules",
+  ".env.local",
+  ".backup",
+  ".git",
+  ".trellis",
+  ".cursor",
+  ".agent",
+  "workspace",
+  "update.tar.gz"
+]);
+let latestVersionCache = null;
+let updateInProgress = false;
 
 import cronstruePlugin from "cronstrue/i18n.js";
 const cronstrue = cronstruePlugin.default || cronstruePlugin;
@@ -184,6 +203,222 @@ function cleanupExpiredSessions() {
       SESSIONS.delete(token);
     }
   }
+}
+
+// ── Version / Update helpers ─────────────────────────────────────
+
+function shouldSkipProjectSyncEntry(name) {
+  return PROJECT_SYNC_EXCLUDES.has(name);
+}
+
+function syncProjectTree(sourceDir, targetDir, { deleteExtraneous = false } = {}) {
+  fs.mkdirSync(targetDir, { recursive: true });
+  const sourceEntries = fs.readdirSync(sourceDir, { withFileTypes: true })
+    .filter((entry) => !shouldSkipProjectSyncEntry(entry.name));
+  const sourceNames = new Set(sourceEntries.map((entry) => entry.name));
+
+  if (deleteExtraneous) {
+    for (const entry of fs.readdirSync(targetDir, { withFileTypes: true })) {
+      if (shouldSkipProjectSyncEntry(entry.name)) continue;
+      if (!sourceNames.has(entry.name)) {
+        fs.rmSync(path.join(targetDir, entry.name), { recursive: true, force: true });
+      }
+    }
+  }
+
+  for (const entry of sourceEntries) {
+    const sourcePath = path.join(sourceDir, entry.name);
+    const targetPath = path.join(targetDir, entry.name);
+    fs.rmSync(targetPath, { recursive: true, force: true });
+    fs.cpSync(sourcePath, targetPath, {
+      recursive: entry.isDirectory(),
+      force: true,
+      preserveTimestamps: true,
+    });
+  }
+}
+
+function compareVersions(a, b) {
+  const pa = String(a).replace(/^v/, "").split(".").map(Number);
+  const pb = String(b).replace(/^v/, "").split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i] || 0, nb = pb[i] || 0;
+    if (na > nb) return 1;
+    if (na < nb) return -1;
+  }
+  return 0;
+}
+
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    https.get({ hostname: parsed.hostname, path: parsed.pathname + parsed.search, headers: { "User-Agent": "Arona-WebUI/" + CURRENT_VERSION } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return httpsGetJson(res.headers.location).then(resolve, reject);
+      }
+      let data = "";
+      res.on("data", (c) => data += c);
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+}
+
+async function checkForUpdate({ force = false, suppressErrors = true } = {}) {
+  if (!force && latestVersionCache && (Date.now() - latestVersionCache.checkedAt) < SIX_HOURS) {
+    return latestVersionCache;
+  }
+  try {
+    const release = await httpsGetJson(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`);
+    const version = String(release.tag_name || "").replace(/^v/, "");
+    const asset = (release.assets || []).find((a) => /\.tar\.gz$/.test(a.name));
+    latestVersionCache = {
+      version,
+      changelog: release.body || "",
+      publishedAt: release.published_at || "",
+      downloadUrl: asset ? asset.browser_download_url : null,
+      checkedAt: Date.now(),
+      hasUpdate: compareVersions(version, CURRENT_VERSION) > 0
+    };
+    return latestVersionCache;
+  } catch (error) {
+    if (!suppressErrors) throw error;
+    return null;
+  }
+}
+
+function backupCurrentFiles(projectRoot, backupDir) {
+  syncProjectTree(projectRoot, backupDir, { deleteExtraneous: true });
+}
+
+function restoreFromBackup(backupDir, projectRoot) {
+  syncProjectTree(backupDir, projectRoot, { deleteExtraneous: true });
+}
+
+function downloadFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const doGet = (targetUrl, redirects) => {
+      if (redirects > 5) return reject(new Error("Too many redirects"));
+      const parsed = new URL(targetUrl);
+      const mod = parsed.protocol === "http:" ? http : https;
+      mod.get(targetUrl, { headers: { "User-Agent": "Arona-WebUI/" + CURRENT_VERSION } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          return doGet(res.headers.location, redirects + 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        const ws = fs.createWriteStream(destPath);
+        res.pipe(ws);
+        ws.on("finish", () => ws.close(resolve));
+        ws.on("error", (err) => {
+          try {
+            fs.unlinkSync(destPath);
+          } catch {
+            // ignore cleanup failure
+          }
+          reject(err);
+        });
+      }).on("error", reject);
+    };
+    doGet(url, 0);
+  });
+}
+
+function triggerRestart(projectRoot) {
+  const isPm2 = !!(process.env.PM2_HOME || process.env.pm_id);
+  const isSystemd = !!process.env.INVOCATION_ID;
+  if (isPm2 || isSystemd) {
+    process.exit(0);
+  }
+  const restartWrapperScript = `
+const { spawn } = require("node:child_process");
+const net = require("node:net");
+const path = require("node:path");
+
+const parentPid = Number(process.env.ARONA_RESTART_PARENT_PID || "0");
+const port = Number(process.env.ARONA_RESTART_PORT || "18790");
+const host = process.env.ARONA_RESTART_HOST || "127.0.0.1";
+const cwd = process.env.ARONA_RESTART_CWD;
+const pollMs = 250;
+const timeoutMs = 20000;
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isParentAlive() {
+  if (!parentPid) return false;
+  try {
+    process.kill(parentPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function canBindPort() {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.once("listening", () => {
+      server.close(() => resolve(true));
+    });
+    server.listen(port, host);
+  });
+}
+
+(async () => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const parentAlive = isParentAlive();
+    const portReleased = await canBindPort();
+    if (!parentAlive && portReleased) break;
+    await delay(pollMs);
+  }
+
+  const child = spawn(process.execPath, [path.join(cwd, "src/server.mjs")], {
+    cwd,
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+  });
+  child.unref();
+})()
+  .catch(() => {})
+  .finally(() => process.exit(0));
+`;
+  const child = spawn(process.execPath, ["-e", restartWrapperScript], {
+    cwd: projectRoot,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      ARONA_RESTART_CWD: projectRoot,
+      ARONA_RESTART_HOST: "127.0.0.1",
+      ARONA_RESTART_PARENT_PID: String(process.pid),
+      ARONA_RESTART_PORT: String(PORT),
+    }
+  });
+  child.unref();
+  process.exit(0);
+}
+
+function buildVersionResponse(projectRoot = path.join(__dirname, "..")) {
+  const isDocker = fs.existsSync("/.dockerenv");
+  const hasBackup = fs.existsSync(path.join(projectRoot, ".backup", "previous-version"));
+  const latest = latestVersionCache
+    ? {
+      version: latestVersionCache.version,
+      changelog: latestVersionCache.changelog,
+      publishedAt: latestVersionCache.publishedAt,
+      hasUpdate: latestVersionCache.hasUpdate
+    }
+    : null;
+  return { ok: true, version: CURRENT_VERSION, latest, isDocker, hasBackup };
 }
 
 async function handleLogin(req, res) {
@@ -1605,6 +1840,121 @@ async function handleApi(req, res, pathname, query) {
       });
     }
 
+    // ── Version / Update routes ───────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/version") {
+      const projectRoot = path.join(__dirname, "..");
+      return jsonResponse(res, 200, buildVersionResponse(projectRoot));
+    }
+
+    if (req.method === "POST" && pathname === "/api/version/check") {
+      try {
+        const projectRoot = path.join(__dirname, "..");
+        await checkForUpdate({ force: true, suppressErrors: false });
+        return jsonResponse(res, 200, buildVersionResponse(projectRoot));
+      } catch (err) {
+        return jsonResponse(res, 502, {
+          ok: false,
+          error: `检查更新失败: ${err instanceof Error ? err.message : String(err)}`
+        });
+      }
+    }
+
+    if (req.method === "POST" && pathname === "/api/update/apply") {
+      if (updateInProgress) return jsonResponse(res, 409, { ok: false, error: "更新正在进行中，请稍候" });
+      const projectRoot = path.join(__dirname, "..");
+      const isDocker = fs.existsSync("/.dockerenv");
+      if (isDocker) return jsonResponse(res, 400, { ok: false, error: "Docker 环境请使用 docker pull 更新" });
+
+      let latest;
+      try {
+        latest = latestVersionCache || await checkForUpdate({ force: true, suppressErrors: false });
+      } catch (err) {
+        return jsonResponse(res, 502, {
+          ok: false,
+          error: `检查更新失败: ${err instanceof Error ? err.message : String(err)}`
+        });
+      }
+
+      if (!latest || !latest.hasUpdate) return jsonResponse(res, 400, { ok: false, error: "已是最新版本，无需更新" });
+      if (!latest.downloadUrl) return jsonResponse(res, 400, { ok: false, error: "未找到可下载的更新包" });
+
+      updateInProgress = true;
+      const backupDir = path.join(projectRoot, ".backup", "previous-version");
+      let backupCreated = false;
+      try {
+        backupCurrentFiles(projectRoot, backupDir);
+        backupCreated = true;
+
+        const tmpDir = path.join(os.tmpdir(), `arona-update-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        try {
+          const tarPath = path.join(tmpDir, "release.tar.gz");
+          await downloadFile(latest.downloadUrl, tarPath);
+          const extractDir = path.join(tmpDir, "extracted");
+          fs.mkdirSync(extractDir, { recursive: true });
+          execSync(`tar xzf "${tarPath}" -C "${extractDir}" --strip-components=1`, { encoding: "utf8" });
+
+          syncProjectTree(extractDir, projectRoot, { deleteExtraneous: true });
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+
+        const newPkg = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"));
+        if (JSON.stringify(newPkg.dependencies) !== JSON.stringify(pkgJson.dependencies)) {
+          execSync("npm install --production", { cwd: projectRoot, encoding: "utf8", timeout: 120000 });
+        }
+
+        jsonResponse(res, 200, { ok: true, message: "更新完成，正在重启..." });
+        setTimeout(() => triggerRestart(projectRoot), 500);
+        return;
+      } catch (err) {
+        let errorMessage = `更新失败: ${err instanceof Error ? err.message : String(err)}`;
+        if (backupCreated) {
+          try {
+            restoreFromBackup(backupDir, projectRoot);
+            errorMessage += "；已自动回滚到更新前版本";
+          } catch (restoreErr) {
+            errorMessage += `；自动回滚失败: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`;
+          }
+        }
+        return jsonResponse(res, 500, { ok: false, error: errorMessage });
+      } finally {
+        updateInProgress = false;
+      }
+    }
+
+    if (req.method === "POST" && pathname === "/api/update/rollback") {
+      if (updateInProgress) return jsonResponse(res, 409, { ok: false, error: "操作正在进行中，请稍候" });
+      const projectRoot = path.join(__dirname, "..");
+      const backupDir = path.join(projectRoot, ".backup", "previous-version");
+      if (!fs.existsSync(backupDir)) {
+        return jsonResponse(res, 400, { ok: false, error: "没有可用的备份，无法回滚" });
+      }
+
+      updateInProgress = true;
+      try {
+        restoreFromBackup(backupDir, projectRoot);
+
+        const restoredPkg = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf8"));
+        if (JSON.stringify(restoredPkg.dependencies) !== JSON.stringify(pkgJson.dependencies)) {
+          execSync("npm install --production", { cwd: projectRoot, encoding: "utf8", timeout: 120000 });
+        }
+
+        jsonResponse(res, 200, { ok: true, message: "回滚完成，正在重启..." });
+        setTimeout(() => triggerRestart(projectRoot), 500);
+        return;
+      } catch (err) {
+        try {
+          restoreFromBackup(backupDir, projectRoot);
+        } catch {
+          // best effort, report original failure below
+        }
+        return jsonResponse(res, 500, { ok: false, error: `回滚失败: ${err instanceof Error ? err.message : String(err)}` });
+      } finally {
+        updateInProgress = false;
+      }
+    }
+
     return jsonResponse(res, 404, { ok: false, error: "API endpoint not found" });
   } catch (error) {
     return jsonResponse(res, getApiErrorStatusCode(error), {
@@ -1687,6 +2037,11 @@ if (typeof sessionCleanupTimer.unref === "function") sessionCleanupTimer.unref()
 
 const gatewayCleanupTimer = setInterval(cleanupIdleGatewaySession, GATEWAY_POOL_CLEANUP_INTERVAL_MS);
 if (typeof gatewayCleanupTimer.unref === "function") gatewayCleanupTimer.unref();
+
+// Version check: startup + periodic
+checkForUpdate({ suppressErrors: true }).catch(() => {});
+const updateCheckTimer = setInterval(() => checkForUpdate({ suppressErrors: true }).catch(() => {}), SIX_HOURS);
+if (typeof updateCheckTimer.unref === "function") updateCheckTimer.unref();
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`OpenClaw MVP server running on http://127.0.0.1:${PORT}`);

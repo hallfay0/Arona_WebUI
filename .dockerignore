@@ -1,0 +1,13 @@
+node_modules
+.env.local
+.git
+.trellis
+openclaw-src
+.cursor
+.agent
+.backup
+_test_usage.mjs
+connect-server.sh
+tunnel-gateway.sh
+workspace
+update.tar.gz

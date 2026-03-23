@@ -1,6 +1,7 @@
 import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260307-model-fix-v12";
 
 const state = {
+  updateInfo: null,
   currentView: "overview",
   modelsHash: "",
   modelProvidersDraft: {},
@@ -1280,11 +1281,15 @@ async function loadOverview() {
   container.innerHTML = renderSkeleton(5);
 
   try {
-    const data = await api("/api/overview");
+    const [data, versionData] = await Promise.all([
+      api("/api/overview"),
+      api("/api/version").catch(() => null)
+    ]);
+    state.updateInfo = versionData;
     const channels = data.channels?.channels || {};
     const channelValues = Object.values(channels);
     if (channelValues.length === 0 && (data.sessions?.sessions || []).length === 0) {
-      container.innerHTML = renderEmpty("fa-solid fa-wind", "暂无活跃数据", "阿洛娜还没发现任何会话或频道记录呢～");
+      container.innerHTML = renderVersionBar(versionData) + renderEmpty("fa-solid fa-wind", "暂无活跃数据", "阿洛娜还没发现任何会话或频道记录呢～");
       return;
     }
     const sessions = data.sessions?.sessions || [];
@@ -1365,8 +1370,7 @@ async function loadOverview() {
       `;
     }).join("");
 
-    container.innerHTML = `
-
+    container.innerHTML = `${renderVersionBar(versionData)}
       <div class="dashboard-grid dashboard-grid-lg">${statsHtml}</div>
       
       <div class="panel-grid-split">
@@ -8397,6 +8401,230 @@ function bindEvents() {
     });
   }
 }
+
+// ── Version / Update UI ──────────────────────────────────────────
+
+function simpleMarkdown(text) {
+  if (!text) return "";
+  const lines = text.split("\n");
+  let html = "";
+  let inList = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (inList) { html += "</ul>"; inList = false; }
+      continue;
+    }
+    const hMatch = trimmed.match(/^(#{1,3})\s+(.+)/);
+    if (hMatch) {
+      if (inList) { html += "</ul>"; inList = false; }
+      const level = Math.min(hMatch[1].length + 1, 5);
+      html += `<h${level} style="margin:4px 0;font-size:${level <= 3 ? '0.9' : '0.85'}rem;">${escapeHtml(hMatch[2])}</h${level}>`;
+      continue;
+    }
+    const liMatch = trimmed.match(/^[-*]\s+(.+)/);
+    if (liMatch) {
+      if (!inList) { html += '<ul style="margin:4px 0 4px 16px;padding:0;list-style:disc;">'; inList = true; }
+      html += `<li style="margin:1px 0;font-size:0.85rem;">${inlineMarkdown(escapeHtml(liMatch[1]))}</li>`;
+      continue;
+    }
+    if (inList) { html += "</ul>"; inList = false; }
+    html += `<p style="margin:2px 0;font-size:0.85rem;">${inlineMarkdown(escapeHtml(trimmed))}</p>`;
+  }
+  if (inList) html += "</ul>";
+  return html;
+}
+
+function inlineMarkdown(text) {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`(.+?)`/g, '<code style="background:var(--surface);padding:1px 4px;border-radius:3px;font-size:0.8rem;">$1</code>');
+}
+
+function renderUpdateBanner(versionData) {
+  const latest = versionData?.latest;
+  if (!latest?.hasUpdate) return "";
+
+  const currentVer = escapeHtml(versionData.version || "");
+  const latestVer = escapeHtml(latest.version || "");
+  const changelogHtml = latest.changelog
+    ? `<div style="color:var(--foreground-muted);max-height:120px;overflow:auto;margin-top:8px;line-height:1.5;">${simpleMarkdown(latest.changelog)}</div>`
+    : "";
+
+  let publishedHtml = "";
+  if (latest.publishedAt) {
+    try {
+      const d = new Date(latest.publishedAt);
+      publishedHtml = `<span style="color:var(--foreground-subtle);font-size:0.8rem;margin-left:8px;">发布于 ${d.toLocaleDateString()}</span>`;
+    } catch (_) { /* ignore */ }
+  }
+
+  let actionHtml;
+  if (versionData.isDocker) {
+    actionHtml = `<div style="font-size:0.85rem;color:var(--foreground-muted);">Docker 环境请手动更新：<code style="background:var(--surface);padding:2px 6px;border-radius:4px;">docker pull lingshichat/arona-webui:latest &amp;&amp; docker restart &lt;container&gt;</code></div>`;
+  } else {
+    actionHtml = `<button class="btn-primary" onclick="applyUpdate()" id="apply-update-btn"><i class="fa-solid fa-download"></i> 立即更新</button>`;
+  }
+
+  const rollbackHtml = versionData.hasBackup
+    ? `<button class="btn-secondary" onclick="rollbackUpdate()" id="rollback-update-btn" style="margin-left:6px;"><i class="fa-solid fa-rotate-left"></i> 回滚</button>`
+    : "";
+
+  return `
+    <div class="glass-panel" style="margin-bottom:16px;border-color:var(--border-accent);position:relative;overflow:hidden;">
+      <div style="position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse at top left, var(--accent-glow), transparent 70%);pointer-events:none;"></div>
+      <div style="padding:16px 20px;position:relative;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <i class="fa-solid fa-arrow-up-from-bracket" style="color:var(--accent);font-size:1.1rem;"></i>
+            <span style="font-weight:600;">v${currentVer} → v${latestVer}</span>
+            <span class="status-badge accent">新版本可用</span>
+            ${publishedHtml}
+          </div>
+          <div style="display:flex;align-items:center;flex-shrink:0;gap:6px;">
+            ${actionHtml}
+            ${rollbackHtml}
+          </div>
+        </div>
+        ${changelogHtml}
+      </div>
+    </div>
+  `;
+}
+
+function renderVersionBar(versionData) {
+  const updateBanner = renderUpdateBanner(versionData);
+  const currentVer = versionData?.version ? `v${escapeHtml(versionData.version)}` : "";
+  const versionDisplay = currentVer
+    ? `<span style="color:var(--foreground-muted);font-size:0.85rem;">当前版本: ${currentVer}</span>`
+    : "";
+  const disableCheck = _updateCheckInProgress || _updateOperationInProgress;
+  const checkButtonIcon = _updateCheckInProgress
+    ? '<i class="fa-solid fa-spinner fa-spin"></i>'
+    : '<i class="fa-solid fa-rotate"></i>';
+  const checkButtonText = _updateCheckInProgress ? "检查中" : "检查更新";
+
+  return `
+    ${updateBanner}
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+      ${versionDisplay}
+      <button class="btn-secondary btn-size-sm" onclick="checkForUpdate()" id="check-update-btn" style="font-size:0.75rem;padding:2px 8px;" ${disableCheck ? "disabled" : ""}>${checkButtonIcon} ${checkButtonText}</button>
+      <span id="update-check-status" style="font-size:0.8rem;color:var(--foreground-subtle);"></span>
+    </div>
+  `;
+}
+
+let _updateCheckInProgress = false;
+let _updateOperationInProgress = false;
+
+function setUpdateButtonDisabled(id, disabled, pendingHtml) {
+  const button = $(id);
+  if (!button) return;
+  if (!button.dataset.defaultHtml) {
+    button.dataset.defaultHtml = button.innerHTML;
+  }
+  button.disabled = disabled;
+  button.innerHTML = disabled && pendingHtml ? pendingHtml : button.dataset.defaultHtml;
+}
+
+function setUpdateUiBusyState({ checking = _updateCheckInProgress, operating = _updateOperationInProgress } = {}) {
+  _updateCheckInProgress = checking;
+  _updateOperationInProgress = operating;
+  setUpdateButtonDisabled("check-update-btn", checking || operating, '<i class="fa-solid fa-spinner fa-spin"></i> 检查中');
+  setUpdateButtonDisabled("apply-update-btn", operating, '<i class="fa-solid fa-spinner fa-spin"></i> 更新中...');
+  setUpdateButtonDisabled("rollback-update-btn", operating, '<i class="fa-solid fa-spinner fa-spin"></i> 回滚中...');
+}
+
+async function checkForUpdate() {
+  if (_updateCheckInProgress || _updateOperationInProgress) return;
+  const statusEl = $("update-check-status");
+  setUpdateUiBusyState({ checking: true, operating: _updateOperationInProgress });
+  if (statusEl) statusEl.textContent = "检查中...";
+  try {
+    const versionData = await api("/api/version/check", { method: "POST" });
+    state.updateInfo = versionData;
+    if (versionData?.latest?.hasUpdate) {
+      if (statusEl) statusEl.textContent = "";
+      if (state.currentView === "overview") loadOverview();
+    } else {
+      if (statusEl) {
+        statusEl.textContent = "已是最新版本";
+        setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 3000);
+      }
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = "检查失败：" + (err.message || "网络错误");
+      setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 4000);
+    }
+    showToast("检查更新失败：" + (err.message || "网络错误"), "error", 4000);
+  } finally {
+    setUpdateUiBusyState({ checking: false, operating: _updateOperationInProgress });
+  }
+}
+
+async function applyUpdate() {
+  if (_updateOperationInProgress) return;
+  const versionData = state.updateInfo;
+  const latestVer = versionData?.latest?.version || "新版本";
+  const confirmed = await requestConfirmDialog({
+    title: "确认更新",
+    message: `确认更新到 v${latestVer}？更新过程中服务将短暂中断。`,
+    confirmText: "立即更新",
+    cancelText: "取消",
+    variant: "primary"
+  });
+  if (!confirmed) return;
+
+  setUpdateUiBusyState({ checking: false, operating: true });
+  const statusEl = $("update-check-status");
+  try {
+    await api("/api/update/apply", { method: "POST" });
+    if (statusEl) statusEl.textContent = "更新完成，页面将在几秒后刷新...";
+    showToast("更新完成，服务即将重启", "success", 5000);
+    setTimeout(() => location.reload(), 5000);
+  } catch (err) {
+    setUpdateUiBusyState({ checking: false, operating: false });
+    if (statusEl) {
+      statusEl.textContent = "更新失败：" + (err.message || "未知错误");
+      setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 6000);
+    }
+    showToast("更新失败：" + (err.message || "未知错误"), "error", 5000);
+  }
+}
+
+async function rollbackUpdate() {
+  if (_updateOperationInProgress) return;
+  const confirmed = await requestConfirmDialog({
+    title: "确认回滚",
+    message: "确认回滚到上一版本？回滚过程中服务将短暂中断。",
+    confirmText: "确认回滚",
+    cancelText: "取消",
+    variant: "danger"
+  });
+  if (!confirmed) return;
+
+  setUpdateUiBusyState({ checking: false, operating: true });
+  const statusEl = $("update-check-status");
+  if (statusEl) statusEl.textContent = "回滚中...";
+  try {
+    await api("/api/update/rollback", { method: "POST" });
+    if (statusEl) statusEl.textContent = "回滚完成，页面将在几秒后刷新...";
+    showToast("回滚完成，服务即将重启", "success", 5000);
+    setTimeout(() => location.reload(), 5000);
+  } catch (err) {
+    setUpdateUiBusyState({ checking: false, operating: false });
+    if (statusEl) {
+      statusEl.textContent = "回滚失败：" + (err.message || "未知错误");
+      setTimeout(() => { if (statusEl) statusEl.textContent = ""; }, 6000);
+    }
+    showToast("回滚失败：" + (err.message || "未知错误"), "error", 5000);
+  }
+}
+
+window.checkForUpdate = checkForUpdate;
+window.applyUpdate = applyUpdate;
+window.rollbackUpdate = rollbackUpdate;
 
 async function bootstrap() {
   bindEvents();

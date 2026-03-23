@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -27,7 +29,7 @@ jobs:
 
           mkdir "$STAGING"
           cp -r src public node_modules "$STAGING/"
-          cp package.json start.bat start.sh .env.example README.md LICENSE "$STAGING/" 2>/dev/null || true
+          cp package.json package-lock.json start.bat start.sh .env.example README.md LICENSE Dockerfile docker-compose.yml .dockerignore "$STAGING/" 2>/dev/null || true
           cp -r scripts "$STAGING/" 2>/dev/null || true
           chmod +x "$STAGING/start.sh" "$STAGING/scripts/install.sh" 2>/dev/null || true
 
@@ -38,11 +40,14 @@ jobs:
           cp "arona-webui-${VERSION}.zip" "arona-webui-latest.zip"
           cp "arona-webui-${VERSION}.tar.gz" "arona-webui-latest.tar.gz"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          body: |
+      - name: Build release notes
+        shell: bash
+        run: |
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREV_TAG="$(git tag --sort=-version:refname | grep '^v' | grep -vx "${CURRENT_TAG}" | head -n1 || true)"
+
+          {
+            cat <<'EOF'
             ## Quick Start / 快速开始
 
             **Windows**: Download `.zip` → Extract → Double-click `start.bat`
@@ -62,6 +67,31 @@ jobs:
             首次启动浏览器会自动打开配置向导，按提示填入网关地址和密码即可。
 
             详见 [README](https://github.com/lingshichat/Arona_WebUI#readme)。
+            EOF
+
+            echo
+            echo "## Changelog / 更新日志"
+            echo
+
+            if [ -n "${PREV_TAG}" ]; then
+              echo "Changes from \`${PREV_TAG}\` to \`${CURRENT_TAG}\`:"
+            else
+              echo "Changes included in \`${CURRENT_TAG}\`:"
+            fi
+            echo
+
+            NOTES="$(git log --no-merges --pretty=format:'- %h %s' "${PREV_TAG:+${PREV_TAG}..}${CURRENT_TAG}" -- . ':(exclude).trellis' || true)"
+            if [ -n "${NOTES}" ]; then
+              printf '%s\n' "${NOTES}"
+            else
+              echo "- No non-.trellis commits found in this release range."
+            fi
+          } > release-body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-body.md
           files: |
             arona-webui-*.zip
             arona-webui-*.tar.gz
