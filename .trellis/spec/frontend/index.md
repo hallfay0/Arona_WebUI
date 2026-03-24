@@ -46,7 +46,7 @@ Rendered into `index.html` sections by `app.js`:
 |---|---|---|
 | 仪表盘 (Overview) | `#view-overview` | `GET /api/overview` + `GET /api/system-load` + `POST /api/gateway/restart` + `GET /api/gateway/doctor` |
 | 模型管理 (Models) | `#view-models` | `GET /api/models`, `POST /api/models/save` |
-| 技能状态 (Skills) | `#view-skills` | `GET /api/skills`, `POST /api/skills/update`, `POST /api/skills/install` |
+| 扩展中心 (Extensions) | `#view-extensions` | `GET /api/skills`, `GET/POST /api/store/skills/*`, `GET/POST /api/store/plugins/*`, `GET/POST /api/store/mcp/*`, `GET/POST/DELETE /api/store/sources` |
 | 任务计划 (Cron) | `#view-cron` | `GET /api/cron/list`, `GET /api/cron/runs`, `POST /api/cron/add\|update\|remove\|run` |
 | 实时日志 (Logs) | `#view-logs` | `GET /api/logs` (polled) |
 | Playground (Chat) | `#view-chat` | `GET /api/gateway-auth` + Gateway WS RPC (`sessions.list`, `sessions.patch`, `chat.history`, `chat.send`) |
@@ -64,6 +64,7 @@ Rendered into `index.html` sections by `app.js`:
 - **Auth token**: opaque Bearer session token stored in `localStorage['openclaw_token']`
 - **Theming**: CSS custom properties toggled by `theme.js`
 - **Chat transport**: browser bootstraps from `/api/gateway-auth`, then `GatewayClient` talks to gateway WS directly
+- **Extension sources**: `state.extSources` 保存可用仓库源，`state.extActiveSourceByTab` 为 `skill|plugin|mcp` 分别记录当前源；同一 source 不再全局套用全部 tab
 
 Current Models view scope:
 - Provider/catalog editing via `models.providers`

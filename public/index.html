@@ -68,9 +68,9 @@
           <i class="fa-solid fa-microchip"></i>
           <span>模型管理</span>
         </a>
-        <a data-view="skills" class="nav-item">
-          <i class="fa-solid fa-wand-sparkles"></i>
-          <span>技能状态</span>
+        <a data-view="extensions" class="nav-item">
+          <i class="fa-solid fa-store"></i>
+          <span>扩展中心</span>
         </a>
         <a data-view="cron" class="nav-item">
           <i class="fa-solid fa-clock-rotate-left"></i>
@@ -217,108 +217,337 @@
         </section>
       </div>
 
-      <section id="view-skills" class="view">
+      <!-- ═══ 扩展中心 ═══ -->
+      <section id="view-extensions" class="view">
         <div class="view-shell-head view-shell-head-wrap">
           <div class="view-shell-copy">
-            <h2 class="view-shell-title">技能状态</h2>
-            <p class="view-shell-subtitle">查看和管理当前安装的 Agent 技能，掌控终端能力。</p>
+            <h2 class="view-shell-title">扩展中心</h2>
+            <p class="view-shell-subtitle">浏览、安装和管理 Skill、Plugin 与 MCP Server。</p>
           </div>
-          <div class="panel-tabs glass-tabs skills-tabs-shell">
-            <button type="button" class="tab-btn active skills-tab-btn" data-target="skills-active"
-              ><i class="fa-solid fa-bolt tab-icon"></i>活跃技能</button>
-            <button type="button" class="tab-btn skills-tab-btn" data-target="skills-config"
-              ><i class="fa-solid fa-gears tab-icon"></i>配置中心</button>
+          <div class="ext-head-actions">
+            <button type="button" id="ext-sources-btn" class="panel-action-btn btn-secondary btn-size-sm" title="仓库源管理">
+              <i class="fa-solid fa-server"></i> 仓库源
+            </button>
           </div>
         </div>
 
-        <div id="skills-active-panel" class="skills-panel active">
-          <div class="glass-panel skills-panel-card skills-panel-card-main" id="skills-table-active" data-spotlight></div>
+        <!-- 主 Tab: Skill / Plugin / MCP -->
+        <div class="panel-tabs glass-tabs ext-main-tabs">
+          <button type="button" class="tab-btn active ext-main-tab" data-ext-tab="skill">
+            <i class="fa-solid fa-wand-sparkles tab-icon"></i>Skill
+          </button>
+          <button type="button" class="tab-btn ext-main-tab" data-ext-tab="plugin">
+            <i class="fa-solid fa-puzzle-piece tab-icon"></i>Plugin
+          </button>
+          <button type="button" class="tab-btn ext-main-tab" data-ext-tab="mcp">
+            <i class="fa-solid fa-plug tab-icon"></i>MCP
+          </button>
         </div>
 
-        <div id="skills-config-panel" class="skills-panel">
-          <div class="config-section-stack">
-            <!-- 待配置 -->
-            <div class="config-section">
-              <h3 class="config-section-title config-section-title-warn">
-                <i class="fa-solid fa-triangle-exclamation"></i>待补全配置
-              </h3>
-              <div class="glass-panel skills-panel-card skills-panel-card-compact skills-panel-card-warn" id="skills-table-pending" data-spotlight>
+        <!-- ── Skill Panel ── -->
+        <div id="ext-skill-panel" class="ext-panel active">
+          <div class="panel-tabs glass-tabs ext-sub-tabs">
+            <button type="button" class="tab-btn active ext-sub-tab" data-ext-sub="skill-store">
+              <i class="fa-solid fa-store tab-icon"></i>商店浏览
+            </button>
+            <button type="button" class="tab-btn ext-sub-tab" data-ext-sub="skill-installed">
+              <i class="fa-solid fa-box-open tab-icon"></i>已安装
+            </button>
+            <button type="button" class="tab-btn ext-sub-tab" data-ext-sub="skill-pending">
+              <i class="fa-solid fa-triangle-exclamation tab-icon"></i>待配置
+            </button>
+          </div>
+          <!-- Store -->
+          <div id="ext-skill-store" class="ext-sub-panel active">
+            <div class="ext-search-bar">
+              <i class="fa-solid fa-magnifying-glass ext-search-icon"></i>
+              <input type="text" id="ext-skill-search" class="form-control ext-search-input" placeholder="搜索 ClawHub 技能..." spellcheck="false" />
+              <button type="button" id="ext-skill-search-btn" class="btn-primary btn-size-sm">搜索</button>
+            </div>
+            <div id="ext-skill-store-list" class="ext-card-grid"></div>
+          </div>
+          <!-- Installed -->
+          <div id="ext-skill-installed" class="ext-sub-panel">
+            <div id="ext-skill-installed-list" class="ext-card-grid"></div>
+          </div>
+          <!-- Pending Config -->
+          <div id="ext-skill-pending" class="ext-sub-panel">
+            <div id="ext-skill-pending-list" class="ext-card-grid"></div>
+          </div>
+        </div>
+
+        <!-- ── Plugin Panel ── -->
+        <div id="ext-plugin-panel" class="ext-panel">
+          <div class="panel-tabs glass-tabs ext-sub-tabs">
+            <button type="button" class="tab-btn active ext-sub-tab" data-ext-sub="plugin-store">
+              <i class="fa-solid fa-store tab-icon"></i>商店浏览
+            </button>
+            <button type="button" class="tab-btn ext-sub-tab" data-ext-sub="plugin-installed">
+              <i class="fa-solid fa-box-open tab-icon"></i>已安装
+            </button>
+          </div>
+          <div id="ext-plugin-store" class="ext-sub-panel active">
+            <div class="ext-search-bar">
+              <i class="fa-solid fa-magnifying-glass ext-search-icon"></i>
+              <input type="text" id="ext-plugin-search" class="form-control ext-search-input" placeholder="搜索 ClawHub 插件..." spellcheck="false" />
+              <button type="button" id="ext-plugin-search-btn" class="btn-primary btn-size-sm">搜索</button>
+            </div>
+            <div id="ext-plugin-store-list" class="ext-card-grid"></div>
+          </div>
+          <div id="ext-plugin-installed" class="ext-sub-panel">
+            <div id="ext-plugin-installed-list" class="ext-card-grid"></div>
+          </div>
+        </div>
+
+        <!-- ── MCP Panel ── -->
+        <div id="ext-mcp-panel" class="ext-panel">
+          <div class="panel-tabs glass-tabs ext-sub-tabs">
+            <button type="button" class="tab-btn active ext-sub-tab" data-ext-sub="mcp-presets">
+              <i class="fa-solid fa-star tab-icon"></i>推荐 &amp; 添加
+            </button>
+            <button type="button" class="tab-btn ext-sub-tab" data-ext-sub="mcp-configured">
+              <i class="fa-solid fa-list-check tab-icon"></i>已配置
+            </button>
+          </div>
+          <div id="ext-mcp-presets" class="ext-sub-panel active">
+            <div id="ext-mcp-presets-list" class="ext-card-grid"></div>
+            <div id="ext-mcp-custom-panel" class="ext-mcp-custom glass-panel" data-spotlight>
+              <h4 class="ext-mcp-custom-title"><i class="fa-solid fa-plus"></i> 手动添加 MCP Server</h4>
+              <div class="ext-mcp-form">
+                <div class="form-row">
+                  <label class="form-label-strong" for="ext-mcp-name">名称</label>
+                  <input type="text" id="ext-mcp-name" class="form-control" placeholder="例如: my-mcp-server" spellcheck="false" />
+                </div>
+                <div class="form-row">
+                  <label class="form-label-strong" for="ext-mcp-command">命令</label>
+                  <input type="text" id="ext-mcp-command" class="form-control form-control-mono" placeholder="例如: npx" spellcheck="false" />
+                </div>
+                <div class="form-row">
+                  <label class="form-label-strong" for="ext-mcp-args">参数 <span class="form-help-muted-inline">(逗号分隔)</span></label>
+                  <input type="text" id="ext-mcp-args" class="form-control form-control-mono" placeholder="例如: -y, @modelcontextprotocol/server-filesystem, /path" spellcheck="false" />
+                </div>
+                <div class="form-row">
+                  <label class="form-label-strong">环境变量</label>
+                  <div id="ext-mcp-env-rows" class="ext-env-rows"></div>
+                  <button type="button" id="ext-mcp-env-add" class="panel-action-btn btn-secondary btn-size-xs"><i class="fa-solid fa-plus"></i> 添加变量</button>
+                </div>
+                <button type="button" id="ext-mcp-add-btn" class="btn-primary"><i class="fa-solid fa-plus"></i> 添加 MCP Server</button>
               </div>
             </div>
-            <!-- 已停用 -->
-            <div class="config-section">
-              <h3 class="config-section-title config-section-title-muted">
-                <i class="fa-solid fa-power-off"></i>已停用技能
-              </h3>
-              <div class="glass-panel skills-panel-card skills-panel-card-compact" id="skills-table-disabled" data-spotlight></div>
-            </div>
-            <!-- 策略阻止 -->
-            <div class="config-section">
-              <h3 class="config-section-title config-section-title-danger">
-                <i class="fa-solid fa-ban"></i>策略阻止拦截
-              </h3>
-              <div class="glass-panel skills-panel-card skills-panel-card-compact skills-panel-card-danger" id="skills-table-blocked" data-spotlight>
-              </div>
-            </div>
+          </div>
+          <div id="ext-mcp-configured" class="ext-sub-panel">
+            <div id="ext-mcp-configured-list" class="ext-card-grid"></div>
           </div>
         </div>
       </section>
 
-      <!-- Skill Config Modal -->
-      <div id="skill-config-modal" class="provider-modal-shell" aria-hidden="true">
-        <div class="provider-modal-backdrop" data-skill-modal-close></div>
-        <section class="provider-modal-panel skill-config-modal-panel" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title">
-          <div class="provider-modal-head skill-config-modal-head">
+      <!-- ═══ 扩展配置 Modal ═══ -->
+      <div id="ext-config-modal" class="provider-modal-shell" aria-hidden="true">
+        <div class="provider-modal-backdrop" data-ext-modal-close></div>
+        <section class="provider-modal-panel ext-config-modal-panel" role="dialog" aria-modal="true" aria-labelledby="ext-modal-title">
+          <div class="provider-modal-head">
             <div>
-              <h3 id="skill-modal-title" class="skill-config-title">技能配置</h3>
+              <h3 id="ext-modal-title" class="skill-config-title">扩展配置</h3>
               <p class="skill-config-subtitle">
-                <code id="skill-config-key" class="skill-config-key"></code>
+                <span id="ext-modal-type-badge" class="status-badge"></span>
+                <code id="ext-modal-key" class="skill-config-key"></code>
               </p>
             </div>
-            <button type="button" class="provider-modal-close" data-skill-modal-close aria-label="关闭">
+            <button type="button" class="provider-modal-close" data-ext-modal-close aria-label="关闭">
               <i class="fa-solid fa-xmark"></i>
             </button>
           </div>
 
-          <div class="provider-modal-body skill-config-modal-body">
-            <div id="skill-config-desc" class="skill-config-desc"></div>
-            <div id="skill-config-status" class="skill-config-status"></div>
+          <div class="provider-modal-body ext-config-modal-body">
+            <div id="ext-modal-desc" class="skill-config-desc"></div>
+
+            <!-- 详情区 -->
+            <div id="ext-modal-detail-section" class="form-section is-hidden">
+              <div class="ext-detail-grid">
+                <div id="ext-modal-detail-source" class="ext-detail-row is-hidden">
+                  <span class="ext-detail-label">来源</span>
+                  <span id="ext-modal-detail-source-val" class="ext-detail-value"></span>
+                </div>
+                <div id="ext-modal-detail-version" class="ext-detail-row is-hidden">
+                  <span class="ext-detail-label">版本</span>
+                  <span id="ext-modal-detail-version-val" class="ext-detail-value"></span>
+                </div>
+                <div id="ext-modal-detail-author" class="ext-detail-row is-hidden">
+                  <span class="ext-detail-label">作者</span>
+                  <span id="ext-modal-detail-author-val" class="ext-detail-value"></span>
+                </div>
+                <div id="ext-modal-detail-homepage" class="ext-detail-row is-hidden">
+                  <span class="ext-detail-label">主页</span>
+                  <a id="ext-modal-detail-homepage-link" class="ext-detail-link" href="#" target="_blank" rel="noopener"></a>
+                </div>
+              </div>
+              <div id="ext-modal-detail-tags" class="ext-card-tags" style="margin-top:8px"></div>
+            </div>
+
+            <!-- README / 详细描述 -->
+            <div id="ext-modal-readme-section" class="form-section is-hidden">
+              <label class="form-label-strong"><i class="fa-solid fa-book-open form-label-icon"></i>详细说明</label>
+              <div id="ext-modal-readme-content" class="ext-readme-content"></div>
+            </div>
+
+            <!-- 安全评估 -->
+            <div id="ext-modal-safety-section" class="form-section is-hidden">
+              <label class="form-label-strong"><i class="fa-solid fa-shield-halved form-label-icon"></i>安全评估</label>
+              <div id="ext-modal-safety-badges" class="ext-safety-badges"></div>
+            </div>
+
+            <!-- 状态区 -->
+            <div id="ext-modal-status-section" class="form-section">
+              <div class="ext-modal-status-row">
+                <label class="form-label-strong"><i class="fa-solid fa-circle-info form-label-icon"></i>状态</label>
+                <span id="ext-modal-status-badge" class="status-badge"></span>
+              </div>
+              <div class="ext-modal-toggle-row">
+                <label class="form-label-strong" for="ext-modal-toggle">启用</label>
+                <label class="toggle-switch">
+                  <input type="checkbox" id="ext-modal-toggle" />
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+            </div>
 
             <!-- API Key -->
-            <div id="skill-config-apikey-section" class="form-section form-section-lg is-hidden">
+            <div id="ext-modal-apikey-section" class="form-section is-hidden">
               <label class="form-label-strong">
                 <i class="fa-solid fa-key form-label-icon"></i>API 密钥
-                (<code id="skill-config-primary-env"></code>)
+                (<code id="ext-modal-primary-env"></code>)
               </label>
-              <input type="password" id="skill-config-apikey" class="form-control form-control-mono" placeholder="输入 API 密钥..." />
+              <div class="ext-modal-apikey-wrap">
+                <input type="password" id="ext-modal-apikey" class="form-control form-control-mono" placeholder="输入 API 密钥..." />
+                <button type="button" id="ext-modal-apikey-toggle" class="panel-action-btn btn-ghost btn-size-xs" aria-label="显示/隐藏密钥">
+                  <i class="fa-solid fa-eye"></i>
+                </button>
+              </div>
               <p class="form-help-muted">密钥将被安全存储，保存后不会回显。留空则不修改。</p>
             </div>
 
-            <!-- Environment Variables -->
-            <div id="skill-config-env-section" class="form-section">
+            <!-- 环境变量 -->
+            <div id="ext-modal-env-section" class="form-section">
               <div class="form-section-head">
                 <label class="form-label-strong">
                   <i class="fa-solid fa-terminal form-label-icon"></i>环境变量
                 </label>
-                <button type="button" id="skill-config-env-add" class="panel-action-btn btn-secondary btn-size-sm">
+                <button type="button" id="ext-modal-env-add" class="panel-action-btn btn-secondary btn-size-sm">
                   <i class="fa-solid fa-plus"></i> 添加
                 </button>
               </div>
-              <div id="skill-config-env-rows"></div>
-              <p id="skill-config-env-empty" class="form-empty-hint">该技能无需额外环境变量。</p>
+              <div id="ext-modal-env-rows" class="ext-env-rows"></div>
+              <p id="ext-modal-env-empty" class="form-empty-hint">无需额外环境变量。</p>
+            </div>
+
+            <!-- 依赖检查 -->
+            <div id="ext-modal-deps-section" class="form-section is-hidden">
+              <label class="form-label-strong">
+                <i class="fa-solid fa-cube form-label-icon"></i>依赖检查
+              </label>
+              <div id="ext-modal-deps-list" class="ext-deps-list"></div>
+            </div>
+
+            <!-- 配置检查 -->
+            <div id="ext-modal-config-checks-section" class="form-section is-hidden">
+              <label class="form-label-strong">
+                <i class="fa-solid fa-clipboard-check form-label-icon"></i>配置检查
+              </label>
+              <div id="ext-modal-config-checks-list" class="ext-deps-list"></div>
+            </div>
+
+            <!-- 插件动态配置 (基于 configSchema) -->
+            <div id="ext-modal-plugin-config-section" class="form-section is-hidden">
+              <label class="form-label-strong">
+                <i class="fa-solid fa-sliders form-label-icon"></i>插件配置
+              </label>
+              <div id="ext-modal-plugin-config-form"></div>
             </div>
           </div>
 
-          <div class="provider-modal-foot skill-config-modal-foot">
-            <button id="skill-config-install-btn" type="button" class="panel-action-btn btn-secondary is-hidden">
-              <i class="fa-solid fa-download"></i> <span id="skill-config-install-label">安装依赖</span>
-            </button>
+          <div class="provider-modal-foot">
+            <div class="ext-modal-foot-left">
+              <button id="ext-modal-install-dep-btn" type="button" class="panel-action-btn btn-secondary is-hidden">
+                <i class="fa-solid fa-download"></i> <span id="ext-modal-install-dep-label">安装依赖</span>
+              </button>
+              <button id="ext-modal-uninstall-btn" type="button" class="panel-action-btn btn-danger btn-size-sm is-hidden">
+                <i class="fa-regular fa-trash-can"></i> 卸载
+              </button>
+            </div>
             <div class="form-inline-actions">
-              <button type="button" class="panel-action-btn btn-secondary btn-ghost" data-skill-modal-close>取消</button>
-              <button id="skill-config-save-btn" type="button" class="btn-primary btn-primary-strong">
+              <button type="button" class="panel-action-btn btn-secondary btn-ghost" data-ext-modal-close>取消</button>
+              <button id="ext-modal-save-btn" type="button" class="btn-primary btn-primary-strong">
                 <i class="fa-solid fa-floppy-disk"></i> 保存配置
               </button>
             </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- ═══ 仓库源管理 Modal ═══ -->
+      <div id="ext-sources-modal" class="provider-modal-shell" aria-hidden="true">
+        <div class="provider-modal-backdrop" data-sources-modal-close></div>
+        <section class="provider-modal-panel ext-sources-modal-panel" role="dialog" aria-modal="true" aria-labelledby="sources-modal-title">
+          <div class="provider-modal-head">
+            <div>
+              <h3 id="sources-modal-title">仓库源管理</h3>
+            </div>
+            <button type="button" class="provider-modal-close" data-sources-modal-close aria-label="关闭">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+          <div class="provider-modal-body">
+            <p class="form-help-muted ext-sources-note">当前仓库源仅影响商店浏览、详情和安装来源。</p>
+            <div id="ext-sources-list" class="ext-sources-list"></div>
+            <div class="ext-sources-add-form">
+              <h4 class="form-label-strong"><i class="fa-solid fa-plus"></i> 添加自定义源</h4>
+              <div class="form-row">
+                <label class="form-label-strong" for="ext-source-kind">类型</label>
+                <select id="ext-source-kind" class="form-control">
+                  <option value="registry">Registry API</option>
+                  <option value="github-skills">GitHub Skills 仓库</option>
+                  <option value="mcp-presets">MCP Presets JSON</option>
+                </select>
+              </div>
+              <div class="form-row">
+                <label class="form-label-strong" for="ext-source-name">名称</label>
+                <input type="text" id="ext-source-name" class="form-control" placeholder="例如: My Registry" />
+              </div>
+              <div class="form-row">
+                <label class="form-label-strong" for="ext-source-url">URL</label>
+                <input type="text" id="ext-source-url" class="form-control form-control-mono" placeholder="https://example.com/marketplace" spellcheck="false" />
+              </div>
+              <div id="ext-source-github-fields" class="ext-source-advanced-fields is-hidden">
+                <div class="form-row">
+                  <label class="form-label-strong" for="ext-source-ref">分支 / Ref</label>
+                  <input type="text" id="ext-source-ref" class="form-control form-control-mono" value="main" spellcheck="false" />
+                </div>
+                <div class="form-row">
+                  <label class="form-label-strong" for="ext-source-skills-path">Skills 目录</label>
+                  <input type="text" id="ext-source-skills-path" class="form-control form-control-mono" value="skills" spellcheck="false" />
+                </div>
+              </div>
+              <fieldset class="ext-source-tabs-fieldset">
+                <legend class="form-label-strong">适用 Tab</legend>
+                <label class="ext-source-tab-option">
+                  <input type="checkbox" id="ext-source-tab-skill" checked />
+                  <span>Skill</span>
+                </label>
+                <label class="ext-source-tab-option">
+                  <input type="checkbox" id="ext-source-tab-plugin" checked />
+                  <span>Plugin</span>
+                </label>
+                <label class="ext-source-tab-option">
+                  <input type="checkbox" id="ext-source-tab-mcp" />
+                  <span>MCP</span>
+                </label>
+              </fieldset>
+              <p id="ext-source-kind-help" class="form-help-muted">Registry API 适合同时提供 Skill / Plugin 商店接口。</p>
+              <button type="button" id="ext-source-add-btn" class="btn-primary btn-size-sm"><i class="fa-solid fa-plus"></i> 添加</button>
+            </div>
+          </div>
+          <div class="provider-modal-foot">
+            <button type="button" class="panel-action-btn btn-secondary btn-ghost" data-sources-modal-close>关闭</button>
           </div>
         </section>
       </div>

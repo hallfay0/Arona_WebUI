@@ -70,5 +70,8 @@ AGENTS.md
 _test_usage.mjs
 connect-server.sh
 tunnel-gateway.sh
+server-tunnel-config.sh
+server-tunnel.env.example
 workspace/
 update.tar.gz
+data/store-sources.json

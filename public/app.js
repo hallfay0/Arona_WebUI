@@ -27,6 +27,18 @@ const state = {
   },
   providerModalOpen: false,
   skillModalOpen: false,
+  extModalOpen: false,
+  extSourcesModalOpen: false,
+  extActiveTab: "skill",
+  extActiveSubTab: { skill: "skill-store", plugin: "plugin-store", mcp: "mcp-presets" },
+  extNeedsRestart: false,
+  extSources: [],
+  extActiveSourceByTab: {
+    skill: "clawhub",
+    plugin: "clawhub",
+    mcp: "builtin-mcp"
+  },
+  extMcpCapability: null,
   providerEditor: {
     mode: "create",
     originalKey: "",
@@ -163,9 +175,6 @@ const SUBAGENT_THINKING_OPTIONS = [
   { value: "adaptive", label: "adaptive" }
 ];
 
-// Skills 缓存，供配置弹窗读取
-let _skillsCache = [];
-
 const PERSONA_FALLBACK_FILES = [
   "IDENTITY.md",
   "SOUL.md",
@@ -275,7 +284,7 @@ document.addEventListener("mouseleave", () => {
 const viewLoaders = {
   overview: loadOverview,
   models: loadModels,
-  skills: loadSkills,
+  extensions: loadExtensions,
   cron: loadCron,
   nodes: loadNodes,
   usage: loadUsage,
@@ -506,8 +515,8 @@ function applyConfirmAcceptVariant(button, variant = "primary") {
 }
 
 function getSkillModalInitialSelector() {
-  const apiKeyVisible = !$("skill-config-apikey-section")?.classList.contains("is-hidden");
-  return apiKeyVisible ? "#skill-config-apikey" : "#skill-config-env-add";
+  const apiKeyVisible = !$("ext-modal-apikey-section")?.classList.contains("is-hidden");
+  return apiKeyVisible ? "#ext-modal-apikey" : "#ext-modal-env-add";
 }
 
 // ── Cron Runs Modal ──
@@ -3693,6 +3702,193 @@ async function saveModels() {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 扩展中心 (Extension Center)
+// ═══════════════════════════════════════════════════════════════
+
+let _skillsCache = [];
+let _pluginsCache = [];
+let _mcpPresetsCache = {};
+let _mcpConfiguredCache = {};
+
+const EXT_SOURCE_TABS = ["skill", "plugin", "mcp"];
+const EXT_SOURCE_TAB_LABELS = {
+  skill: "Skill",
+  plugin: "Plugin",
+  mcp: "MCP"
+};
+const EXT_SOURCE_KIND_ALLOWED_TABS = {
+  registry: ["skill", "plugin"],
+  "github-skills": ["skill"],
+  "mcp-presets": ["mcp"]
+};
+const EXT_SOURCE_KIND_DEFAULT_TABS = {
+  registry: ["skill", "plugin"],
+  "github-skills": ["skill"],
+  "mcp-presets": ["mcp"]
+};
+const EXT_SOURCE_KIND_LABELS = {
+  registry: "Registry API",
+  "github-skills": "GitHub Skills",
+  "mcp-presets": "MCP Presets JSON"
+};
+
+function getAllowedTabsForSourceKind(kind) {
+  return EXT_SOURCE_KIND_ALLOWED_TABS[kind] ? [...EXT_SOURCE_KIND_ALLOWED_TABS[kind]] : ["skill"];
+}
+
+function normalizeSourceTabs(source) {
+  const kind = String(source?.kind || "registry");
+  const allowedTabs = getAllowedTabsForSourceKind(kind);
+  const requestedTabs = Array.isArray(source?.tabs)
+    ? source.tabs.map((tab) => String(tab)).filter((tab) => allowedTabs.includes(tab))
+    : [];
+  return requestedTabs.length > 0
+    ? requestedTabs
+    : [...(EXT_SOURCE_KIND_DEFAULT_TABS[kind] || allowedTabs)];
+}
+
+function getExtSourceId(tab = state.extActiveTab) {
+  return state.extActiveSourceByTab?.[tab] || "";
+}
+
+function getExtSource(tab = state.extActiveTab) {
+  const sourceId = getExtSourceId(tab);
+  return state.extSources.find((source) => source.id === sourceId) || null;
+}
+
+function sourceSupportsTab(source, tab) {
+  return Array.isArray(source?.tabs) && source.tabs.includes(tab);
+}
+
+function getExtSourceKindLabel(kind) {
+  return EXT_SOURCE_KIND_LABELS[kind] || kind;
+}
+
+function getExtSourceQueryParam(tab = state.extActiveTab) {
+  const sourceId = getExtSourceId(tab);
+  return sourceId ? `&source=${encodeURIComponent(sourceId)}` : "";
+}
+
+function getExtSourceLabel(tab = state.extActiveTab) {
+  const active = getExtSource(tab);
+  return active?.name || "ClawHub";
+}
+
+async function ensureExtSources(force = false) {
+  if (!force && Array.isArray(state.extSources) && state.extSources.length > 0) {
+    return state.extSources;
+  }
+  const sources = await api("/api/store/sources");
+  const list = Array.isArray(sources)
+    ? sources.map((source) => ({
+      ...source,
+      kind: String(source?.kind || "registry"),
+      tabs: normalizeSourceTabs(source)
+    }))
+    : [];
+  state.extSources = list;
+  for (const tab of EXT_SOURCE_TABS) {
+    const currentId = getExtSourceId(tab);
+    if (list.some((source) => source.id === currentId && sourceSupportsTab(source, tab))) {
+      continue;
+    }
+    state.extActiveSourceByTab[tab] = list.find((source) => sourceSupportsTab(source, tab))?.id || "";
+  }
+  return list;
+}
+
+function normalizeSkillRecord(skill) {
+  return {
+    name: skill.name,
+    description: skill.description?.trim() || "",
+    source: skill.source,
+    key: skill.skillKey,
+    enabled: !skill.disabled,
+    disabled: skill.disabled === true,
+    eligible: skill.eligible === true,
+    blockedByAllowlist: skill.blockedByAllowlist === true,
+    missing: normalizeSkillMissing(skill.missing),
+    primaryEnv: skill.primaryEnv || null,
+    install: Array.isArray(skill.install) ? skill.install : [],
+    emoji: skill.emoji || "",
+    bundled: skill.source === "bundled"
+  };
+}
+
+async function refreshExtSkillsCache() {
+  const data = await api("/api/skills");
+  const skills = Array.isArray(data?.skills) ? data.skills : [];
+  _skillsCache = skills
+    .slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+    .map(normalizeSkillRecord);
+  return _skillsCache;
+}
+
+function normalizePluginRecord(plugin) {
+  return {
+    id: String(plugin?.id || ""),
+    name: String(plugin?.name || plugin?.id || ""),
+    packageName: String(plugin?.packageName || plugin?.name || plugin?.id || ""),
+    description: String(plugin?.description || ""),
+    version: String(plugin?.version || ""),
+    enabled: plugin?.enabled !== false,
+    status: String(plugin?.status || (plugin?.enabled !== false ? "loaded" : "disabled")),
+    source: String(plugin?.source || "unknown"),
+    config: plugin?.config && typeof plugin.config === "object" ? plugin.config : {},
+    configSchema: plugin?.configSchema && typeof plugin.configSchema === "object" ? plugin.configSchema : null,
+    uiHints: plugin?.uiHints && typeof plugin.uiHints === "object" ? plugin.uiHints : null,
+    author: String(plugin?.author || ""),
+    homepage: String(plugin?.homepage || "")
+  };
+}
+
+function getPluginLookupKeys(plugin) {
+  return [plugin.id, plugin.name, plugin.packageName]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function refreshExtPluginsCache() {
+  const data = await api("/api/store/plugins/list");
+  const plugins = Array.isArray(data) ? data : (Array.isArray(data?.plugins) ? data.plugins : []);
+  _pluginsCache = plugins.map(normalizePluginRecord);
+  return _pluginsCache;
+}
+
+async function ensureExtMcpCapability(force = false) {
+  if (!force && state.extMcpCapability) {
+    return state.extMcpCapability;
+  }
+  const capability = await api("/api/store/mcp/capability").catch((error) => ({
+    supported: false,
+    error: error instanceof Error ? error.message : String(error)
+  }));
+  state.extMcpCapability = capability;
+  return capability;
+}
+
+function setExtMcpManualFormEnabled(enabled) {
+  const panel = $("ext-mcp-custom-panel");
+  if (panel) {
+    panel.classList.toggle("is-hidden", enabled !== true);
+  }
+}
+
+function renderExtMcpUnsupported(target, capability) {
+  if (!target) return;
+  const title = escapeHtml("当前网关不支持 MCP 配置");
+  const subtitle = escapeHtml(capability?.error || "请升级服务器上的 OpenClaw 后再使用 MCP 管理。");
+  target.innerHTML = `
+    <div class="glass-panel panel-error ext-mcp-unsupported">
+      <div class="empty-icon"><i class="fa-solid fa-plug-circle-xmark"></i></div>
+      <div class="empty-title">${title}</div>
+      <div class="empty-subtitle">${subtitle}</div>
+    </div>
+  `;
+}
+
 function normalizeSkillMissing(missing) {
   const source = missing && typeof missing === "object" ? missing : {};
   const toList = (value) => (Array.isArray(value)
@@ -3721,445 +3917,1805 @@ function buildSkillNotReadyReasons(skill) {
   return reasons;
 }
 
-async function loadSkills() {
-  const tableActive = $("skills-table-active");
-  const tablePending = $("skills-table-pending");
-  const tableDisabled = $("skills-table-disabled");
-  const tableBlocked = $("skills-table-blocked");
+// ── Extension Center: loadExtensions ──
 
-  if (tableActive) tableActive.innerHTML = renderSkeleton(3);
-  if (tablePending) tablePending.innerHTML = renderSkeleton(1);
+async function loadExtensions() {
+  await ensureExtSources();
+
+  // 加载当前活跃子 tab 的数据
+  const tab = state.extActiveTab;
+  const sub = state.extActiveSubTab[tab];
+
+  if (tab === "skill") {
+    if (sub === "skill-store") await loadExtSkillStore();
+    else if (sub === "skill-pending") await loadExtSkillPending();
+    else await loadExtSkillInstalled();
+  } else if (tab === "plugin") {
+    if (sub === "plugin-store") await loadExtPluginStore();
+    else await loadExtPluginInstalled();
+  } else if (tab === "mcp") {
+    if (sub === "mcp-presets") await loadExtMcpPresets();
+    else await loadExtMcpConfigured();
+  }
+}
+
+// ── Skill Store ──
+
+async function loadExtSkillStore(query) {
+  const container = $("ext-skill-store-list");
+  if (!container) return;
+  const source = getExtSource("skill");
+  if (!source) {
+    container.innerHTML = renderEmpty("fa-solid fa-server", "还没有 Skill 仓库源", "前往「仓库源管理」添加一个支持 Skill 的源");
+    return;
+  }
+
+  const searchTerm = (query && query.trim()) ? query.trim() : "tool";
+  const isDefault = !query || !query.trim();
+
+  container.innerHTML = `<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>${isDefault ? "正在加载推荐..." : "正在搜索..."}</div></div>`;
 
   try {
-    const data = await api("/api/skills");
-    const skills = data.skills || [];
+    if (_skillsCache.length === 0) {
+      await refreshExtSkillsCache().catch(() => []);
+    }
+    const items = isDefault
+      ? source.kind === "github-skills"
+        ? await api(`/api/store/skills/list?limit=100${getExtSourceQueryParam("skill")}`)
+        : await api(`/api/store/skills/search?q=${encodeURIComponent(searchTerm)}&limit=20${getExtSourceQueryParam("skill")}`)
+      : await api(`/api/store/skills/search?q=${encodeURIComponent(searchTerm)}&limit=20${getExtSourceQueryParam("skill")}`);
+    const list = Array.isArray(items) ? items : [];
 
-    if (skills.length === 0) {
-      const emptyHtml = renderEmpty("fa-solid fa-box-open", "技能箱是空的", "还没有安装任何技能，快去添加一些吧！");
-      if (tableActive) tableActive.innerHTML = emptyHtml;
-      if (tablePending) tablePending.innerHTML = emptyHtml;
-      if (tableDisabled) tableDisabled.innerHTML = emptyHtml;
-      if (tableBlocked) tableBlocked.innerHTML = emptyHtml;
+    if (list.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-box-open", "未找到技能", isDefault ? `${getExtSourceLabel("skill")} 暂无推荐技能` : "尝试其他关键词搜索");
       return;
     }
 
-    const rows = skills
-      .slice()
-      .sort((a, b) => String(a.name).localeCompare(String(b.name)))
-      .map((skill) => ({
-        name: skill.name,
-        description: skill.description?.trim() || "",
-        source: skill.source,
-        key: skill.skillKey,
-        enabled: !skill.disabled,
-        eligible: skill.eligible === true,
-        disabled: skill.disabled === true,
-        blockedByAllowlist: skill.blockedByAllowlist === true,
-        missing: normalizeSkillMissing(skill.missing),
-        primaryEnv: skill.primaryEnv || null,
-        install: Array.isArray(skill.install) ? skill.install : [],
-        emoji: skill.emoji || ""
-      }));
+    // 获取已安装技能的 key 列表
+    const installedKeys = new Set(_skillsCache.map(s => s.key));
 
-    _skillsCache = rows;
-
-    // 划分四个象限
-    const activeSkills = rows.filter(s => s.enabled && s.eligible);
-    const blockedSkills = rows.filter(s => s.blockedByAllowlist);
-    const pendingSkills = rows.filter(s => !s.eligible && !s.blockedByAllowlist);
-    const disabledSkills = rows.filter(s => s.eligible && !s.enabled);
-
-    const renderSkillEntry = (skill, { category }) => {
-      const cleanName = skill.name.replace(/\s*\(.*?\)/, "");
-      const reasons = buildSkillNotReadyReasons(skill);
-      let reasonBlock = "";
-
-      if (category === "active") {
-        reasonBlock = `
-          <div class="skill-hint-active">
-            <i class="fa-solid fa-bolt"></i>
-            <span>技能活跃中，将自动参与协同</span>
-          </div>
-        `;
-      } else if (category === "blocked") {
-        reasonBlock = `
-          <div class="skill-hint-block skill-hint-blocked">
-            <i class="fa-solid fa-ban"></i>
-            <span>被所属节点组的安全白名单拦截，禁止强制运行。</span>
-          </div>
-        `;
-      } else if (category === "pending") {
-        const missHtml = reasons.map(r => `<li>${escapeHtml(r)}</li>`).join("");
-        reasonBlock = `
-          <div class="skill-hint-pending">
-            <div class="skill-hint-title">
-              <i class="fa-solid fa-triangle-exclamation"></i>缺少必要运行条件
-            </div>
-            <ul class="skill-hint-list">${missHtml}</ul>
-            <div class="skill-hint-note">提示：请在终端服务器补齐环境变量或依赖包后，尝试在此重新开启。</div>
-          </div>
-        `;
-      } else if (category === "disabled") {
-        reasonBlock = `
-          <div class="skill-hint-block skill-hint-disabled">
-            <i class="fa-solid fa-power-off"></i>
-            <span>已停用该模块，拨动右侧开关启用即可恢复。</span>
-          </div>
-        `;
-      }
-
-      // 禁用开关判定（被组策略阻止不能开）
-      const toggleDisabled = category === "blocked" ? "disabled" : "";
-
-      const statusLabels = {
-        active: { text: '运行中', className: 'skill-entry-status-active' },
-        pending: { text: '待配置', className: 'skill-entry-status-pending' },
-        disabled: { text: '已停用', className: 'skill-entry-status-disabled' },
-        blocked: { text: '被拦截', className: 'skill-entry-status-blocked' }
-      };
-      const statusInfo = statusLabels[category] || { text: '未知', className: 'skill-entry-status-disabled' };
-      const toggleClass = category === 'blocked'
-        ? 'switch-toggle skill-entry-toggle skill-entry-toggle-blocked'
-        : 'switch-toggle skill-entry-toggle';
+    container.innerHTML = list.map(item => {
+      const slug = escapeHtml(item.slug || item.name || "");
+      const name = escapeHtml(item.displayName || item.slug || "");
+      const desc = escapeHtml(item.summary || item.description || "");
+      const version = escapeHtml(item.latestVersion || "");
+      const installed = installedKeys.has(slug);
+      const tags = (item.tags || []).slice(0, 3);
 
       return `
-        <article class="skill-entry">
-          <div class="skill-entry-main">
-            <div class="skill-entry-head">
-              <strong class="skill-entry-name">${escapeHtml(cleanName)}</strong>
-              <span class="skill-chip skill-chip-source">${escapeHtml(skill.source)}</span>
-            </div>
-            <div class="skill-entry-key">${escapeHtml(skill.key)}</div>
-            <div class="skill-entry-description">${escapeHtml(skill.description || "暂无技能描述。")}</div>
-            ${reasonBlock}
-          </div>
-          <div class="skill-entry-side">
-            <div class="skill-entry-controls">
-              <button type="button" class="skill-config-btn panel-action-btn btn-secondary btn-size-sm" data-skill-config="${escapeHtml(skill.key)}">
-                <i class="fa-solid fa-sliders"></i> 配置
-              </button>
-              <div class="skill-toggle-wrap">
-                 <label class="${toggleClass}" aria-label="切换状态">
-                  <input type="checkbox" data-skill-toggle="${escapeHtml(skill.key)}" ${skill.enabled ? "checked" : ""} ${toggleDisabled} />
-                  <span class="slider"><span class="knob"></span></span>
-                </label>
-                <span class="skill-entry-status ${statusInfo.className}">${statusInfo.text}</span>
+        <div class="ext-card" data-spotlight data-ext-detail-skill="${slug}">
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="fa-solid fa-wand-sparkles"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${name}</div>
+              <div class="ext-card-meta">
+                ${version ? `<span class="ext-card-version">v${version}</span>` : ""}
               </div>
             </div>
           </div>
-        </article>
-      `;
-    };
-
-    const renderList = (items, category, emptyMsg) => {
-      if (items.length === 0) {
-        return `<div class="skill-list-empty">${emptyMsg}</div>`;
-      }
-      return items.map((skill) => renderSkillEntry(skill, { category })).join("");
-    };
-
-    if (tableActive) tableActive.innerHTML = renderList(activeSkills, "active", "没有位于活跃状态的技能。");
-    if (tablePending) tablePending.innerHTML = renderList(pendingSkills, "pending", "太棒了，目前所有可用的技能都已就绪！");
-    if (tableDisabled) tableDisabled.innerHTML = renderList(disabledSkills, "disabled", "目前没有手动停用的闲置技能。");
-    if (tableBlocked) tableBlocked.innerHTML = renderList(blockedSkills, "blocked", "目前没有被系统阻止的技能。");
-
-    // 绑定所有的开关动作并劫持刷新
-    const bindToggles = () => {
-      for (const toggle of document.querySelectorAll("[data-skill-toggle]")) {
-        toggle.addEventListener("change", async () => {
-          const skillKey = toggle.getAttribute("data-skill-toggle");
-          const enabled = toggle.checked;
-          if (!skillKey) return;
-          try {
-            await api("/api/skills/update", {
-              method: "POST",
-              body: JSON.stringify({ skillKey, enabled })
-            });
-            // 变更后立即局部重新拉取，触发流转
-            await loadSkills();
-          } catch (err) {
-            alert(err.message);
-            toggle.checked = !enabled;
-          }
-        });
-      }
-    };
-
-    bindToggles();
-
-  } catch (err) {
-    if (tableActive) tableActive.textContent = err.message;
-  }
-}
-
-// 绑定技能面板切换事件
-document.addEventListener("click", (e) => {
-  const btn = e.target.closest(".skills-tab-btn");
-  if (!btn) return;
-
-  document.querySelectorAll(".skills-tab-btn").forEach(b => {
-    b.classList.remove("active");
-  });
-
-  btn.classList.add("active");
-
-  const targetId = btn.getAttribute("data-target") + "-panel";
-  document.querySelectorAll(".skills-panel").forEach(p => {
-    p.classList.remove("active");
-  });
-
-  const panel = document.getElementById(targetId);
-  if (panel) {
-    panel.classList.add("active");
-  }
-});
-
-// 绑定技能配置 Modal 流转
-function addSkillEnvRow(container, key, value, readonlyKey) {
-  const row = document.createElement("div");
-  row.className = "env-row";
-
-  const keyInput = document.createElement("input");
-  keyInput.type = "text";
-  keyInput.className = "env-key form-control form-control-mono form-control-sm";
-  keyInput.value = key;
-  keyInput.placeholder = "变量名";
-  if (readonlyKey) {
-    keyInput.readOnly = true;
-    keyInput.classList.add("is-readonly");
-  }
-
-  const valInput = document.createElement("input");
-  valInput.type = "text";
-  valInput.className = "env-val form-control form-control-mono form-control-sm";
-  valInput.value = value;
-  valInput.placeholder = "值";
-
-  const deleteBtn = document.createElement("button");
-  deleteBtn.type = "button";
-  deleteBtn.className = "env-row-delete panel-action-btn btn-secondary btn-size-sm btn-danger";
-  deleteBtn.title = "移除";
-  deleteBtn.innerHTML = '<i class="fa-solid fa-trash-can"></i>';
-
-  row.appendChild(keyInput);
-  row.appendChild(valInput);
-  row.appendChild(deleteBtn);
-  container.appendChild(row);
-}
-
-function setSkillModalOpen(open) {
-  const modal = $("skill-config-modal");
-  if (!modal) return;
-
-  state.skillModalOpen = open === true;
-  modal.classList.toggle("open", state.skillModalOpen);
-  modal.setAttribute("aria-hidden", state.skillModalOpen ? "false" : "true");
-  document.body.classList.toggle("skill-modal-open", state.skillModalOpen);
-
-  if (state.skillModalOpen) {
-    captureModalFocus("skill-config-modal", { initialSelector: getSkillModalInitialSelector() });
-  } else {
-    releaseModalFocus("skill-config-modal");
-  }
-}
-
-document.addEventListener("click", async (e) => {
-  // 打开技能配置 Modal
-  const configBtn = e.target.closest("[data-skill-config]");
-  if (configBtn) {
-    const skillKey = configBtn.getAttribute("data-skill-config");
-    if (!skillKey) return;
-
-    const skill = _skillsCache.find(s => s.key === skillKey);
-    if (!skill) return;
-
-    const modal = $("skill-config-modal");
-    if (!modal) return;
-
-    // 填充基本信息
-    $("skill-modal-title").textContent = `${skill.emoji ? skill.emoji + " " : ""}${skill.name}`;
-    $("skill-config-key").textContent = skill.key;
-    $("skill-config-desc").textContent = skill.description || "暂无技能描述。";
-
-    // 状态/缺失信息
-    const statusEl = $("skill-config-status");
-    const missingItems = [];
-    if (skill.missing.bins?.length > 0) missingItems.push(`缺少命令: ${skill.missing.bins.join(", ")}`);
-    if (skill.missing.anyBins?.length > 0) missingItems.push(`至少安装其一: ${skill.missing.anyBins.join(", ")}`);
-    if (skill.missing.env?.length > 0) missingItems.push(`缺少环境变量: ${skill.missing.env.join(", ")}`);
-    if (skill.missing.config?.length > 0) missingItems.push(`缺少配置项: ${skill.missing.config.join(", ")}`);
-
-    if (missingItems.length > 0) {
-      statusEl.innerHTML = `
-        <div class="form-status-block form-status-warning">
-          <div class="form-status-title">
-            <i class="fa-solid fa-triangle-exclamation"></i>缺少运行条件
+          ${desc ? `<div class="ext-card-desc">${desc}</div>` : ""}
+          ${tags.length > 0 ? `<div class="ext-card-tags">${tags.map(t => `<span class="ext-card-tag">${escapeHtml(typeof t === "string" ? t : t.name || "")}</span>`).join("")}</div>` : ""}
+          <div class="ext-card-foot">
+            <div class="ext-card-status">
+              ${installed
+                ? '<span class="status-badge ok">已安装</span>'
+                : ""}
+            </div>
+            <div class="ext-card-actions">
+              ${installed
+                ? `<button class="panel-action-btn btn-secondary btn-size-sm" disabled><i class="fa-solid fa-check"></i> 已安装</button>`
+                : `<button class="btn-primary btn-size-sm" data-ext-install-skill="${slug}"><i class="fa-solid fa-download"></i> 安装</button>`}
+            </div>
           </div>
-          <ul class="form-status-list">
-            ${missingItems.map(i => `<li>${escapeHtml(i)}</li>`).join("")}
-          </ul>
         </div>`;
-    } else if (skill.eligible) {
-      statusEl.innerHTML = `
-        <div class="form-status-block form-status-success">
-          <i class="fa-solid fa-circle-check"></i> 所有运行条件已满足，技能正常工作中。
-        </div>`;
-    } else {
-      statusEl.innerHTML = "";
-    }
-
-    // API Key 区域
-    const apiKeySection = $("skill-config-apikey-section");
-    const apiKeyInput = $("skill-config-apikey");
-    if (skill.primaryEnv) {
-      apiKeySection?.classList.remove("is-hidden");
-      $("skill-config-primary-env").textContent = skill.primaryEnv;
-      apiKeyInput.value = "";
-    } else {
-      apiKeySection?.classList.add("is-hidden");
-    }
-
-    // 环境变量区域
-    const envRowsContainer = $("skill-config-env-rows");
-    const envEmptyHint = $("skill-config-env-empty");
-    envRowsContainer.innerHTML = "";
-    const missingEnvs = (skill.missing.env || []).filter(e => e !== skill.primaryEnv);
-    if (missingEnvs.length > 0) {
-      for (const envName of missingEnvs) {
-        addSkillEnvRow(envRowsContainer, envName, "", true);
-      }
-      envEmptyHint?.classList.add("is-hidden");
-    } else {
-      envEmptyHint?.classList.remove("is-hidden");
-    }
-
-    // 安装按钮
-    const installBtn = $("skill-config-install-btn");
-    if (skill.install?.length > 0 && skill.missing.bins?.length > 0) {
-      installBtn?.classList.remove("is-hidden");
-      $("skill-config-install-label").textContent = skill.install[0].label || "安装依赖";
-      installBtn.setAttribute("data-install-name", skill.name);
-      installBtn.setAttribute("data-install-id", skill.install[0].id);
-      installBtn.setAttribute("data-skill-key", skill.key);
-    } else {
-      installBtn?.classList.add("is-hidden");
-    }
-
-    // 存储当前 skill key
-    $("skill-config-save-btn").setAttribute("data-current-skill", skillKey);
-
-    // 显示 Modal
-    setSkillModalOpen(true);
-    return;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
   }
+}
 
-  // 关闭 Modal
-  const closeTrigger = e.target.closest("[data-skill-modal-close]");
-  if (closeTrigger) {
-    setSkillModalOpen(false);
-    return;
-  }
+// ── Skill Installed ──
 
-  // 添加环境变量行
-    if (e.target.closest("#skill-config-env-add")) {
-      const envRows = $("skill-config-env-rows");
-      if (envRows) {
-        addSkillEnvRow(envRows, "", "", false);
-        const envEmpty = $("skill-config-env-empty");
-        envEmpty?.classList.add("is-hidden");
-      }
+async function loadExtSkillInstalled() {
+  const container = $("ext-skill-installed-list");
+  if (!container) return;
+  container.innerHTML = '<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>正在加载...</div></div>';
+
+  try {
+    const rows = await refreshExtSkillsCache();
+
+    // 已安装列表只显示活跃+已停用（排除待配置）
+    const installedRows = rows.filter(s => s.eligible || s.blockedByAllowlist);
+
+    if (installedRows.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-box-open", "还没有已就绪的技能", "前往商店浏览安装技能，或查看「待配置」补齐依赖");
       return;
     }
 
-  // 删除环境变量行
-  if (e.target.closest(".env-row-delete")) {
-    const row = e.target.closest(".env-row");
-    if (row) row.remove();
-    const envRows = $("skill-config-env-rows");
-    const envEmpty = $("skill-config-env-empty");
-    if (envRows && envEmpty && envRows.children.length === 0) {
-      envEmpty.classList.remove("is-hidden");
+    container.innerHTML = installedRows.map(skill => {
+      const statusClass = skill.eligible && skill.enabled ? "ext-card-installed"
+        : "ext-card-installed ext-card-disabled";
+      const statusBadge = skill.eligible && skill.enabled
+        ? '<span class="status-badge ok">运行中</span>'
+        : skill.blockedByAllowlist
+        ? '<span class="status-badge bad">被拦截</span>'
+        : !skill.eligible
+        ? '<span class="status-badge warn">待配置</span>'
+        : '<span class="status-badge">已停用</span>';
+
+      return `
+        <div class="ext-card ${statusClass}" data-spotlight>
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="fa-solid fa-wand-sparkles"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${skill.emoji ? escapeHtml(skill.emoji) + " " : ""}${escapeHtml(skill.name)}</div>
+              <div class="ext-card-meta">
+                <span class="ext-card-source">${escapeHtml(skill.source)}</span>
+                <code class="ext-card-version">${escapeHtml(skill.key)}</code>
+              </div>
+            </div>
+          </div>
+          <div class="ext-card-desc">${escapeHtml(skill.description || "暂无描述")}</div>
+          <div class="ext-card-foot">
+            <div class="ext-card-status">${statusBadge}</div>
+            <div class="ext-card-actions">
+              <button class="panel-action-btn btn-secondary btn-size-sm" data-ext-config-skill="${escapeHtml(skill.key)}">
+                <i class="fa-solid fa-sliders"></i> 配置
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── Skill Pending Config ──
+
+async function loadExtSkillPending() {
+  const container = $("ext-skill-pending-list");
+  if (!container) return;
+  container.innerHTML = '<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>正在加载...</div></div>';
+
+  try {
+    if (_skillsCache.length === 0) {
+      await refreshExtSkillsCache();
+    }
+
+    const pendingSkills = _skillsCache.filter(s => !s.eligible && !s.blockedByAllowlist);
+
+    if (pendingSkills.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-circle-check", "全部就绪", "所有技能的运行条件已满足，无需额外配置");
+      return;
+    }
+
+    container.innerHTML = pendingSkills.map(skill => {
+      const reasons = buildSkillNotReadyReasons(skill);
+      const reasonHtml = reasons.length > 0
+        ? `<div class="ext-card-desc" style="color:var(--warning)">${reasons.map(r => escapeHtml(r)).join("；")}</div>`
+        : "";
+
+      return `
+        <div class="ext-card ext-card-installed ext-card-pending" data-spotlight>
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="fa-solid fa-wand-sparkles"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${skill.emoji ? escapeHtml(skill.emoji) + " " : ""}${escapeHtml(skill.name)}</div>
+              <div class="ext-card-meta">
+                <span class="ext-card-source">${escapeHtml(skill.source)}</span>
+                <code class="ext-card-version">${escapeHtml(skill.key)}</code>
+              </div>
+            </div>
+          </div>
+          <div class="ext-card-desc">${escapeHtml(skill.description || "暂无描述")}</div>
+          ${reasonHtml}
+          <div class="ext-card-foot">
+            <div class="ext-card-status"><span class="status-badge warn">待配置</span></div>
+            <div class="ext-card-actions">
+              <button class="panel-action-btn btn-secondary btn-size-sm" data-ext-config-skill="${escapeHtml(skill.key)}">
+                <i class="fa-solid fa-sliders"></i> 配置
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── Plugin Store ──
+
+async function loadExtPluginStore(query) {
+  const container = $("ext-plugin-store-list");
+  if (!container) return;
+  const source = getExtSource("plugin");
+  if (!source) {
+    container.innerHTML = renderEmpty("fa-solid fa-server", "还没有 Plugin 仓库源", "前往「仓库源管理」添加一个支持 Plugin 的源");
+    return;
+  }
+  container.innerHTML = '<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>正在加载...</div></div>';
+
+  try {
+    if (_pluginsCache.length === 0) {
+      await refreshExtPluginsCache().catch(() => []);
+    }
+    const searchTerm = (query && query.trim()) ? query.trim() : "plugin";
+    const isDefault = !query || !query.trim();
+    container.innerHTML = `<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>${isDefault ? "正在加载推荐..." : "正在搜索..."}</div></div>`;
+
+    const data = await api(`/api/store/plugins/search?q=${encodeURIComponent(searchTerm)}&family=${encodeURIComponent("code-plugin,bundle-plugin")}&limit=20${getExtSourceQueryParam("plugin")}`);
+    const results = data?.results || data || [];
+    const list = Array.isArray(results) ? results : [];
+
+    if (list.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-box-open", "未找到插件", isDefault ? `${getExtSourceLabel("plugin")} 暂无推荐插件` : "尝试其他关键词搜索");
+      return;
+    }
+
+    const installedPackages = new Set(_pluginsCache.flatMap(getPluginLookupKeys));
+
+    container.innerHTML = list.map(item => {
+      const pkg = item.package || item;
+      const name = escapeHtml(pkg.name || pkg.displayName || "");
+      const display = escapeHtml(pkg.displayName || pkg.name || "");
+      const desc = escapeHtml(pkg.summary || "");
+      const version = escapeHtml(pkg.latestVersion || "");
+      const family = escapeHtml(pkg.family || "");
+      const installed = installedPackages.has(String(pkg.name || pkg.displayName || "").trim().toLowerCase());
+
+      const safetyData = escapeHtml(JSON.stringify({
+        isOfficial: pkg.isOfficial || false,
+        channel: pkg.channel || "unknown",
+        executesCode: pkg.executesCode || false,
+        verificationTier: pkg.verificationTier || null
+      }));
+
+      return `
+        <div class="ext-card" data-spotlight data-ext-detail-plugin="${name}" data-safety="${safetyData}">
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="fa-solid fa-puzzle-piece"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${display}</div>
+              <div class="ext-card-meta">
+                ${version ? `<span class="ext-card-version">v${version}</span>` : ""}
+                ${family ? `<span class="ext-card-source">${family}</span>` : ""}
+              </div>
+            </div>
+          </div>
+          ${desc ? `<div class="ext-card-desc">${desc}</div>` : ""}
+          <div class="ext-card-foot">
+            <div class="ext-card-status">
+              ${installed ? '<span class="status-badge ok">已安装</span>' : ""}
+            </div>
+            <div class="ext-card-actions">
+              ${installed
+                ? '<button class="panel-action-btn btn-secondary btn-size-sm" disabled><i class="fa-solid fa-check"></i> 已安装</button>'
+                : `<button class="btn-primary btn-size-sm" data-ext-install-plugin="${name}"><i class="fa-solid fa-download"></i> 安装</button>`}
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── Plugin Installed ──
+
+async function loadExtPluginInstalled() {
+  const container = $("ext-plugin-installed-list");
+  if (!container) return;
+  container.innerHTML = '<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>正在加载...</div></div>';
+
+  try {
+    let plugins;
+    try {
+      plugins = await refreshExtPluginsCache();
+    } catch (err) {
+      container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> 插件列表加载失败：${escapeHtml(err.message)}<br><small>请确认 openclaw CLI 可用且 Gateway 正在运行。</small></div>`;
+      return;
+    }
+
+    if (plugins.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-puzzle-piece", "还没有安装插件", "前往商店浏览安装插件");
+      return;
+    }
+
+    // 重启提示横幅
+    const banner = state.extNeedsRestart
+      ? `<div class="ext-restart-banner">
+          <span><i class="fa-solid fa-triangle-exclamation"></i> 插件变更需要重启 Gateway 才能生效</span>
+          <button class="btn-primary btn-size-sm" data-ext-restart><i class="fa-solid fa-rotate"></i> 重启</button>
+        </div>`
+      : "";
+
+    container.innerHTML = banner + plugins.map(p => {
+      const id = escapeHtml(p.id || "");
+      const name = escapeHtml(p.name || p.id || "");
+      const desc = escapeHtml(p.description || "");
+      const enabled = p.enabled !== false;
+      const status = p.status || (enabled ? "loaded" : "disabled");
+      const statusBadge = status === "loaded"
+        ? '<span class="status-badge ok">已加载</span>'
+        : status === "error"
+        ? '<span class="status-badge bad">错误</span>'
+        : '<span class="status-badge">已禁用</span>';
+      const cardClass = enabled ? "ext-card-installed" : "ext-card-installed ext-card-disabled";
+
+      return `
+        <div class="ext-card ${cardClass}" data-spotlight>
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="fa-solid fa-puzzle-piece"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${name}</div>
+              <div class="ext-card-meta">
+                <code class="ext-card-version">${id}</code>
+                ${p.version ? `<span class="ext-card-version">v${escapeHtml(p.version)}</span>` : ""}
+              </div>
+            </div>
+          </div>
+          ${desc ? `<div class="ext-card-desc">${desc}</div>` : ""}
+          <div class="ext-card-foot">
+            <div class="ext-card-status">${statusBadge}</div>
+            <div class="ext-card-actions">
+              <button class="panel-action-btn btn-secondary btn-size-sm" data-ext-config-plugin="${id}">
+                <i class="fa-solid fa-sliders"></i> 配置
+              </button>
+              <button class="panel-action-btn btn-secondary btn-size-sm" data-ext-toggle-plugin="${id}" data-enabled="${enabled}">
+                <i class="fa-solid fa-${enabled ? "pause" : "play"}"></i> ${enabled ? "禁用" : "启用"}
+              </button>
+              <button class="panel-action-btn btn-danger btn-size-sm" data-ext-uninstall-plugin="${id}">
+                <i class="fa-regular fa-trash-can"></i>
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── MCP Presets ──
+
+async function loadExtMcpPresets() {
+  const container = $("ext-mcp-presets-list");
+  if (!container) return;
+  const source = getExtSource("mcp");
+  if (!source) {
+    setExtMcpManualFormEnabled(false);
+    container.innerHTML = renderEmpty("fa-solid fa-server", "还没有 MCP 预置源", "前往「仓库源管理」添加一个支持 MCP 的源");
+    return;
+  }
+
+  try {
+    const capability = await ensureExtMcpCapability();
+    if (!capability?.supported) {
+      setExtMcpManualFormEnabled(false);
+      renderExtMcpUnsupported(container, capability);
+      return;
+    }
+    setExtMcpManualFormEnabled(true);
+    const sourceId = source.id;
+    if (!_mcpPresetsCache[sourceId]) {
+      _mcpPresetsCache[sourceId] = await api(`/api/store/mcp/presets?source=${encodeURIComponent(sourceId)}`).catch(() => []);
+    }
+    const presets = Array.isArray(_mcpPresetsCache[sourceId]) ? _mcpPresetsCache[sourceId] : [];
+
+    if (presets.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-plug", "暂无推荐", "可通过下方表单手动添加");
+      return;
+    }
+
+    container.innerHTML = presets.map(preset => {
+      const id = escapeHtml(preset.id || "");
+      const name = escapeHtml(preset.name || "");
+      const desc = escapeHtml(preset.description || "");
+      const icon = preset.icon || "fa-solid fa-plug";
+
+      return `
+        <div class="ext-card" data-spotlight>
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="${escapeHtml(icon)}"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${name}</div>
+            </div>
+          </div>
+          ${desc ? `<div class="ext-card-desc">${desc}</div>` : ""}
+          <div class="ext-card-foot">
+            <div class="ext-card-status"></div>
+            <div class="ext-card-actions">
+              <button class="btn-primary btn-size-sm" data-ext-add-mcp-preset="${id}"><i class="fa-solid fa-plus"></i> 添加</button>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  } catch (err) {
+    setExtMcpManualFormEnabled(false);
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── MCP Configured ──
+
+async function loadExtMcpConfigured() {
+  const container = $("ext-mcp-configured-list");
+  if (!container) return;
+  container.innerHTML = '<div class="ext-loading"><i class="fa-solid fa-circle-notch fa-spin"></i><div>正在加载...</div></div>';
+
+  try {
+    const capability = await ensureExtMcpCapability();
+    if (!capability?.supported) {
+      renderExtMcpUnsupported(container, capability);
+      return;
+    }
+    const data = await api("/api/store/mcp/list");
+    const servers = data?.servers || {};
+    _mcpConfiguredCache = servers && typeof servers === "object" ? servers : {};
+    const entries = Object.entries(servers);
+
+    if (entries.length === 0) {
+      container.innerHTML = renderEmpty("fa-solid fa-plug", "还没有配置 MCP Server", "前往「推荐 & 添加」添加");
+      return;
+    }
+
+    container.innerHTML = entries.map(([name, config]) => {
+      const cmd = escapeHtml(config?.command || "");
+      const args = Array.isArray(config?.args) ? config.args.map(a => escapeHtml(a)).join(" ") : "";
+      const envKeys = config?.env ? Object.keys(config.env) : [];
+
+      return `
+        <div class="ext-card ext-card-installed" data-spotlight>
+          <div class="ext-card-head">
+            <div class="ext-card-icon"><i class="fa-solid fa-plug"></i></div>
+            <div class="ext-card-title-wrap">
+              <div class="ext-card-name">${escapeHtml(name)}</div>
+              <div class="ext-card-meta">
+                <code class="ext-card-version">${cmd} ${args}</code>
+              </div>
+            </div>
+          </div>
+          ${envKeys.length > 0 ? `<div class="ext-card-desc">环境变量: ${envKeys.map(k => escapeHtml(k)).join(", ")}</div>` : ""}
+          <div class="ext-card-foot">
+            <div class="ext-card-status"><span class="status-badge ok">已配置</span></div>
+            <div class="ext-card-actions">
+              <button class="panel-action-btn btn-secondary btn-size-sm" data-ext-config-mcp="${escapeHtml(name)}">
+                <i class="fa-solid fa-sliders"></i> 编辑
+              </button>
+              <button class="panel-action-btn btn-danger btn-size-sm" data-ext-remove-mcp="${escapeHtml(name)}">
+                <i class="fa-regular fa-trash-can"></i> 删除
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error"><i class="fa-solid fa-triangle-exclamation"></i> ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── Extension Config Modal ──
+
+function setExtModalOpen(open, { initialSelector } = {}) {
+  const modal = $("ext-config-modal");
+  if (!modal) return;
+  state.extModalOpen = open === true;
+  modal.classList.toggle("open", state.extModalOpen);
+  modal.setAttribute("aria-hidden", state.extModalOpen ? "false" : "true");
+  if (state.extModalOpen) {
+    captureModalFocus("ext-config-modal", { initialSelector: initialSelector || getSkillModalInitialSelector() });
+  } else {
+    releaseModalFocus("ext-config-modal");
+    resetExtModal();
+  }
+}
+
+/** 重置 modal 所有 section 到默认隐藏状态 */
+function resetExtModal() {
+  // 所有可切换 section 统一隐藏
+  for (const id of [
+    "ext-modal-detail-section", "ext-modal-safety-section", "ext-modal-readme-section",
+    "ext-modal-status-section", "ext-modal-apikey-section", "ext-modal-env-section",
+    "ext-modal-deps-section", "ext-modal-config-checks-section", "ext-modal-plugin-config-section",
+  ]) {
+    $(id)?.classList.add("is-hidden");
+  }
+  // 按钮全部显示/隐藏到默认
+  $("ext-modal-save-btn")?.classList.remove("is-hidden");
+  $("ext-modal-install-dep-btn")?.classList.add("is-hidden");
+  $("ext-modal-uninstall-btn")?.classList.add("is-hidden");
+  $("ext-modal-save-btn")?.removeAttribute("data-save-type");
+  $("ext-modal-save-btn")?.removeAttribute("data-save-key");
+  $("ext-modal-uninstall-btn")?.removeAttribute("data-uninstall-type");
+  $("ext-modal-uninstall-btn")?.removeAttribute("data-uninstall-key");
+  $("ext-modal-plugin-config-form").innerHTML = "";
+  const toggleRow = $("ext-config-modal")?.querySelector(".ext-modal-toggle-row");
+  toggleRow?.classList.remove("is-hidden");
+}
+
+function setExtModalDetailRow(id, value, { isLink = false } = {}) {
+  const row = $(id);
+  if (!row) return;
+  row.classList.toggle("is-hidden", !value);
+  if (!value) return;
+  if (isLink) {
+    const link = row.querySelector("a");
+    if (link) {
+      link.textContent = value;
+      link.href = value.startsWith("http") ? value : `https://${value}`;
+    }
+    return;
+  }
+  const valueEl = row.querySelector(".ext-detail-value");
+  if (valueEl) {
+    valueEl.textContent = value;
+  }
+}
+
+function getObjectPathValue(source, pathSegments) {
+  let cursor = source;
+  for (const segment of pathSegments) {
+    if (!cursor || typeof cursor !== "object") return undefined;
+    cursor = cursor[segment];
+  }
+  return cursor;
+}
+
+function setObjectPathValue(target, pathSegments, value) {
+  if (!pathSegments.length) return;
+  let cursor = target;
+  for (let i = 0; i < pathSegments.length - 1; i += 1) {
+    const key = pathSegments[i];
+    if (!cursor[key] || typeof cursor[key] !== "object" || Array.isArray(cursor[key])) {
+      cursor[key] = {};
+    }
+    cursor = cursor[key];
+  }
+  cursor[pathSegments[pathSegments.length - 1]] = value;
+}
+
+function getPluginSchemaDefault(schema) {
+  if (!schema || typeof schema !== "object") return "";
+  if (Object.prototype.hasOwnProperty.call(schema, "default")) return schema.default;
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) return schema.enum[0];
+  if (schema.type === "boolean") return false;
+  if (schema.type === "array") return [];
+  if (schema.type === "object") return {};
+  return "";
+}
+
+function encodePluginPath(pathSegments) {
+  return escapeHtml(JSON.stringify(pathSegments));
+}
+
+function decodePluginPath(pathValue) {
+  try {
+    const parsed = JSON.parse(pathValue);
+    return Array.isArray(parsed) ? parsed.map((segment) => String(segment)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function renderPluginConfigField(fieldKey, schema, currentValue, pathSegments) {
+  const label = escapeHtml(schema?.title || fieldKey);
+  const help = escapeHtml(schema?.description || schema?.uiHints?.description || "");
+  const inputId = `ext-plugin-config-${pathSegments.map((segment) => String(segment).replace(/[^a-z0-9_-]/gi, "-")).join("-")}`;
+  const encodedPath = encodePluginPath(pathSegments);
+  const hasValue = currentValue !== undefined;
+  const resolvedValue = hasValue ? currentValue : getPluginSchemaDefault(schema);
+
+  if (schema?.properties && typeof schema.properties === "object") {
+    const content = Object.entries(schema.properties)
+      .map(([childKey, childSchema]) => renderPluginConfigField(
+        childKey,
+        childSchema,
+        getObjectPathValue(resolvedValue, [childKey]),
+        [...pathSegments, childKey]
+      ))
+      .join("");
+    return `
+      <div class="ext-plugin-config-group">
+        <div class="form-label-strong">${label}</div>
+        ${help ? `<p class="form-help-muted">${help}</p>` : ""}
+        <div class="ext-plugin-config-fields">${content}</div>
+      </div>
+    `;
+  }
+
+  if (schema?.type === "boolean") {
+    return `
+      <div class="ext-plugin-config-row ext-plugin-config-row-boolean">
+        <div>
+          <label class="form-label-strong" for="${inputId}">${label}</label>
+          ${help ? `<p class="form-help-muted">${help}</p>` : ""}
+        </div>
+        <label class="toggle-switch">
+          <input id="${inputId}" type="checkbox" data-plugin-kind="boolean" data-plugin-path="${encodedPath}" ${resolvedValue === true ? "checked" : ""} />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    `;
+  }
+
+  if (Array.isArray(schema?.enum) && schema.enum.length > 0) {
+    return `
+      <div class="form-row ext-plugin-config-row">
+        <label class="form-label-strong" for="${inputId}">${label}</label>
+        <select id="${inputId}" class="form-control" data-plugin-kind="enum" data-plugin-path="${encodedPath}">
+          ${schema.enum.map((option) => `<option value="${escapeHtml(String(option))}"${String(option) === String(resolvedValue ?? "") ? " selected" : ""}>${escapeHtml(String(option))}</option>`).join("")}
+        </select>
+        ${help ? `<p class="form-help-muted">${help}</p>` : ""}
+      </div>
+    `;
+  }
+
+  if (schema?.type === "number" || schema?.type === "integer") {
+    return `
+      <div class="form-row ext-plugin-config-row">
+        <label class="form-label-strong" for="${inputId}">${label}</label>
+        <input
+          id="${inputId}"
+          type="number"
+          class="form-control form-control-mono"
+          value="${escapeHtml(String(resolvedValue ?? ""))}"
+          data-plugin-kind="${schema.type === "integer" ? "integer" : "number"}"
+          data-plugin-path="${encodedPath}"
+          spellcheck="false"
+        />
+        ${help ? `<p class="form-help-muted">${help}</p>` : ""}
+      </div>
+    `;
+  }
+
+  if (schema?.type === "array" || (schema?.type === "object" && !schema?.properties)) {
+    return `
+      <div class="form-row ext-plugin-config-row">
+        <label class="form-label-strong" for="${inputId}">${label}</label>
+        <textarea
+          id="${inputId}"
+          class="form-control form-control-mono ext-plugin-config-json"
+          data-plugin-kind="json"
+          data-plugin-path="${encodedPath}"
+          spellcheck="false"
+        >${escapeHtml(JSON.stringify(resolvedValue ?? getPluginSchemaDefault(schema), null, 2))}</textarea>
+        ${help ? `<p class="form-help-muted">${help}</p>` : ""}
+      </div>
+    `;
+  }
+
+  const inputType = schema?.format === "password" ? "password" : "text";
+  const placeholder = escapeHtml(schema?.uiHints?.placeholder || "");
+  return `
+    <div class="form-row ext-plugin-config-row">
+      <label class="form-label-strong" for="${inputId}">${label}</label>
+      <input
+        id="${inputId}"
+        type="${inputType}"
+        class="form-control form-control-mono"
+        value="${escapeHtml(String(resolvedValue ?? ""))}"
+        data-plugin-kind="string"
+        data-plugin-path="${encodedPath}"
+        placeholder="${placeholder}"
+        autocomplete="${inputType === "password" ? "off" : "on"}"
+        spellcheck="false"
+      />
+      ${help ? `<p class="form-help-muted">${help}</p>` : ""}
+    </div>
+  `;
+}
+
+function renderPluginConfigEditor(plugin) {
+  const container = $("ext-modal-plugin-config-form");
+  if (!container) return;
+  const schema = plugin?.configSchema;
+  const config = plugin?.config && typeof plugin.config === "object" ? plugin.config : {};
+
+  if (!schema || typeof schema !== "object" || (!schema.properties && schema.type !== "object")) {
+    container.innerHTML = `
+      <div class="form-row ext-plugin-config-row">
+        <label class="form-label-strong" for="ext-plugin-config-json">插件配置 JSON</label>
+        <textarea id="ext-plugin-config-json" class="form-control form-control-mono ext-plugin-config-json" data-plugin-kind="json-root" spellcheck="false">${escapeHtml(JSON.stringify(config, null, 2))}</textarea>
+        <p class="form-help-muted">当前插件未暴露结构化配置 schema，直接编辑 JSON 保存。</p>
+      </div>
+    `;
+    return;
+  }
+
+  const fields = Object.entries(schema.properties)
+    .map(([fieldKey, fieldSchema]) => renderPluginConfigField(fieldKey, fieldSchema, getObjectPathValue(config, [fieldKey]), [fieldKey]))
+    .join("");
+  container.innerHTML = `<div class="ext-plugin-config-fields">${fields}</div>`;
+}
+
+function readPluginConfigEditor(plugin) {
+  const container = $("ext-modal-plugin-config-form");
+  if (!container) return {};
+
+  if (!plugin?.configSchema || typeof plugin.configSchema !== "object" || (!plugin.configSchema.properties && plugin.configSchema.type !== "object")) {
+    const raw = $("ext-plugin-config-json")?.value?.trim();
+    if (!raw) return {};
+    return JSON.parse(raw);
+  }
+
+  const config = {};
+  for (const field of container.querySelectorAll("[data-plugin-path]")) {
+    const pathSegments = decodePluginPath(field.getAttribute("data-plugin-path") || "");
+    if (!pathSegments.length) continue;
+
+    const kind = field.getAttribute("data-plugin-kind") || "string";
+    let value;
+    if (kind === "boolean") {
+      value = field.checked;
+    } else if (kind === "number" || kind === "integer") {
+      const raw = field.value.trim();
+      if (!raw) continue;
+      value = kind === "integer" ? Number.parseInt(raw, 10) : Number(raw);
+      if (!Number.isFinite(value)) continue;
+    } else if (kind === "json") {
+      const raw = field.value.trim();
+      if (!raw) continue;
+      value = JSON.parse(raw);
+    } else {
+      value = field.value;
+    }
+    setObjectPathValue(config, pathSegments, value);
+  }
+  return config;
+}
+
+function openExtPluginConfigModal(pluginId) {
+  const plugin = _pluginsCache.find((entry) => entry.id === pluginId);
+  if (!plugin) return;
+
+  resetExtModal();
+  $("ext-modal-status-section")?.classList.remove("is-hidden");
+  $("ext-modal-detail-section")?.classList.remove("is-hidden");
+  $("ext-modal-plugin-config-section")?.classList.remove("is-hidden");
+
+  $("ext-modal-title").textContent = plugin.name;
+  $("ext-modal-type-badge").textContent = "Plugin";
+  $("ext-modal-type-badge").className = "status-badge dynamic";
+  $("ext-modal-key").textContent = plugin.id;
+  $("ext-modal-desc").textContent = plugin.description || "配置插件运行参数。";
+
+  $("ext-modal-status-badge").textContent = plugin.status === "error" ? "错误" : plugin.enabled ? "已加载" : "已禁用";
+  $("ext-modal-status-badge").className = `status-badge ${plugin.status === "error" ? "bad" : plugin.enabled ? "ok" : ""}`;
+  $("ext-modal-toggle").checked = plugin.enabled;
+  $("ext-modal-toggle").setAttribute("data-type", "plugin");
+  $("ext-modal-toggle").setAttribute("data-key", plugin.id);
+
+  setExtModalDetailRow("ext-modal-detail-source", plugin.source || "");
+  setExtModalDetailRow("ext-modal-detail-version", plugin.version || "");
+  setExtModalDetailRow("ext-modal-detail-author", plugin.author || "");
+  setExtModalDetailRow("ext-modal-detail-homepage", plugin.homepage || "", { isLink: true });
+  $("ext-modal-detail-tags").innerHTML = "";
+
+  renderPluginConfigEditor(plugin);
+
+  const uninstallBtn = $("ext-modal-uninstall-btn");
+  uninstallBtn?.classList.remove("is-hidden");
+  uninstallBtn?.setAttribute("data-uninstall-type", "plugin");
+  uninstallBtn?.setAttribute("data-uninstall-key", plugin.id);
+
+  $("ext-modal-save-btn").setAttribute("data-save-type", "plugin");
+  $("ext-modal-save-btn").setAttribute("data-save-key", plugin.id);
+
+  setExtModalOpen(true, { initialSelector: "#ext-plugin-config-json, #ext-modal-plugin-config-form [data-plugin-path], #ext-modal-toggle" });
+}
+
+function openExtMcpConfigModal(name) {
+  const config = _mcpConfiguredCache[name];
+  if (!config || typeof config !== "object") return;
+
+  resetExtModal();
+  $("ext-modal-status-section")?.classList.remove("is-hidden");
+  $("ext-modal-env-section")?.classList.remove("is-hidden");
+  $("ext-modal-plugin-config-section")?.classList.remove("is-hidden");
+
+  const toggleRow = $("ext-config-modal")?.querySelector(".ext-modal-toggle-row");
+  toggleRow?.classList.add("is-hidden");
+
+  $("ext-modal-title").textContent = name;
+  $("ext-modal-type-badge").textContent = "MCP";
+  $("ext-modal-type-badge").className = "status-badge accent";
+  $("ext-modal-key").textContent = name;
+  $("ext-modal-desc").textContent = "编辑 MCP Server 的命令、参数与环境变量。";
+  $("ext-modal-status-badge").textContent = "已配置";
+  $("ext-modal-status-badge").className = "status-badge ok";
+
+  $("ext-modal-plugin-config-form").innerHTML = `
+    <div class="form-row ext-plugin-config-row">
+      <label class="form-label-strong" for="ext-mcp-modal-command">命令</label>
+      <input id="ext-mcp-modal-command" type="text" class="form-control form-control-mono" value="${escapeHtml(String(config.command || ""))}" spellcheck="false" />
+    </div>
+    <div class="form-row ext-plugin-config-row">
+      <label class="form-label-strong" for="ext-mcp-modal-args">参数 <span class="form-help-muted-inline">(逗号分隔)</span></label>
+      <input id="ext-mcp-modal-args" type="text" class="form-control form-control-mono" value="${escapeHtml(Array.isArray(config.args) ? config.args.join(", ") : "")}" spellcheck="false" />
+    </div>
+  `;
+
+  const envRows = $("ext-modal-env-rows");
+  envRows.innerHTML = "";
+  const envEntries = Object.entries(config.env && typeof config.env === "object" ? config.env : {});
+  if (envEntries.length === 0) {
+    $("ext-modal-env-empty")?.classList.remove("is-hidden");
+  } else {
+    $("ext-modal-env-empty")?.classList.add("is-hidden");
+    for (const [envKey, envValue] of envEntries) {
+      addExtEnvRow(envRows, envKey, envValue, false);
+    }
+  }
+
+  const uninstallBtn = $("ext-modal-uninstall-btn");
+  uninstallBtn?.classList.remove("is-hidden");
+  uninstallBtn?.setAttribute("data-uninstall-type", "mcp");
+  uninstallBtn?.setAttribute("data-uninstall-key", name);
+
+  $("ext-modal-save-btn").setAttribute("data-save-type", "mcp");
+  $("ext-modal-save-btn").setAttribute("data-save-key", name);
+
+  setExtModalOpen(true, { initialSelector: "#ext-mcp-modal-command" });
+}
+
+function openExtSkillConfigModal(skillKey) {
+  const skill = _skillsCache.find(s => s.key === skillKey);
+  if (!skill) return;
+
+  resetExtModal();
+
+  // 配置模式：显示状态区、环境变量区
+  $("ext-modal-status-section")?.classList.remove("is-hidden");
+  $("ext-modal-env-section")?.classList.remove("is-hidden");
+
+  $("ext-modal-title").textContent = `${skill.emoji ? skill.emoji + " " : ""}${skill.name}`;
+  $("ext-modal-type-badge").textContent = "Skill";
+  $("ext-modal-type-badge").className = "status-badge accent";
+  $("ext-modal-key").textContent = skill.key;
+  $("ext-modal-desc").textContent = skill.description || "暂无描述。";
+
+  // 状态
+  $("ext-modal-status-badge").textContent = skill.eligible && skill.enabled ? "运行中" : !skill.eligible ? "待配置" : "已停用";
+  $("ext-modal-status-badge").className = `status-badge ${skill.eligible && skill.enabled ? "ok" : !skill.eligible ? "warn" : ""}`;
+  $("ext-modal-toggle").checked = skill.enabled;
+  $("ext-modal-toggle").setAttribute("data-type", "skill");
+  $("ext-modal-toggle").setAttribute("data-key", skill.key);
+
+  // API Key
+  const apiSection = $("ext-modal-apikey-section");
+  if (skill.primaryEnv) {
+    apiSection?.classList.remove("is-hidden");
+    $("ext-modal-primary-env").textContent = skill.primaryEnv;
+    $("ext-modal-apikey").value = "";
+  } else {
+    apiSection?.classList.add("is-hidden");
+  }
+
+  // 环境变量
+  const envRows = $("ext-modal-env-rows");
+  envRows.innerHTML = "";
+  const missingEnvs = (skill.missing.env || []).filter(e => e !== skill.primaryEnv);
+  if (missingEnvs.length > 0) {
+    for (const envName of missingEnvs) {
+      addExtEnvRow(envRows, envName, "", true);
+    }
+    $("ext-modal-env-empty")?.classList.add("is-hidden");
+  } else {
+    $("ext-modal-env-empty")?.classList.remove("is-hidden");
+  }
+
+  // 依赖检查
+  const depsSection = $("ext-modal-deps-section");
+  const depsList = $("ext-modal-deps-list");
+  const allBins = [...(skill.missing.bins || [])];
+  const requirements = skill.missing;
+  if (allBins.length > 0 || (requirements.config && requirements.config.length > 0)) {
+    depsSection?.classList.remove("is-hidden");
+    let depsHtml = "";
+    if (allBins.length > 0) {
+      depsHtml += allBins.map(b => `<div class="ext-dep-item ext-dep-item-missing"><i class="fa-solid fa-xmark"></i> <span class="ext-dep-name">${escapeHtml(b)}</span> <span>缺失</span></div>`).join("");
+    }
+    depsList.innerHTML = depsHtml;
+  } else {
+    depsSection?.classList.add("is-hidden");
+  }
+
+  // 配置检查
+  $("ext-modal-config-checks-section")?.classList.add("is-hidden");
+
+  // 插件配置区域隐藏
+  $("ext-modal-plugin-config-section")?.classList.add("is-hidden");
+
+  // 详细说明（用 description 作为简介）
+  const readmeSection = $("ext-modal-readme-section");
+  const readmeContent = $("ext-modal-readme-content");
+  if (readmeSection && readmeContent) {
+    if (skill.description && skill.description.length > 50) {
+      readmeSection.classList.remove("is-hidden");
+      readmeContent.textContent = skill.description;
+    } else {
+      readmeSection.classList.add("is-hidden");
+    }
+  }
+
+  // 安装依赖按钮
+  const installDepBtn = $("ext-modal-install-dep-btn");
+  if (skill.install?.length > 0 && skill.missing.bins?.length > 0) {
+    installDepBtn?.classList.remove("is-hidden");
+    $("ext-modal-install-dep-label").textContent = skill.install[0].label || "安装依赖";
+    installDepBtn.setAttribute("data-install-name", skill.name);
+    installDepBtn.setAttribute("data-install-id", skill.install[0].id);
+  } else {
+    installDepBtn?.classList.add("is-hidden");
+  }
+
+  // 卸载按钮
+  const uninstallBtn = $("ext-modal-uninstall-btn");
+  if (skill.bundled) {
+    uninstallBtn?.classList.add("is-hidden");
+  } else {
+    uninstallBtn?.classList.remove("is-hidden");
+    uninstallBtn.setAttribute("data-uninstall-type", "skill");
+    uninstallBtn.setAttribute("data-uninstall-key", skill.key);
+  }
+
+  // 保存按钮数据
+  $("ext-modal-save-btn").setAttribute("data-save-type", "skill");
+  $("ext-modal-save-btn").setAttribute("data-save-key", skill.key);
+
+  setExtModalOpen(true);
+}
+
+function addExtEnvRow(container, key, value, readonlyKey) {
+  const row = document.createElement("div");
+  row.className = "ext-env-row";
+  row.innerHTML = `
+    <input type="text" class="env-key form-control form-control-mono form-control-sm" value="${escapeHtml(key)}" placeholder="变量名" ${readonlyKey ? 'readonly' : ''} spellcheck="false" />
+    <input type="text" class="env-val form-control form-control-mono form-control-sm" value="${escapeHtml(value)}" placeholder="值" spellcheck="false" />
+    <span class="ext-env-delete" title="移除"><i class="fa-solid fa-trash-can"></i></span>
+  `;
+  container.appendChild(row);
+}
+
+// ── Sources Modal ──
+
+function syncExtSourceKindForm() {
+  const kind = $("ext-source-kind")?.value || "registry";
+  const allowedTabs = getAllowedTabsForSourceKind(kind);
+  const githubFields = $("ext-source-github-fields");
+  if (githubFields) {
+    githubFields.classList.toggle("is-hidden", kind !== "github-skills");
+  }
+
+  const help = $("ext-source-kind-help");
+  if (help) {
+    help.textContent = kind === "github-skills"
+      ? "GitHub Skills 仓库会从指定 repo 的 skills 目录读取技能列表，只支持 Skill。"
+      : kind === "mcp-presets"
+      ? "MCP Presets JSON 需要返回一个 MCP 预置数组，只支持 MCP。"
+      : "Registry API 适合同时提供 Skill / Plugin 商店接口。";
+  }
+
+  const urlInput = $("ext-source-url");
+  if (urlInput) {
+    urlInput.placeholder = kind === "github-skills"
+      ? "https://github.com/MiniMax-AI/skills"
+      : kind === "mcp-presets"
+      ? "https://example.com/mcp-presets.json"
+      : "https://example.com/marketplace";
+  }
+
+  for (const tab of EXT_SOURCE_TABS) {
+    const input = $(`ext-source-tab-${tab}`);
+    if (!input) continue;
+    const supported = allowedTabs.includes(tab);
+    input.disabled = !supported;
+    if (!supported) {
+      input.checked = false;
+    }
+  }
+
+  if (!allowedTabs.some((tab) => $(`ext-source-tab-${tab}`)?.checked)) {
+    const firstAllowed = $(`ext-source-tab-${allowedTabs[0]}`);
+    if (firstAllowed) firstAllowed.checked = true;
+  }
+}
+
+function setSourcesModalOpen(open) {
+  const modal = $("ext-sources-modal");
+  if (!modal) return;
+  state.extSourcesModalOpen = open === true;
+  modal.classList.toggle("open", state.extSourcesModalOpen);
+  modal.setAttribute("aria-hidden", state.extSourcesModalOpen ? "false" : "true");
+  if (state.extSourcesModalOpen) {
+    captureModalFocus("ext-sources-modal");
+    syncExtSourceKindForm();
+    loadSourcesList();
+  } else {
+    releaseModalFocus("ext-sources-modal");
+  }
+}
+
+async function loadSourcesList() {
+  const container = $("ext-sources-list");
+  if (!container) return;
+  try {
+    const list = await ensureExtSources(true);
+    container.innerHTML = list.map(s => `
+      <div class="ext-source-item ${EXT_SOURCE_TABS.some((tab) => getExtSourceId(tab) === s.id) ? "ext-source-item-current" : ""}">
+        <div class="ext-source-info">
+          <span class="ext-source-name">${escapeHtml(s.name)}${s.builtin ? ' <span class="status-badge">内置</span>' : ""}</span>
+          <span class="ext-source-url">${escapeHtml(String(s.url || "").startsWith("builtin://") ? "本地内置数据" : s.url)}</span>
+          <div class="ext-source-meta">
+            <span class="status-badge dynamic">${escapeHtml(getExtSourceKindLabel(s.kind))}</span>
+            ${s.tabs.map((tab) => `<span class="status-badge accent">${escapeHtml(EXT_SOURCE_TAB_LABELS[tab])}</span>`).join("")}
+          </div>
+        </div>
+        <div class="ext-source-actions">
+          ${s.tabs.map((tab) => (s.id === getExtSourceId(tab)
+            ? `<button type="button" class="panel-action-btn btn-secondary btn-size-xs" disabled><i class="fa-solid fa-check"></i> ${escapeHtml(EXT_SOURCE_TAB_LABELS[tab])}</button>`
+            : `<button type="button" class="panel-action-btn btn-secondary btn-size-xs" data-ext-activate-source="${escapeHtml(s.id)}" data-ext-source-tab="${escapeHtml(tab)}"><i class="fa-solid fa-bullseye"></i> 用于 ${escapeHtml(EXT_SOURCE_TAB_LABELS[tab])}</button>`)).join("")}
+          ${s.builtin ? "" : `<button type="button" class="panel-action-btn btn-danger btn-size-xs" data-ext-delete-source="${escapeHtml(s.id)}"><i class="fa-regular fa-trash-can"></i></button>`}
+        </div>
+      </div>
+    `).join("");
+  } catch (err) {
+    container.innerHTML = `<div class="ext-error">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+// ── Detail Modal ──
+
+async function openExtDetailModal(type, idOrSlug, safetyJson) {
+  const modal = $("ext-config-modal");
+  if (!modal) return;
+
+  resetExtModal();
+  $("ext-modal-detail-section")?.classList.remove("is-hidden");
+  $("ext-modal-safety-section")?.classList.remove("is-hidden");
+
+  // 基本信息
+  $("ext-modal-title").textContent = "加载中...";
+  $("ext-modal-type-badge").textContent = type === "skill" ? "Skill" : "Plugin";
+  $("ext-modal-type-badge").className = `status-badge ${type === "skill" ? "accent" : "dynamic"}`;
+  $("ext-modal-key").textContent = idOrSlug;
+  $("ext-modal-desc").textContent = "";
+
+  // 隐藏配置按钮，显示安装按钮
+  $("ext-modal-save-btn")?.classList.add("is-hidden");
+  $("ext-modal-install-dep-btn")?.classList.add("is-hidden");
+  $("ext-modal-uninstall-btn")?.classList.add("is-hidden");
+
+  setExtModalOpen(true, { initialSelector: "button[data-ext-modal-close]" });
+
+  let detail = null;
+  try {
+    if (type === "skill") {
+      detail = await api(`/api/store/skills/detail/${encodeURIComponent(idOrSlug)}?source=${encodeURIComponent(getExtSourceId("skill"))}`);
+    } else {
+      detail = await api(`/api/store/plugins/detail/${encodeURIComponent(idOrSlug)}?source=${encodeURIComponent(getExtSourceId("plugin"))}`);
+    }
+  } catch {
+    // API 失败时降级使用 safetyJson 中的基本信息
+  }
+
+  // 填充信息（优先用 detail，降级用 safetyJson / 基本 id）
+  const name = detail?.displayName || detail?.package?.displayName || detail?.name || idOrSlug;
+  const desc = detail?.summary || detail?.description || detail?.package?.summary || "";
+  const version = detail?.latestVersion?.version || detail?.latestVersion || detail?.package?.latestVersion || "";
+  const author = detail?.ownerHandle || detail?.package?.ownerHandle || "";
+  const homepage = detail?.homepage || detail?.sourceRepo || detail?.verification?.sourceRepo || "";
+  const channel = detail?.channel || detail?.package?.channel || "";
+  const tags = detail?.tags || detail?.capabilityTags || detail?.package?.capabilityTags || [];
+
+  $("ext-modal-title").textContent = name;
+  $("ext-modal-desc").textContent = desc || (detail ? "" : "详情加载受限，显示基本信息。");
+
+  // 详情区域
+  setExtModalDetailRow("ext-modal-detail-source", channel);
+  setExtModalDetailRow("ext-modal-detail-version", version);
+  setExtModalDetailRow("ext-modal-detail-author", author);
+  setExtModalDetailRow("ext-modal-detail-homepage", homepage, { isLink: true });
+
+  // 标签
+  const tagsEl = $("ext-modal-detail-tags");
+  if (tagsEl) {
+    const tagList = Array.isArray(tags) ? tags : Object.entries(tags || {}).map(([k, v]) => v || k);
+    tagsEl.innerHTML = tagList.map(t => `<span class="ext-card-tag">${escapeHtml(typeof t === "string" ? t : "")}</span>`).join("");
+  }
+
+  // 详细说明
+  const readmeSection = $("ext-modal-readme-section");
+  const readmeContent = $("ext-modal-readme-content");
+  if (readmeSection && readmeContent) {
+    const fullDesc = desc || detail?.skill?.summary || "";
+    const changelog = detail?.latestVersion?.changelog || "";
+    const displayText = fullDesc.length > 50 ? fullDesc : (changelog || fullDesc);
+    if (displayText) {
+      readmeSection.classList.remove("is-hidden");
+      readmeContent.textContent = displayText;
+    } else {
+      readmeSection.classList.add("is-hidden");
+    }
+  }
+
+  // 安全评估
+  renderSafetyBadges(type, safetyJson ? safetyJson : detail);
+}
+
+function renderSafetyBadges(type, data) {
+  const container = $("ext-modal-safety-badges");
+  if (!container) return;
+
+  let safety;
+  if (typeof data === "string") {
+    try { safety = JSON.parse(data); } catch { safety = {}; }
+  } else {
+    safety = {
+      isOfficial: data?.isOfficial || data?.package?.isOfficial || false,
+      channel: data?.channel || data?.package?.channel || "",
+      executesCode: data?.executesCode || data?.capabilities?.executesCode || data?.package?.executesCode || false,
+      verificationTier: data?.verificationTier || data?.verification?.tier || data?.package?.verificationTier || null,
+    };
+  }
+
+  const badges = [];
+
+  if (type === "plugin") {
+    if (safety.isOfficial && safety.verificationTier) {
+      badges.push('<span class="ext-safety-badge ext-safety-badge-ok"><i class="fa-solid fa-circle-check"></i> 官方认证</span>');
+    } else if (safety.channel === "community") {
+      badges.push('<span class="ext-safety-badge ext-safety-badge-accent"><i class="fa-solid fa-users"></i> 社区贡献</span>');
+    } else {
+      badges.push('<span class="ext-safety-badge ext-safety-badge-warn"><i class="fa-solid fa-triangle-exclamation"></i> 未验证</span>');
+    }
+    if (safety.executesCode) {
+      badges.push('<span class="ext-safety-badge ext-safety-badge-danger"><i class="fa-solid fa-bolt"></i> 执行代码</span>');
+    }
+  } else {
+    // Skill — 无 ClawHub 安全字段，显示通用提示
+    badges.push('<span class="ext-safety-badge ext-safety-badge-warn"><i class="fa-solid fa-triangle-exclamation"></i> 第三方技能</span>');
+  }
+
+  container.innerHTML = badges.join("");
+}
+
+function buildSafetyMessage(type, safetyData) {
+  let safety = {};
+  if (typeof safetyData === "string") {
+    try { safety = JSON.parse(safetyData); } catch { /* ignore */ }
+  } else if (safetyData) {
+    safety = safetyData;
+  }
+
+  const lines = [];
+  if (type === "skill") {
+    lines.push("第三方技能可能访问文件系统和网络。");
+    lines.push("请确认来源可信后再安装。");
+  } else if (type === "plugin") {
+    if (safety.isOfficial) {
+      lines.push("此插件为官方发布。");
+    } else if (safety.channel === "community") {
+      lines.push("此插件为社区贡献，未经官方审核。");
+    } else {
+      lines.push("此插件来源未经验证。");
+    }
+    if (safety.executesCode) {
+      lines.push("此插件会执行代码，请确认安全后再安装。");
+    }
+  } else if (type === "mcp") {
+    lines.push("MCP Server 会以本地进程运行。");
+    lines.push("请确认命令安全且来源可信。");
+  }
+  return lines.join("\n");
+}
+
+// ── Extension Center Event Delegation ──
+
+document.addEventListener("click", async (e) => {
+  // 主 Tab 切换
+  const mainTab = e.target.closest(".ext-main-tab");
+  if (mainTab) {
+    const tab = mainTab.getAttribute("data-ext-tab");
+    if (!tab) return;
+    if (tab === state.extActiveTab) return;
+    state.extActiveTab = tab;
+    document.querySelectorAll(".ext-main-tab").forEach(b => b.classList.toggle("active", b === mainTab));
+    document.querySelectorAll(".ext-panel").forEach(p => p.classList.toggle("active", p.id === `ext-${tab}-panel`));
+    await loadExtensions();
+    return;
+  }
+
+  // 子 Tab 切换
+  const subTab = e.target.closest(".ext-sub-tab");
+  if (subTab) {
+    const sub = subTab.getAttribute("data-ext-sub");
+    if (!sub) return;
+    if (sub === state.extActiveSubTab[state.extActiveTab]) return;
+    state.extActiveSubTab[state.extActiveTab] = sub;
+    const panel = subTab.closest(".ext-panel");
+    if (panel) {
+      panel.querySelectorAll(".ext-sub-tab").forEach(b => b.classList.toggle("active", b === subTab));
+      panel.querySelectorAll(".ext-sub-panel").forEach(p => p.classList.toggle("active", p.id === `ext-${sub}`));
+    }
+    await loadExtensions();
+    return;
+  }
+
+  // Skill 搜索
+  if (e.target.closest("#ext-skill-search-btn")) {
+    const q = $("ext-skill-search")?.value || "";
+    await loadExtSkillStore(q);
+    return;
+  }
+
+  // Plugin 搜索
+  if (e.target.closest("#ext-plugin-search-btn")) {
+    const q = $("ext-plugin-search")?.value || "";
+    await loadExtPluginStore(q);
+    return;
+  }
+
+  // 安装 Skill（含安全确认）
+  const installSkillBtn = e.target.closest("[data-ext-install-skill]");
+  if (installSkillBtn) {
+    const slug = installSkillBtn.getAttribute("data-ext-install-skill");
+    const safetyMsg = buildSafetyMessage("skill");
+    const confirmed = await requestConfirmDialog({
+      title: "安全确认",
+      message: `即将安装技能「${slug}」\n\n${safetyMsg}\n\n确定继续安装？`,
+      confirmText: "确认安装",
+      cancelText: "取消",
+      variant: "default"
+    });
+    if (!confirmed) return;
+    installSkillBtn.disabled = true;
+    installSkillBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i>';
+    try {
+      await api("/api/store/skills/install", {
+        method: "POST", body: JSON.stringify({ slug, source: getExtSourceId("skill") })
+      });
+      await refreshExtSkillsCache().catch(() => []);
+      await loadExtSkillStore($("ext-skill-search")?.value);
+    } catch (err) {
+      alert(`安装失败: ${err.message}`);
+    } finally {
+      installSkillBtn.disabled = false;
+      installSkillBtn.innerHTML = '<i class="fa-solid fa-download"></i> 安装';
     }
     return;
   }
 
-  // 保存配置
-  const saveBtn = e.target.closest("#skill-config-save-btn");
-  if (saveBtn) {
-    const skillKey = saveBtn.getAttribute("data-current-skill");
-    if (!skillKey) return;
+  // 安装 Plugin（含安全确认）
+  const installPluginBtn = e.target.closest("[data-ext-install-plugin]");
+  if (installPluginBtn) {
+    const name = installPluginBtn.getAttribute("data-ext-install-plugin");
+    const card = installPluginBtn.closest("[data-safety]");
+    const safetyRaw = card?.getAttribute("data-safety");
+    const safetyMsg = buildSafetyMessage("plugin", safetyRaw);
+    const confirmed = await requestConfirmDialog({
+      title: "安全确认",
+      message: `即将安装插件「${name}」\n\n${safetyMsg}\n\n安装后需重启 Gateway 生效。确定继续？`,
+      confirmText: "确认安装",
+      cancelText: "取消",
+      variant: "default"
+    });
+    if (!confirmed) return;
+    installPluginBtn.disabled = true;
+    installPluginBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i>';
+    try {
+      const sourceId = getExtSourceId("plugin");
+      await api("/api/store/plugins/install", {
+        method: "POST", body: JSON.stringify({ spec: `${sourceId}:${name}` })
+      });
+      state.extNeedsRestart = true;
+      await refreshExtPluginsCache().catch(() => []);
+      await loadExtPluginInstalled();
+    } catch (err) {
+      alert(`安装失败: ${err.message}`);
+    } finally {
+      installPluginBtn.disabled = false;
+      installPluginBtn.innerHTML = '<i class="fa-solid fa-download"></i> 安装';
+    }
+    return;
+  }
 
-    saveBtn.disabled = true;
-    const originalText = saveBtn.innerHTML;
-    saveBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 正在保存...';
+  // 切换 Plugin 启用/禁用
+  const togglePluginBtn = e.target.closest("[data-ext-toggle-plugin]");
+  if (togglePluginBtn) {
+    const id = togglePluginBtn.getAttribute("data-ext-toggle-plugin");
+    const wasEnabled = togglePluginBtn.getAttribute("data-enabled") === "true";
+    togglePluginBtn.disabled = true;
+    try {
+      await api("/api/store/plugins/toggle", {
+        method: "POST", body: JSON.stringify({ id, enabled: !wasEnabled })
+      });
+      state.extNeedsRestart = true;
+      await refreshExtPluginsCache().catch(() => []);
+      await loadExtPluginInstalled();
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      togglePluginBtn.disabled = false;
+    }
+    return;
+  }
+
+  // 卸载 Plugin
+  const uninstallPluginBtn = e.target.closest("[data-ext-uninstall-plugin]");
+  if (uninstallPluginBtn) {
+    const id = uninstallPluginBtn.getAttribute("data-ext-uninstall-plugin");
+    if (!confirm(`确定卸载插件 "${id}"？`)) return;
+    uninstallPluginBtn.disabled = true;
+    try {
+      await api("/api/store/plugins/uninstall", {
+        method: "POST", body: JSON.stringify({ id })
+      });
+      state.extNeedsRestart = true;
+      await refreshExtPluginsCache().catch(() => []);
+      await loadExtPluginInstalled();
+    } catch (err) {
+      alert(`卸载失败: ${err.message}`);
+    } finally {
+      uninstallPluginBtn.disabled = false;
+    }
+    return;
+  }
+
+  // 添加 MCP 从预置（含安全确认）
+  const addPresetBtn = e.target.closest("[data-ext-add-mcp-preset]");
+  if (addPresetBtn) {
+    const capability = await ensureExtMcpCapability();
+    if (!capability?.supported) {
+      showToast(capability.error || "当前网关不支持 MCP 配置", "warning", 3200);
+      return;
+    }
+    const presetId = addPresetBtn.getAttribute("data-ext-add-mcp-preset");
+    const presetList = Array.isArray(_mcpPresetsCache[getExtSourceId("mcp")]) ? _mcpPresetsCache[getExtSourceId("mcp")] : [];
+    const preset = presetList.find(p => p.id === presetId);
+    if (!preset) return;
+    const safetyMsg = buildSafetyMessage("mcp");
+    const confirmed = await requestConfirmDialog({
+      title: "安全确认",
+      message: `即将添加 MCP Server「${preset.name}」\n命令: ${preset.defaultConfig?.command || ""} ${(preset.defaultConfig?.args || []).join(" ")}\n\n${safetyMsg}\n\n确定继续？`,
+      confirmText: "确认添加",
+      cancelText: "取消",
+      variant: "default"
+    });
+    if (!confirmed) return;
+    addPresetBtn.disabled = true;
+    try {
+      await api("/api/store/mcp/set", {
+        method: "POST", body: JSON.stringify({ name: preset.id, config: preset.defaultConfig })
+      });
+      addPresetBtn.innerHTML = '<i class="fa-solid fa-check"></i> 已添加';
+    } catch (err) {
+      alert(`添加失败: ${err.message}`);
+      addPresetBtn.disabled = false;
+    }
+    return;
+  }
+
+  // 删除 MCP
+  const removeMcpBtn = e.target.closest("[data-ext-remove-mcp]");
+  if (removeMcpBtn) {
+    const capability = await ensureExtMcpCapability();
+    if (!capability?.supported) {
+      showToast(capability.error || "当前网关不支持 MCP 配置", "warning", 3200);
+      return;
+    }
+    const name = removeMcpBtn.getAttribute("data-ext-remove-mcp");
+    if (!confirm(`确定删除 MCP Server "${name}"？`)) return;
+    removeMcpBtn.disabled = true;
+    try {
+      await api("/api/store/mcp/remove", {
+        method: "POST", body: JSON.stringify({ name })
+      });
+      await loadExtMcpConfigured();
+    } catch (err) {
+      alert(`删除失败: ${err.message}`);
+    }
+    return;
+  }
+
+  // 手动添加 MCP
+  if (e.target.closest("#ext-mcp-add-btn")) {
+    const capability = await ensureExtMcpCapability();
+    if (!capability?.supported) {
+      showToast(capability.error || "当前网关不支持 MCP 配置", "warning", 3200);
+      return;
+    }
+    const name = $("ext-mcp-name")?.value?.trim();
+    const command = $("ext-mcp-command")?.value?.trim();
+    const argsRaw = $("ext-mcp-args")?.value?.trim();
+    if (!name || !command) {
+      alert("名称和命令不能为空");
+      return;
+    }
+    const args = argsRaw ? argsRaw.split(",").map(a => a.trim()).filter(Boolean) : [];
+    const env = {};
+    for (const row of document.querySelectorAll("#ext-mcp-env-rows .ext-env-row")) {
+      const k = row.querySelector(".env-key")?.value?.trim();
+      const v = row.querySelector(".env-val")?.value?.trim();
+      if (k) env[k] = v || "";
+    }
+    const config = { command, args };
+    if (Object.keys(env).length > 0) config.env = env;
+    try {
+      await api("/api/store/mcp/set", {
+        method: "POST", body: JSON.stringify({ name, config })
+      });
+      $("ext-mcp-name").value = "";
+      $("ext-mcp-command").value = "";
+      $("ext-mcp-args").value = "";
+      $("ext-mcp-env-rows").innerHTML = "";
+      alert(`MCP Server "${name}" 已添加`);
+    } catch (err) {
+      alert(`添加失败: ${err.message}`);
+    }
+    return;
+  }
+
+  // MCP 环境变量添加
+  if (e.target.closest("#ext-mcp-env-add")) {
+    addExtEnvRow($("ext-mcp-env-rows"), "", "", false);
+    return;
+  }
+
+  // 环境变量删除（通用）
+  const envDelete = e.target.closest(".ext-env-delete");
+  if (envDelete) {
+    envDelete.closest(".ext-env-row")?.remove();
+    return;
+  }
+
+  // 重启 Gateway
+  if (e.target.closest("[data-ext-restart]")) {
+    const btn = e.target.closest("[data-ext-restart]");
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 重启中...';
+    try {
+      await api("/api/gateway/restart", {
+        method: "POST", body: JSON.stringify({ mode: "hot" })
+      });
+      state.extNeedsRestart = false;
+      await loadExtPluginInstalled();
+    } catch (err) {
+      alert(`重启失败: ${err.message}`);
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fa-solid fa-rotate"></i> 重启';
+    }
+    return;
+  }
+
+  // 点击商店 Skill 卡片 → 详情弹框
+  const detailSkillCard = e.target.closest("[data-ext-detail-skill]");
+  if (detailSkillCard && !e.target.closest("button")) {
+    const slug = detailSkillCard.getAttribute("data-ext-detail-skill");
+    if (slug) openExtDetailModal("skill", slug);
+    return;
+  }
+
+  // 点击商店 Plugin 卡片 → 详情弹框
+  const detailPluginCard = e.target.closest("[data-ext-detail-plugin]");
+  if (detailPluginCard && !e.target.closest("button")) {
+    const name = detailPluginCard.getAttribute("data-ext-detail-plugin");
+    const safetyRaw = detailPluginCard.getAttribute("data-safety");
+    if (name) openExtDetailModal("plugin", name, safetyRaw);
+    return;
+  }
+
+  // 打开 Plugin 配置 Modal
+  const configPluginBtn = e.target.closest("[data-ext-config-plugin]");
+  if (configPluginBtn) {
+    openExtPluginConfigModal(configPluginBtn.getAttribute("data-ext-config-plugin"));
+    return;
+  }
+
+  // 打开 MCP 配置 Modal
+  const configMcpBtn = e.target.closest("[data-ext-config-mcp]");
+  if (configMcpBtn) {
+    const capability = await ensureExtMcpCapability();
+    if (!capability?.supported) {
+      showToast(capability.error || "当前网关不支持 MCP 配置", "warning", 3200);
+      return;
+    }
+    openExtMcpConfigModal(configMcpBtn.getAttribute("data-ext-config-mcp"));
+    return;
+  }
+
+  // 打开 Skill 配置 Modal
+  const configSkillBtn = e.target.closest("[data-ext-config-skill]");
+  if (configSkillBtn) {
+    openExtSkillConfigModal(configSkillBtn.getAttribute("data-ext-config-skill"));
+    return;
+  }
+
+  // 关闭配置 Modal
+  if (e.target.closest("[data-ext-modal-close]")) {
+    setExtModalOpen(false);
+    return;
+  }
+
+  // Modal 环境变量添加
+  if (e.target.closest("#ext-modal-env-add")) {
+    addExtEnvRow($("ext-modal-env-rows"), "", "", false);
+    $("ext-modal-env-empty")?.classList.add("is-hidden");
+    return;
+  }
+
+  // Modal API Key 显隐
+  if (e.target.closest("#ext-modal-apikey-toggle")) {
+    const input = $("ext-modal-apikey");
+    const icon = e.target.closest("#ext-modal-apikey-toggle").querySelector("i");
+    if (input.type === "password") {
+      input.type = "text";
+      icon.className = "fa-solid fa-eye-slash";
+    } else {
+      input.type = "password";
+      icon.className = "fa-solid fa-eye";
+    }
+    return;
+  }
+
+  // Modal 保存配置
+  const saveModalBtn = e.target.closest("#ext-modal-save-btn");
+  if (saveModalBtn) {
+    const type = saveModalBtn.getAttribute("data-save-type");
+    const key = saveModalBtn.getAttribute("data-save-key");
+    if (!type || !key) return;
+
+    saveModalBtn.disabled = true;
+    const originalText = saveModalBtn.innerHTML;
+    saveModalBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 正在保存...';
 
     try {
-      const payload = { skillKey };
+      if (type === "skill") {
+        const payload = { skillKey: key };
+        const toggle = $("ext-modal-toggle");
+        payload.enabled = toggle?.checked ?? true;
 
-      // API Key
-      const apiKeyInput = $("skill-config-apikey");
-      const apiKeySection = $("skill-config-apikey-section");
-      if (apiKeySection && !apiKeySection.classList.contains("is-hidden") && apiKeyInput?.value?.trim()) {
-        payload.apiKey = apiKeyInput.value.trim();
-      }
+        const apiKeyInput = $("ext-modal-apikey");
+        const apiKeySection = $("ext-modal-apikey-section");
+        if (apiKeySection && !apiKeySection.classList.contains("is-hidden") && apiKeyInput?.value?.trim()) {
+          payload.apiKey = apiKeyInput.value.trim();
+        }
 
-      // 环境变量
-      const envRows = document.querySelectorAll("#skill-config-env-rows .env-row");
-      if (envRows.length > 0) {
+        const envRows = document.querySelectorAll("#ext-modal-env-rows .ext-env-row");
+        if (envRows.length > 0) {
+          const env = {};
+          for (const row of envRows) {
+            const k = row.querySelector(".env-key")?.value?.trim();
+            const v = row.querySelector(".env-val")?.value?.trim();
+            if (k) env[k] = v || "";
+          }
+          if (Object.keys(env).length > 0) payload.env = env;
+        }
+
+        await api("/api/store/skills/update", {
+          method: "POST", body: JSON.stringify(payload)
+        });
+        await refreshExtSkillsCache().catch(() => []);
+      } else if (type === "plugin") {
+        const plugin = _pluginsCache.find((entry) => entry.id === key);
+        const enabled = $("ext-modal-toggle")?.checked ?? true;
+        const config = readPluginConfigEditor(plugin);
+
+        if (plugin && enabled !== plugin.enabled) {
+          await api("/api/store/plugins/toggle", {
+            method: "POST", body: JSON.stringify({ id: key, enabled })
+          });
+          state.extNeedsRestart = true;
+        }
+
+        await api("/api/store/plugins/config", {
+          method: "POST", body: JSON.stringify({ id: key, config })
+        });
+        state.extNeedsRestart = true;
+        await refreshExtPluginsCache().catch(() => []);
+      } else if (type === "mcp") {
+        const capability = await ensureExtMcpCapability();
+        if (!capability?.supported) {
+          throw new Error(capability.error || "当前网关不支持 MCP 配置");
+        }
+        const command = $("ext-mcp-modal-command")?.value?.trim();
+        const argsRaw = $("ext-mcp-modal-args")?.value?.trim();
+        if (!command) {
+          throw new Error("命令不能为空");
+        }
+
+        const args = argsRaw ? argsRaw.split(",").map((item) => item.trim()).filter(Boolean) : [];
         const env = {};
-        for (const row of envRows) {
-          const key = row.querySelector(".env-key")?.value?.trim();
-          const val = row.querySelector(".env-val")?.value?.trim();
-          if (key) env[key] = val || "";
+        for (const row of document.querySelectorAll("#ext-modal-env-rows .ext-env-row")) {
+          const envKey = row.querySelector(".env-key")?.value?.trim();
+          const envValue = row.querySelector(".env-val")?.value?.trim();
+          if (envKey) env[envKey] = envValue || "";
         }
+        const config = { command, args };
         if (Object.keys(env).length > 0) {
-          payload.env = env;
+          config.env = env;
         }
+        await api("/api/store/mcp/set", {
+          method: "POST", body: JSON.stringify({ name: key, config })
+        });
+        _mcpConfiguredCache[key] = config;
       }
 
-      await api("/api/skills/update", {
-        method: "POST",
-        body: JSON.stringify(payload)
-      });
-
-      // 关闭弹窗并重载列表
-      setSkillModalOpen(false);
-      await loadSkills();
-
+      setExtModalOpen(false);
+      await loadExtensions();
     } catch (err) {
-      alert(`保存配置时发生错误：\n\n${err.message}`);
+      alert(`保存失败: ${err.message}`);
     } finally {
-      saveBtn.disabled = false;
-      saveBtn.innerHTML = originalText;
+      saveModalBtn.disabled = false;
+      saveModalBtn.innerHTML = originalText;
     }
     return;
   }
 
-  // 安装依赖
-  const installBtn = e.target.closest("#skill-config-install-btn");
-  if (installBtn) {
-    const name = installBtn.getAttribute("data-install-name");
-    const installId = installBtn.getAttribute("data-install-id");
+  // Modal 安装依赖
+  const installDepBtn = e.target.closest("#ext-modal-install-dep-btn");
+  if (installDepBtn) {
+    const name = installDepBtn.getAttribute("data-install-name");
+    const installId = installDepBtn.getAttribute("data-install-id");
     if (!name || !installId) return;
-
-    installBtn.disabled = true;
-    const originalText = installBtn.innerHTML;
-    installBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 正在安装...';
-
+    installDepBtn.disabled = true;
+    installDepBtn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 正在安装...';
     try {
-      await api("/api/skills/install", {
-        method: "POST",
-        body: JSON.stringify({ name, installId })
+      await api("/api/store/skills/install-dep", {
+        method: "POST", body: JSON.stringify({ name, installId })
       });
-      setSkillModalOpen(false);
-      await loadSkills();
+      await refreshExtSkillsCache().catch(() => []);
+      setExtModalOpen(false);
+      await loadExtensions();
     } catch (err) {
-      alert(`安装失败：\n\n${err.message}`);
+      alert(`安装失败: ${err.message}`);
     } finally {
-      installBtn.disabled = false;
-      installBtn.innerHTML = originalText;
+      installDepBtn.disabled = false;
+      installDepBtn.innerHTML = '<i class="fa-solid fa-download"></i> 安装依赖';
     }
     return;
+  }
+
+  // Modal 卸载
+  const uninstallModalBtn = e.target.closest("#ext-modal-uninstall-btn");
+  if (uninstallModalBtn) {
+    const type = uninstallModalBtn.getAttribute("data-uninstall-type");
+    const key = uninstallModalBtn.getAttribute("data-uninstall-key");
+    if (!confirm(`确定卸载 "${key}"？`)) return;
+    uninstallModalBtn.disabled = true;
+    try {
+      if (type === "skill") {
+        await api("/api/store/skills/uninstall", {
+          method: "POST", body: JSON.stringify({ slug: key })
+        });
+        await refreshExtSkillsCache().catch(() => []);
+      } else if (type === "plugin") {
+        await api("/api/store/plugins/uninstall", {
+          method: "POST", body: JSON.stringify({ id: key })
+        });
+        state.extNeedsRestart = true;
+        await refreshExtPluginsCache().catch(() => []);
+      } else if (type === "mcp") {
+        const capability = await ensureExtMcpCapability();
+        if (!capability?.supported) {
+          throw new Error(capability.error || "当前网关不支持 MCP 配置");
+        }
+        await api("/api/store/mcp/remove", {
+          method: "POST", body: JSON.stringify({ name: key })
+        });
+        delete _mcpConfiguredCache[key];
+      }
+      setExtModalOpen(false);
+      await loadExtensions();
+    } catch (err) {
+      alert(`卸载失败: ${err.message}`);
+    } finally {
+      uninstallModalBtn.disabled = false;
+    }
+    return;
+  }
+
+  // 仓库源按钮
+  if (e.target.closest("#ext-sources-btn")) {
+    setSourcesModalOpen(true);
+    return;
+  }
+
+  // 关闭仓库源 Modal
+  if (e.target.closest("[data-sources-modal-close]")) {
+    setSourcesModalOpen(false);
+    return;
+  }
+
+  // 添加仓库源
+  if (e.target.closest("#ext-source-add-btn")) {
+    const kind = $("ext-source-kind")?.value || "registry";
+    const name = $("ext-source-name")?.value?.trim();
+    const url = $("ext-source-url")?.value?.trim();
+    const tabs = EXT_SOURCE_TABS.filter((tab) => $(`ext-source-tab-${tab}`)?.checked);
+    const ref = $("ext-source-ref")?.value?.trim() || "main";
+    const skillsPath = $("ext-source-skills-path")?.value?.trim() || "skills";
+    if (!name || !url) { alert("名称和 URL 不能为空"); return; }
+    if (tabs.length === 0) { alert("至少选择一个适用 Tab"); return; }
+    try {
+      await api("/api/store/sources", {
+        method: "POST", body: JSON.stringify({
+          name,
+          url,
+          kind,
+          tabs,
+          ref,
+          skillsPath
+        })
+      });
+      $("ext-source-name").value = "";
+      $("ext-source-url").value = "";
+      if ($("ext-source-ref")) $("ext-source-ref").value = "main";
+      if ($("ext-source-skills-path")) $("ext-source-skills-path").value = "skills";
+      $("ext-source-kind").value = "registry";
+      syncExtSourceKindForm();
+      await ensureExtSources(true);
+      await loadSourcesList();
+      await loadExtensions();
+    } catch (err) {
+      alert(err.message);
+    }
+    return;
+  }
+
+  // 删除仓库源
+  const deleteSourceBtn = e.target.closest("[data-ext-delete-source]");
+  if (deleteSourceBtn) {
+    const id = deleteSourceBtn.getAttribute("data-ext-delete-source");
+    if (!confirm(`确定删除仓库源 "${id}"？`)) return;
+    try {
+      await api("/api/store/sources", {
+        method: "DELETE", body: JSON.stringify({ id })
+      });
+      await ensureExtSources(true);
+      await loadSourcesList();
+      await loadExtensions();
+    } catch (err) {
+      alert(err.message);
+    }
+    return;
+  }
+
+  // 设为当前仓库源
+  const activateSourceBtn = e.target.closest("[data-ext-activate-source]");
+  if (activateSourceBtn) {
+    const sourceId = activateSourceBtn.getAttribute("data-ext-activate-source") || "";
+    const tab = activateSourceBtn.getAttribute("data-ext-source-tab") || "";
+    if (sourceId && EXT_SOURCE_TABS.includes(tab)) {
+      state.extActiveSourceByTab[tab] = sourceId;
+    }
+    await loadSourcesList();
+    await loadExtensions();
+    if (EXT_SOURCE_TABS.includes(tab)) {
+      showToast(`${EXT_SOURCE_TAB_LABELS[tab]} 已切换到 ${getExtSourceLabel(tab)}`, "success", 1800);
+    }
+    return;
+  }
+});
+
+document.addEventListener("change", (e) => {
+  if (e.target.id === "ext-source-kind") {
+    syncExtSourceKindForm();
+  }
+});
+
+// Skill/Plugin 搜索回车支持
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    if (e.target.id === "ext-skill-search") {
+      e.preventDefault();
+      $("ext-skill-search-btn")?.click();
+    } else if (e.target.id === "ext-plugin-search") {
+      e.preventDefault();
+      $("ext-plugin-search-btn")?.click();
+    }
   }
 });
 
@@ -7898,6 +9454,10 @@ function bindEvents() {
       event.preventDefault();
       const nextView = nav.dataset.view || "";
       if (!nextView) return;
+      if (nextView === state.currentView) {
+        $("sidebar")?.classList.remove("active");
+        return;
+      }
 
       if (state.currentView === "persona" && nextView !== "persona") {
         const shouldContinue = await confirmDiscardPersonaDrafts({ actionLabel: "切换到其他视图" });
@@ -8204,6 +9764,16 @@ function bindEvents() {
     if ($("models-config-modal")?.classList.contains("show")) {
       event.preventDefault();
       await closeAdvancedConfigModal();
+      return;
+    }
+    if (state.extSourcesModalOpen) {
+      event.preventDefault();
+      setSourcesModalOpen(false);
+      return;
+    }
+    if (state.extModalOpen) {
+      event.preventDefault();
+      setExtModalOpen(false);
       return;
     }
     if (!state.providerModalOpen) return;

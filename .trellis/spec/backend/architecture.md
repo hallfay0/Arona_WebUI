@@ -69,6 +69,12 @@ Session-token auth stored in a `SESSIONS` Map.
 | `/api/gateway/restart` | POST | Partial | Restart gateway: hot (via config.patch RPC) or hard (SIGTERM via shell) |
 | `/api/gateway/doctor` | GET | Yes | Run diagnostics (health, channels, memory status) |
 | `/api/gateway/doctor/fix` | POST | No | Execute auto-fix (placeholder) |
+| `/api/store/skills/search\|list\|detail/*` | GET | Mixed | Skill 商店浏览，`registry` 源走外部 `/api/v1/*`，`github-skills` 源走 GitHub repo |
+| `/api/store/skills/install\|uninstall\|update\|install-dep` | POST | Mixed | Skill 安装与配置；ClawHub 安装走 gateway RPC，GitHub 安装写入本地 skills 目录 |
+| `/api/store/plugins/search\|detail/*` | GET | Mixed | Plugin 商店浏览，当前仅 `registry` 源有效 |
+| `/api/store/plugins/list\|install\|uninstall\|toggle\|config` | GET/POST | Mixed | Plugin 管理；list/toggle/config 走 gateway config，安装/卸载走本机 CLI |
+| `/api/store/mcp/capability\|list\|presets\|set\|remove` | GET/POST | Mixed | MCP 能力探测、预置列表和配置；对旧网关会先返回“不支持”能力结果 |
+| `/api/store/sources` | GET/POST/DELETE | No | 扩展中心 source 清单（runtime 文件：`data/store-sources.json`） |
 
 ---
 

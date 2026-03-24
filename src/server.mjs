@@ -6,6 +6,7 @@ import os from "node:os";
 import { execSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import https from "node:https";
+import { handleStoreApi } from "./store-routes.mjs";
 
 // Load .env.local if it exists (local dev config, not committed to git)
 const __filename = fileURLToPath(import.meta.url);
@@ -1953,6 +1954,14 @@ async function handleApi(req, res, pathname, query) {
       } finally {
         updateInProgress = false;
       }
+    }
+
+    // ── Store routes (/api/store/*) ──
+    if (pathname.startsWith("/api/store/")) {
+      const result = await handleStoreApi({
+        req, res, pathname, query, parseBody, jsonResponse, withGateway,
+      });
+      if (result !== null) return;
     }
 
     return jsonResponse(res, 404, { ok: false, error: "API endpoint not found" });

@@ -1,0 +1,135 @@
+[
+  {
+    "id": "filesystem",
+    "name": "Filesystem",
+    "description": "读写本地文件系统，支持目录浏览、文件搜索和编辑",
+    "icon": "fa-solid fa-folder-open",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/directory"]
+    }
+  },
+  {
+    "id": "github",
+    "name": "GitHub",
+    "description": "访问 GitHub 仓库、Issue、PR，执行搜索和文件操作",
+    "icon": "fa-brands fa-github",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": ""
+      }
+    }
+  },
+  {
+    "id": "context7",
+    "name": "Context7",
+    "description": "为 AI 提供最新的、版本特定的库文档和代码示例",
+    "icon": "fa-solid fa-book",
+    "defaultConfig": {
+      "command": "uvx",
+      "args": ["context7-mcp"]
+    }
+  },
+  {
+    "id": "puppeteer",
+    "name": "Puppeteer",
+    "description": "浏览器自动化，支持网页截图、元素操作和 JavaScript 执行",
+    "icon": "fa-solid fa-globe",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+    }
+  },
+  {
+    "id": "brave-search",
+    "name": "Brave Search",
+    "description": "使用 Brave 搜索引擎进行网络搜索和本地搜索",
+    "icon": "fa-solid fa-magnifying-glass",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": {
+        "BRAVE_API_KEY": ""
+      }
+    }
+  },
+  {
+    "id": "slack",
+    "name": "Slack",
+    "description": "访问 Slack 工作区，读取频道消息、发送消息和管理频道",
+    "icon": "fa-brands fa-slack",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "env": {
+        "SLACK_BOT_TOKEN": "",
+        "SLACK_TEAM_ID": ""
+      }
+    }
+  },
+  {
+    "id": "memory",
+    "name": "Memory",
+    "description": "基于知识图谱的持久化记忆系统，支持实体和关系管理",
+    "icon": "fa-solid fa-brain",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    }
+  },
+  {
+    "id": "sqlite",
+    "name": "SQLite",
+    "description": "连接 SQLite 数据库，执行查询、分析表结构和数据探索",
+    "icon": "fa-solid fa-database",
+    "defaultConfig": {
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "/path/to/database.db"]
+    }
+  },
+  {
+    "id": "fetch",
+    "name": "Fetch",
+    "description": "获取网页内容并转换为 Markdown 格式，支持自定义请求头",
+    "icon": "fa-solid fa-download",
+    "defaultConfig": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  },
+  {
+    "id": "sequential-thinking",
+    "name": "Sequential Thinking",
+    "description": "通过序列化思维过程帮助 AI 进行复杂推理和问题分解",
+    "icon": "fa-solid fa-diagram-project",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    }
+  },
+  {
+    "id": "postgres",
+    "name": "PostgreSQL",
+    "description": "连接 PostgreSQL 数据库，执行只读查询和表结构分析",
+    "icon": "fa-solid fa-database",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://user:password@localhost:5432/dbname"]
+    }
+  },
+  {
+    "id": "exa",
+    "name": "Exa Search",
+    "description": "使用 Exa AI 搜索引擎获取高质量搜索结果和网页内容",
+    "icon": "fa-solid fa-search",
+    "defaultConfig": {
+      "command": "npx",
+      "args": ["-y", "exa-mcp-server"],
+      "env": {
+        "EXA_API_KEY": ""
+      }
+    }
+  }
+]

@@ -35,6 +35,7 @@ Read these files before making backend or fullstack changes:
 - Browser-facing auth bridge: `/api/login`, `/api/gateway-auth`
 - Health / runtime helpers: `/api/health`, `/api/system-load`
 - Gateway-backed routes: overview, models, skills, agents/persona, cron, nodes, logs
+- Extension-center routes: `/api/store/skills/*`, `/api/store/plugins/*`, `/api/store/mcp/*`, `/api/store/sources`
 - Browser Chat transport: `public/gateway-client.js` calls gateway WS directly after `/api/gateway-auth` bootstrap
 - Static file serving: `public/`
 

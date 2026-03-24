@@ -1,6 +1,6 @@
 # HTTP API Contracts
 
-> Browser-facing JSON route contract for models, skills, cron, nodes, logs, and shared envelope behavior.
+> Browser-facing JSON route contract for models, skills, store/extensions, cron, nodes, logs, and shared envelope behavior.
 
 ---
 
@@ -41,6 +41,49 @@
 - `POST /api/skills/update`
   ```json
   { "skillKey": "<key>", "enabled": true, "apiKey": "<optional>", "env": { "KEY": "VALUE" } }
+  ```
+
+#### Extension Store
+- `GET /api/store/skills/search?q=<keyword>&limit=<n>&source=<sourceId>`
+- `GET /api/store/skills/list?limit=<n>&source=<sourceId>`
+- `GET /api/store/skills/detail/<slug>?source=<sourceId>`
+- `POST /api/store/skills/install`
+  ```json
+  { "slug": "<skill slug>", "source": "<source id>", "version": "<optional>", "force": true }
+  ```
+- `GET /api/store/plugins/search?q=<keyword>&family=<family[,family]>&limit=<n>&source=<sourceId>`
+- `GET /api/store/plugins/detail/<name>?source=<sourceId>`
+- `GET /api/store/plugins/list`
+- `POST /api/store/plugins/install`
+  ```json
+  { "spec": "<sourceId>:<package>" }
+  ```
+- `GET /api/store/mcp/capability`
+- `GET /api/store/mcp/list`
+- `GET /api/store/mcp/presets?source=<sourceId>`
+- `POST /api/store/mcp/set`
+  ```json
+  { "name": "<server name>", "config": { "command": "...", "args": ["..."], "env": { "KEY": "VALUE" } } }
+  ```
+- `POST /api/store/mcp/remove`
+  ```json
+  { "name": "<server name>" }
+  ```
+- `GET /api/store/sources`
+- `POST /api/store/sources`
+  ```json
+  {
+    "name": "<display name>",
+    "kind": "registry | github-skills | mcp-presets",
+    "url": "<source base url>",
+    "tabs": ["skill", "plugin"],
+    "ref": "main",
+    "skillsPath": "skills"
+  }
+  ```
+- `DELETE /api/store/sources`
+  ```json
+  { "id": "<source id>" }
   ```
 
 #### Cron
@@ -164,6 +207,20 @@
 - `/api/skills` returns `skills[]`; browser currently reads `name`, `description`, `source`, `skillKey`, `disabled`, `eligible`, `blockedByAllowlist`, `missing`, `primaryEnv`, `install`, `emoji`.
 - `/api/skills/install` requires `name` and `installId`; backend defaults `timeoutMs` to `120000`.
 - `/api/skills/update` forwards whatever optional fields are provided; HTTP layer does not add extra validation beyond JSON parsing.
+
+#### Extension Store contract
+- `source` is not global anymore. Browser keeps `skill|plugin|mcp` current source separately via `state.extActiveSourceByTab`.
+- Source records stored in `data/store-sources.json` are runtime data and should not be committed.
+- `kind=registry` sources may serve `skill` and/or `plugin`; current implementation assumes ClawHub-style `/api/v1/search`, `/api/v1/skills`, `/api/v1/packages/search`, `/api/v1/packages/:name`.
+- `kind=github-skills` sources only support `skill`; browser-facing browse/search/detail routes are backed by GitHub repo traversal of `<skillsPath>/<slug>/SKILL.md`.
+- `kind=mcp-presets` sources only support `mcp`; `/api/store/mcp/presets` returns a JSON array of preset entries.
+- `/api/store/mcp/capability` probes gateway support for top-level `mcp` config via `config.schema.lookup("mcp")`.
+- When capability returns `{ supported: false, error }`, frontend must render MCP surfaces in read-only/disabled mode and avoid calling `/api/store/mcp/set|remove`.
+- `GET /api/store/skills/list` is the default browse path for `github-skills`; many `registry` sources still return empty list and rely on keyword search.
+- `POST /api/store/skills/install` is mixed-mode:
+  - `registry` source → `skills.install` gateway RPC
+  - `github-skills` source → WebUI copies repo files into the local skills directory inferred from `skills.status.filePath` or `OPENCLAW_SKILLS_DIR`
+- GitHub-source backend uses in-memory caching plus in-flight promise de-duplication to reduce duplicate fetches during cold loads.
 
 #### Cron contract
 - `/api/cron/list` forwards `includeDisabled` to gateway and injects `schedule.human` for `schedule.kind === "cron"` when expression parsing succeeds.
