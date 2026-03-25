@@ -71,6 +71,8 @@ Current Models view scope:
 - Agent allowlist + default model via `agents.defaults.models` and `agents.defaults.model`
 - Dedicated model settings via `agents.defaults.imageModel|imageGenerationModel|pdfModel|summarize|subagents`
 - Memory embeddings via `agents.defaults.memorySearch`
+- Text-to-speech via `messages.tts`
+- Audio transcription / STT via `tools.media.audio`
 
 ---
 

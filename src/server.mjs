@@ -82,6 +82,46 @@ function redactApiKeyField(target, key = "apiKey") {
   return target;
 }
 
+function normalizeSecretKey(key) {
+  return String(key || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function isSecretLikeKey(key) {
+  const normalized = normalizeSecretKey(key);
+  if (!normalized) return false;
+  return normalized.includes("apikey")
+    || normalized === "authorization"
+    || normalized.endsWith("authorization")
+    || normalized === "token"
+    || normalized.endsWith("token")
+    || normalized === "secret"
+    || normalized.endsWith("secret")
+    || normalized === "password"
+    || normalized.endsWith("password");
+}
+
+function redactNestedSecretFields(target) {
+  if (!target || typeof target !== "object") return target;
+  if (Array.isArray(target)) {
+    for (const item of target) {
+      redactNestedSecretFields(item);
+    }
+    return target;
+  }
+  for (const [key, value] of Object.entries(target)) {
+    if (typeof value === "string") {
+      if (value.trim() && isSecretLikeKey(key)) {
+        target[key] = REDACTED_API_KEY_TOKEN;
+      }
+      continue;
+    }
+    if (value && typeof value === "object") {
+      redactNestedSecretFields(value);
+    }
+  }
+  return target;
+}
+
 function readModelsConfigForResponse(config) {
   const modelsConfig = cloneJsonValue(config?.parsed?.models, {}) || {};
   const providers = modelsConfig && typeof modelsConfig === "object" && !Array.isArray(modelsConfig)
@@ -104,6 +144,24 @@ function readMemorySearchForResponse(config) {
     redactApiKeyField(memorySearch.remote);
   }
   return memorySearch;
+}
+
+function readTtsConfigForResponse(config) {
+  const ttsConfig = cloneJsonValue(config?.parsed?.messages?.tts, null);
+  if (!ttsConfig || typeof ttsConfig !== "object" || Array.isArray(ttsConfig)) {
+    return ttsConfig ?? null;
+  }
+  redactNestedSecretFields(ttsConfig);
+  return ttsConfig;
+}
+
+function readAudioTranscriptionForResponse(config) {
+  const audioTranscription = cloneJsonValue(config?.parsed?.tools?.media?.audio, null);
+  if (!audioTranscription || typeof audioTranscription !== "object" || Array.isArray(audioTranscription)) {
+    return audioTranscription ?? null;
+  }
+  redactNestedSecretFields(audioTranscription);
+  return audioTranscription;
 }
 
 const INVALID_OPTIONAL_STRING = Symbol("invalid optional string");
@@ -1209,7 +1267,9 @@ async function handleApi(req, res, pathname, query) {
           pdfMaxPages: config.parsed?.agents?.defaults?.pdfMaxPages ?? null,
           summarize: config.parsed?.agents?.defaults?.summarize ?? null,
           subagents: config.parsed?.agents?.defaults?.subagents ?? null,
-          memorySearch: readMemorySearchForResponse(config)
+          memorySearch: readMemorySearchForResponse(config),
+          ttsConfig: readTtsConfigForResponse(config),
+          audioTranscription: readAudioTranscriptionForResponse(config)
         };
       });
       return jsonResponse(res, 200, data);
@@ -1230,6 +1290,8 @@ async function handleApi(req, res, pathname, query) {
       const hasSummarize = hasOwn(body, "summarize");
       const hasSubagents = hasOwn(body, "subagents");
       const hasMemorySearch = hasOwn(body, "memorySearch");
+      const hasTtsConfig = hasOwn(body, "ttsConfig");
+      const hasAudioTranscription = hasOwn(body, "audioTranscription");
       if (
         hasAgentsDefaultsModels
         || hasAgentsDefaultModel
@@ -1273,6 +1335,12 @@ async function handleApi(req, res, pathname, query) {
         if (hasMemorySearch) {
           payload.agents.defaults.memorySearch = body.memorySearch;
         }
+      }
+      if (hasTtsConfig) {
+        payload.messages = { tts: body.ttsConfig };
+      }
+      if (hasAudioTranscription) {
+        payload.tools = { media: { audio: body.audioTranscription } };
       }
       const result = await withGateway((gateway) =>
         gateway.request("config.patch", {

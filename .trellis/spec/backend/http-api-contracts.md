@@ -28,6 +28,8 @@
     "models": { "providers": { "<providerKey>": { "...": "..." } } },
     "agentsDefaultsModels": { "<provider/model>": { "...": "..." } },
     "agentsDefaultModel": { "primary": "<provider/model>", "fallbacks": ["<provider/model>"] },
+    "ttsConfig": { "...": "..." },
+    "audioTranscription": { "...": "..." },
     "baseHash": "<config hash>"
   }
   ```
@@ -174,6 +176,25 @@
       "model": "text-embedding-3-small",
       "remote": { "baseUrl": "https://example.com/v1", "apiKey": "__OPENCLAW_REDACTED__" },
       "fallback": "none"
+    },
+    "ttsConfig": {
+      "auto": "always",
+      "provider": "openai",
+      "summaryModel": "openai/gpt-4.1-mini",
+      "openai": {
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "apiKey": "__OPENCLAW_REDACTED__"
+      }
+    },
+    "audioTranscription": {
+      "enabled": true,
+      "language": "zh",
+      "timeoutSeconds": 30,
+      "models": [
+        { "provider": "openai", "model": "gpt-4o-mini-transcribe" },
+        { "provider": "deepgram", "model": "nova-3" }
+      ]
     }
   }
   ```
@@ -191,6 +212,8 @@
   - `agents.defaults.summarize`
   - `agents.defaults.subagents`
   - `agents.defaults.memorySearch`
+  - `messages.tts`
+  - `tools.media.audio`
 - Browser editor depends on provider config round-tripping extra fields. Managed keys are `baseUrl|baseURL|url|apiKey|api|apiType|type|models`; everything else must survive save.
 - Browser provider save normalizes legacy adapter fields `apiType` / `type` into gateway-schema `api` before calling `/api/models/save`.
 - Browser provider delete / rename emits `models.providers.<key> = null` tombstones so `config.patch` actually removes old provider keys instead of merging them back.
@@ -202,6 +225,8 @@
 - Browser memory-search editor only manages `enabled|provider|model|remote.baseUrl|remote.apiKey|fallback`; advanced keys such as `remote.headers`, `remote.batch`, `local`, `store`, `chunking`, and `query` must survive save unchanged.
 - `memorySearch.provider` UI uses empty string to represent “auto-select”; callers should omit the field instead of sending `"auto"` back through `/api/models/save`.
 - `__OPENCLAW_REDACTED__` is a browser-only placeholder; save callers must remove it before sending for both provider API keys and `memorySearch.remote.apiKey`.
+- `ttsConfig` mirrors `messages.tts`; secret-like nested fields (for example `openai.apiKey`, `elevenlabs.apiKey`, or custom auth headers/tokens) are redacted to `__OPENCLAW_REDACTED__` in `/api/models` responses.
+- `audioTranscription` mirrors `tools.media.audio`; secret-like nested fields (for example custom `headers.Authorization` or `providerOptions.*.*Token`) are redacted to `__OPENCLAW_REDACTED__` in `/api/models` responses.
 
 #### Skills contract
 - `/api/skills` returns `skills[]`; browser currently reads `name`, `description`, `source`, `skillKey`, `disabled`, `eligible`, `blockedByAllowlist`, `missing`, `primaryEnv`, `install`, `emoji`.

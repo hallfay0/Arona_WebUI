@@ -7,7 +7,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>灵诗控制台 | OpenClaw</title>
   <link rel="stylesheet" href="/assets/fontawesome/css/all.min.css">
-  <link rel="stylesheet" href="/styles.css?v=20260321-models-ui-v9" />
+  <link rel="stylesheet" href="/styles.css?v=20260324-form-controls-v3" />
   <script src="/theme.js"></script>
   <style>
     /* 针对由 JS 动态渲染的表格特殊列的限宽，防止撑开页面 */
@@ -214,6 +214,22 @@
                 保存当前供应商</button>
             </div>
           </div>
+        </section>
+      </div>
+
+      <div id="models-config-modal" class="provider-modal-shell" aria-hidden="true">
+        <div class="provider-modal-backdrop" data-config-modal-close></div>
+        <section class="provider-modal-panel" role="dialog" aria-modal="true" aria-labelledby="config-modal-title">
+          <div class="provider-modal-head">
+            <div>
+              <h3 id="config-modal-title" class="provider-modal-title"></h3>
+              <p id="config-modal-subtitle" class="provider-modal-subtitle"></p>
+            </div>
+            <button type="button" class="provider-modal-close" data-config-modal-close aria-label="关闭配置弹窗">
+              <i class="fa-solid fa-xmark"></i>
+            </button>
+          </div>
+          <div class="provider-modal-body" id="config-modal-body" style="padding:24px 30px;overflow-y:auto;"></div>
         </section>
       </div>
 
@@ -911,7 +927,7 @@
       </div>
     </section>
   </div>
-  <script type="module" src="/app.js?v=20260321-models-ui-v9"></script>
+  <script type="module" src="/app.js?v=20260324-form-controls-v3"></script>
   <div id="toast-container" class="toast-container"></div>
 </body>
 

@@ -79,9 +79,11 @@ let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
 - `deletedModelProviderKeys`：记录用户删除或重命名后需要在 `config.patch` 中发送 `null` tombstone 的 provider key。
 - `agentsDefaultsModelsDraft`：当前模型页里“Agent 可用” allowlist 的前端草稿。
 - `agentsDefaultModelDraft`：当前模型页里“设为默认”对应的默认模型草稿。
-- `modelsAdvancedDrafts`：当前模型页里专用模型与 Embedding 的前端草稿，包含 `imageModel` / `imageGenerationModel` / `pdfModel` / `pdfMaxBytesMb` / `pdfMaxPages` / `summarize` / `subagents` / `memorySearch`。
+- `modelsAdvancedDrafts`：当前模型页里专用模型、Embedding 与语音配置的前端草稿，包含 `imageModel` / `imageGenerationModel` / `pdfModel` / `pdfMaxBytesMb` / `pdfMaxPages` / `summarize` / `subagents` / `memorySearch` / `ttsConfig` / `audioTranscription`。
 - `modelsAdvancedDrafts.summarize` 与 `modelsAdvancedDrafts.subagents` 只会被当前 UI 修改少数字段（如 `model`、`timeoutSeconds`、`thinking`）；保存时必须保留对象里原有的其他键。
 - `modelsAdvancedDrafts.memorySearch` 当前 UI 只编辑 `enabled|provider|model|remote.baseUrl|remote.apiKey|fallback`；像 `remote.headers`、`remote.batch`、`local`、`store`、`chunking`、`query` 这类高级字段必须在 round-trip 时保留。
+- `modelsAdvancedDrafts.ttsConfig` 当前 UI 只结构化管理 `auto|provider|summaryModel|timeoutMs|maxTextLength|openai.model|openai.voice|openai.baseUrl|openai.apiKey`；其余字段通过额外 JSON 保留并 round-trip。
+- `modelsAdvancedDrafts.audioTranscription` 当前 UI 只结构化管理 `enabled|language|timeoutSeconds|maxChars` 与前两条 provider 模型 entry；更复杂的 `models[]` 链路、`headers`、`providerOptions` 等字段通过额外 JSON 保留并 round-trip。
 - `deletedAllowlistModelRefs`：记录取消勾选或删除后需要在 `config.patch` 中发送 `null` tombstone 的模型引用。
 - `modelsApply.phase`：`"idle" | "restarting" | "error"`，驱动“网关热重启中”状态徽标和按钮禁用 / 重试连接状态。
 - `modelsApply.message`：当前热重启提示文案；在轮询恢复期间动态更新。

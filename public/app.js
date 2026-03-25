@@ -15,7 +15,9 @@ const state = {
     pdfMaxPages: null,
     summarize: null,
     subagents: null,
-    memorySearch: null
+    memorySearch: null,
+    ttsConfig: null,
+    audioTranscription: null
   },
   modelsAdvancedExpanded: false,
   configModalDirty: false,
@@ -164,6 +166,27 @@ const MEMORY_SEARCH_FALLBACK_OPTIONS = [
   { value: "ollama", label: "Ollama" },
   { value: "local", label: "Local" }
 ];
+const TTS_AUTO_MODE_OPTIONS = [
+  { value: "", label: "跟随网关默认（留空）" },
+  { value: "off", label: "off" },
+  { value: "always", label: "always" },
+  { value: "inbound", label: "inbound" },
+  { value: "tagged", label: "tagged" }
+];
+const TTS_PROVIDER_OPTIONS = [
+  { value: "", label: "自动选择（留空）" },
+  { value: "openai", label: "OpenAI" },
+  { value: "elevenlabs", label: "ElevenLabs" },
+  { value: "microsoft", label: "Microsoft / Edge" }
+];
+const AUDIO_TRANSCRIPTION_PROVIDER_OPTIONS = [
+  { value: "", label: "自动选择（留空）" },
+  { value: "openai", label: "OpenAI" },
+  { value: "deepgram", label: "Deepgram" },
+  { value: "groq", label: "Groq" },
+  { value: "google", label: "Google" },
+  { value: "mistral", label: "Mistral" }
+];
 const SUBAGENT_THINKING_OPTIONS = [
   { value: "", label: "跟随默认" },
   { value: "off", label: "off" },
@@ -198,6 +221,278 @@ const PERSONA_FILE_LABELS = {
   "bootstrap.md": "启动引导",
   "memory.md": "长期记忆"
 };
+
+let formControlEnhancerObserver = null;
+let openCustomSelectShell = null;
+
+function getNumberStepPrecision(step) {
+  const text = String(step ?? "");
+  if (!text || text === "any") return 0;
+  const fraction = text.split(".")[1] || "";
+  return fraction.length;
+}
+
+function stepNumberInputValue(input, direction) {
+  if (!(input instanceof HTMLInputElement) || input.type !== "number") return;
+  const stepAttr = input.getAttribute("step");
+  const step = stepAttr && stepAttr !== "any" ? Number(stepAttr) : 1;
+  const minRaw = input.getAttribute("min");
+  const maxRaw = input.getAttribute("max");
+  const minAttr = minRaw === null || minRaw === "" ? null : Number(minRaw);
+  const maxAttr = maxRaw === null || maxRaw === "" ? null : Number(maxRaw);
+  const hasMin = Number.isFinite(minAttr);
+  const hasMax = Number.isFinite(maxAttr);
+  const precision = getNumberStepPrecision(step);
+  const fallbackBase = hasMin ? Number(minAttr) : 0;
+  const isEmpty = input.value === "";
+  const current = isEmpty ? fallbackBase : Number(input.value);
+  let nextValue = Number.isFinite(current) ? current : fallbackBase;
+  const safeStep = Number.isFinite(step) && step > 0 ? step : 1;
+  if (isEmpty) {
+    nextValue = hasMin ? Number(minAttr) : (direction > 0 ? safeStep : -safeStep);
+  } else {
+    nextValue += direction * safeStep;
+  }
+  if (hasMin) nextValue = Math.max(Number(minAttr), nextValue);
+  if (hasMax) nextValue = Math.min(Number(maxAttr), nextValue);
+  nextValue = Number(nextValue.toFixed(Math.max(0, precision)));
+  input.value = String(nextValue);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  input.focus({ preventScroll: true });
+}
+
+function closeCustomSelect(shell = openCustomSelectShell) {
+  if (!(shell instanceof HTMLElement)) return;
+  shell.classList.remove("open");
+  const toggle = shell.querySelector("[data-select-toggle]");
+  toggle?.setAttribute("aria-expanded", "false");
+  if (openCustomSelectShell === shell) {
+    openCustomSelectShell = null;
+  }
+}
+
+function toggleCustomSelect(shell, forceOpen) {
+  if (!(shell instanceof HTMLElement)) return;
+  const shouldOpen = typeof forceOpen === "boolean" ? forceOpen : !shell.classList.contains("open");
+  if (shouldOpen && openCustomSelectShell && openCustomSelectShell !== shell) {
+    closeCustomSelect(openCustomSelectShell);
+  }
+  shell.classList.toggle("open", shouldOpen);
+  const toggle = shell.querySelector("[data-select-toggle]");
+  toggle?.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+  openCustomSelectShell = shouldOpen ? shell : null;
+}
+
+function buildCustomSelectOption(option, isSelected) {
+  const value = String(option.value ?? "");
+  const disabled = option.disabled === true;
+  return `
+    <button
+      type="button"
+      class="select-option${isSelected ? " selected" : ""}"
+      data-select-option="${escapeHtml(value)}"
+      ${disabled ? 'disabled aria-disabled="true"' : ""}
+    >
+      <span class="select-option-label">${escapeHtml(option.textContent || value || "未命名")}</span>
+      ${isSelected ? '<i class="fa-solid fa-check select-option-check"></i>' : ""}
+    </button>
+  `;
+}
+
+function syncCustomSelect(select) {
+  if (!(select instanceof HTMLSelectElement)) return;
+  const shell = select.closest(".select-field-shell");
+  if (!(shell instanceof HTMLElement)) return;
+  const toggle = shell.querySelector("[data-select-toggle]");
+  const valueEl = shell.querySelector("[data-select-value]");
+  const dropdown = shell.querySelector("[data-select-dropdown]");
+  if (!(toggle instanceof HTMLButtonElement) || !(valueEl instanceof HTMLElement) || !(dropdown instanceof HTMLElement)) return;
+
+  const selectedOption = select.selectedOptions?.[0] || select.options?.[select.selectedIndex] || null;
+  const placeholder = select.dataset.placeholder || "请选择";
+  valueEl.textContent = selectedOption?.textContent?.trim() || placeholder;
+  valueEl.classList.toggle("placeholder", !selectedOption || !selectedOption.value);
+  toggle.disabled = select.disabled === true;
+
+  const options = Array.from(select.options || []);
+  dropdown.innerHTML = options
+    .map((option) => buildCustomSelectOption(option, option.selected))
+    .join("");
+}
+
+function selectCustomOption(shell, value) {
+  if (!(shell instanceof HTMLElement)) return;
+  const select = shell.querySelector("select");
+  if (!(select instanceof HTMLSelectElement)) return;
+  const nextValue = String(value ?? "");
+  if (select.value === nextValue) {
+    syncCustomSelect(select);
+    closeCustomSelect(shell);
+    return;
+  }
+  select.value = nextValue;
+  syncCustomSelect(select);
+  closeCustomSelect(shell);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  select.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function enhanceNumberInput(input) {
+  if (!(input instanceof HTMLInputElement) || input.type !== "number") return;
+  if (input.dataset.numberEnhanced === "true") return;
+  if (input.closest(".number-field-shell")) {
+    input.dataset.numberEnhanced = "true";
+    return;
+  }
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "number-field-shell";
+
+  const stepper = document.createElement("div");
+  stepper.className = "number-stepper";
+  stepper.innerHTML = `
+    <button type="button" class="number-stepper-btn" data-number-step="down" aria-label="减少数值">
+      <i class="fa-solid fa-minus"></i>
+    </button>
+    <button type="button" class="number-stepper-btn" data-number-step="up" aria-label="增加数值">
+      <i class="fa-solid fa-plus"></i>
+    </button>
+  `;
+
+  input.parentNode?.insertBefore(wrapper, input);
+  wrapper.appendChild(input);
+  wrapper.appendChild(stepper);
+  input.classList.add("number-field-input");
+  input.dataset.numberEnhanced = "true";
+}
+
+function enhanceSelectInput(select) {
+  if (!(select instanceof HTMLSelectElement)) return;
+  if (select.dataset.selectEnhanced === "true") return;
+  if (select.multiple || Number(select.size || 0) > 1) return;
+  if (select.closest(".select-field-shell")) {
+    select.dataset.selectEnhanced = "true";
+    return;
+  }
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "select-field-shell";
+  if (select.classList.contains("skeuo-input")) wrapper.classList.add("select-field-shell-skeuo");
+  if (select.classList.contains("form-control") || select.id === "cron-form-kind") wrapper.classList.add("select-field-shell-form");
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "select-display";
+  button.setAttribute("data-select-toggle", "true");
+  button.setAttribute("aria-haspopup", "listbox");
+  button.setAttribute("aria-expanded", "false");
+  button.innerHTML = `
+    <span class="select-display-value" data-select-value></span>
+    <span class="select-display-icon" aria-hidden="true">
+      <i class="fa-solid fa-chevron-down"></i>
+    </span>
+  `;
+
+  const dropdown = document.createElement("div");
+  dropdown.className = "select-dropdown";
+  dropdown.setAttribute("data-select-dropdown", "true");
+
+  select.parentNode?.insertBefore(wrapper, select);
+  wrapper.appendChild(select);
+  wrapper.appendChild(button);
+  wrapper.appendChild(dropdown);
+
+  select.classList.add("select-native");
+  select.tabIndex = -1;
+  select.dataset.selectEnhanced = "true";
+  select.addEventListener("change", () => syncCustomSelect(select));
+
+  syncCustomSelect(select);
+}
+
+function enhanceNumberInputs(root = document) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  for (const input of root.querySelectorAll('input[type="number"]')) {
+    enhanceNumberInput(input);
+  }
+}
+
+function enhanceSelectInputs(root = document) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  for (const select of root.querySelectorAll("select")) {
+    enhanceSelectInput(select);
+  }
+}
+
+function initGlobalFormControlEnhancer() {
+  if (!document.body) return;
+  enhanceNumberInputs(document);
+  enhanceSelectInputs(document);
+  if (formControlEnhancerObserver) return;
+
+  document.addEventListener("pointerdown", (event) => {
+    const button = event.target.closest("[data-number-step]");
+    if (!button) return;
+    event.preventDefault();
+    const wrapper = button.closest(".number-field-shell");
+    const input = wrapper?.querySelector('input[type="number"]');
+    if (!input) return;
+    stepNumberInputValue(input, button.getAttribute("data-number-step") === "down" ? -1 : 1);
+  });
+
+  document.addEventListener("click", (event) => {
+    const optionButton = event.target.closest("[data-select-option]");
+    if (optionButton) {
+      const shell = optionButton.closest(".select-field-shell");
+      selectCustomOption(shell, optionButton.getAttribute("data-select-option") || "");
+      return;
+    }
+
+    const toggleButton = event.target.closest("[data-select-toggle]");
+    if (toggleButton) {
+      const shell = toggleButton.closest(".select-field-shell");
+      toggleCustomSelect(shell);
+      return;
+    }
+
+    if (!event.target.closest(".select-field-shell")) {
+      closeCustomSelect();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && openCustomSelectShell) {
+      closeCustomSelect();
+      return;
+    }
+    const toggleButton = event.target.closest?.("[data-select-toggle]");
+    if (!toggleButton) return;
+    if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const shell = toggleButton.closest(".select-field-shell");
+      toggleCustomSelect(shell, true);
+    }
+  });
+
+  formControlEnhancerObserver = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (node.matches?.('input[type="number"]')) {
+          enhanceNumberInput(node);
+        }
+        if (node.matches?.("select")) {
+          enhanceSelectInput(node);
+        }
+        enhanceNumberInputs(node);
+        enhanceSelectInputs(node);
+      }
+    }
+  });
+
+  formControlEnhancerObserver.observe(document.body, { childList: true, subtree: true });
+}
 
 // =========================================
 // Spotlight 交互与全局光照
@@ -1641,13 +1936,19 @@ function formatUptime(seconds) {
   return `${m}分钟`;
 }
 
-function cloneProviderConfig(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+function cloneJsonData(value, fallback = null) {
+  if (value === undefined) return fallback;
   try {
     return JSON.parse(JSON.stringify(value));
   } catch {
-    return {};
+    return fallback;
   }
+}
+
+function cloneProviderConfig(value) {
+  const cloned = cloneJsonData(value, null);
+  if (!cloned || typeof cloned !== "object" || Array.isArray(cloned)) return {};
+  return cloned;
 }
 
 function cloneAgentModelsConfig(value) {
@@ -1738,6 +2039,310 @@ function cloneMemorySearchConfig(value) {
   return Object.keys(source).length > 0 ? source : null;
 }
 
+function trimConfigStringFields(target, fields = []) {
+  if (!target || typeof target !== "object" || Array.isArray(target)) return;
+  for (const key of fields) {
+    if (typeof target[key] !== "string") continue;
+    target[key] = target[key].trim();
+    if (!target[key]) delete target[key];
+  }
+}
+
+function normalizeSecretKey(key) {
+  return String(key || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function isSecretLikeKey(key) {
+  const normalized = normalizeSecretKey(key);
+  if (!normalized) return false;
+  return normalized.includes("apikey")
+    || normalized === "authorization"
+    || normalized.endsWith("authorization")
+    || normalized === "token"
+    || normalized.endsWith("token")
+    || normalized === "secret"
+    || normalized.endsWith("secret")
+    || normalized === "password"
+    || normalized.endsWith("password");
+}
+
+function stripSecretLikeFields(value, { removeAll = false } = {}) {
+  if (Array.isArray(value)) {
+    const cleaned = value
+      .map((item) => stripSecretLikeFields(item, { removeAll }))
+      .filter((item) => item !== undefined);
+    return cleaned.length > 0 ? cleaned : undefined;
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const next = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string" && isSecretLikeKey(key)) {
+      const trimmed = item.trim();
+      if (removeAll || !trimmed || trimmed === REDACTED_API_KEY_TOKEN) {
+        continue;
+      }
+      next[key] = trimmed;
+      continue;
+    }
+    const cleaned = stripSecretLikeFields(item, { removeAll });
+    if (cleaned === undefined) continue;
+    if (Array.isArray(cleaned) && cleaned.length === 0) continue;
+    if (cleaned && typeof cleaned === "object" && !Array.isArray(cleaned) && Object.keys(cleaned).length === 0) {
+      continue;
+    }
+    next[key] = cleaned;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function cloneTtsConfig(value) {
+  const source = cloneOptionalConfigObject(value);
+  if (!source) return null;
+
+  trimConfigStringFields(source, ["auto", "provider", "summaryModel", "mode", "prefsPath"]);
+  source.timeoutMs = normalizeOptionalPositiveInteger(source.timeoutMs);
+  source.maxTextLength = normalizeOptionalPositiveInteger(source.maxTextLength);
+  if (source.timeoutMs === null) delete source.timeoutMs;
+  if (source.maxTextLength === null) delete source.maxTextLength;
+
+  if (source.openai && typeof source.openai === "object" && !Array.isArray(source.openai)) {
+    const openai = cloneProviderConfig(source.openai);
+    trimConfigStringFields(openai, ["baseUrl", "model", "voice", "apiKey", "instructions"]);
+    const speed = Number(openai.speed);
+    if (Number.isFinite(speed) && speed > 0) openai.speed = speed;
+    else delete openai.speed;
+    source.openai = Object.keys(openai).length > 0 ? openai : undefined;
+  }
+
+  for (const sectionKey of ["elevenlabs", "edge", "microsoft"]) {
+    const section = source[sectionKey];
+    if (!section || typeof section !== "object" || Array.isArray(section)) {
+      delete source[sectionKey];
+      continue;
+    }
+    const clonedSection = cloneProviderConfig(section);
+    trimConfigStringFields(clonedSection, [
+      "apiKey",
+      "baseUrl",
+      "voiceId",
+      "modelId",
+      "languageCode",
+      "voice",
+      "lang",
+      "outputFormat",
+      "pitch",
+      "rate",
+      "volume",
+      "proxy"
+    ]);
+    if (clonedSection.voiceSettings && typeof clonedSection.voiceSettings === "object" && !Array.isArray(clonedSection.voiceSettings)) {
+      const voiceSettings = cloneProviderConfig(clonedSection.voiceSettings);
+      if (Object.keys(voiceSettings).length > 0) clonedSection.voiceSettings = voiceSettings;
+      else delete clonedSection.voiceSettings;
+    }
+    source[sectionKey] = Object.keys(clonedSection).length > 0 ? clonedSection : undefined;
+  }
+
+  if (source.modelOverrides && typeof source.modelOverrides === "object" && !Array.isArray(source.modelOverrides)) {
+    const modelOverrides = cloneProviderConfig(source.modelOverrides);
+    source.modelOverrides = Object.keys(modelOverrides).length > 0 ? modelOverrides : undefined;
+  } else {
+    delete source.modelOverrides;
+  }
+
+  if (source.openai === undefined) delete source.openai;
+  if (source.elevenlabs === undefined) delete source.elevenlabs;
+  if (source.edge === undefined) delete source.edge;
+  if (source.microsoft === undefined) delete source.microsoft;
+
+  return Object.keys(source).length > 0 ? source : null;
+}
+
+function cloneAudioTranscriptionConfig(value) {
+  const source = cloneOptionalConfigObject(value);
+  if (!source) return null;
+
+  if (typeof source.enabled !== "boolean") delete source.enabled;
+  trimConfigStringFields(source, ["prompt", "language", "echoFormat", "baseUrl"]);
+  source.maxBytes = normalizeOptionalPositiveInteger(source.maxBytes);
+  source.maxChars = normalizeOptionalPositiveInteger(source.maxChars);
+  source.timeoutSeconds = normalizeOptionalPositiveInteger(source.timeoutSeconds);
+  if (source.maxBytes === null) delete source.maxBytes;
+  if (source.maxChars === null) delete source.maxChars;
+  if (source.timeoutSeconds === null) delete source.timeoutSeconds;
+
+  if (source.headers && typeof source.headers === "object" && !Array.isArray(source.headers)) {
+    const headers = {};
+    for (const [key, item] of Object.entries(source.headers)) {
+      const valueText = toTrimmedString(item);
+      if (!valueText) continue;
+      headers[key] = valueText;
+    }
+    source.headers = Object.keys(headers).length > 0 ? headers : undefined;
+  } else {
+    delete source.headers;
+  }
+
+  const providerOptions = cloneJsonData(source.providerOptions, undefined);
+  if (providerOptions && typeof providerOptions === "object" && !Array.isArray(providerOptions)) {
+    source.providerOptions = providerOptions;
+  } else {
+    delete source.providerOptions;
+  }
+
+  if (source.deepgram && typeof source.deepgram === "object" && !Array.isArray(source.deepgram)) {
+    const deepgram = cloneProviderConfig(source.deepgram);
+    source.deepgram = Object.keys(deepgram).length > 0 ? deepgram : undefined;
+  } else {
+    delete source.deepgram;
+  }
+
+  if (source.attachments && typeof source.attachments === "object" && !Array.isArray(source.attachments)) {
+    const attachments = cloneProviderConfig(source.attachments);
+    source.attachments = Object.keys(attachments).length > 0 ? attachments : undefined;
+  } else {
+    delete source.attachments;
+  }
+
+  if (source.scope && typeof source.scope === "object" && !Array.isArray(source.scope)) {
+    const scope = cloneJsonData(source.scope, undefined);
+    source.scope = scope && typeof scope === "object" && !Array.isArray(scope) ? scope : undefined;
+  } else {
+    delete source.scope;
+  }
+
+  if (Array.isArray(source.models)) {
+    const models = cloneJsonData(source.models, [])
+      .map((entry) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+        const next = cloneProviderConfig(entry);
+        trimConfigStringFields(next, [
+          "provider",
+          "model",
+          "type",
+          "command",
+          "prompt",
+          "language",
+          "profile",
+          "preferredProfile",
+          "baseUrl"
+        ]);
+        if (Array.isArray(next.args)) {
+          next.args = next.args.map((item) => toTrimmedString(item)).filter(Boolean);
+          if (next.args.length === 0) delete next.args;
+        }
+        if (Array.isArray(next.capabilities)) {
+          next.capabilities = next.capabilities.map((item) => toTrimmedString(item)).filter(Boolean);
+          if (next.capabilities.length === 0) delete next.capabilities;
+        }
+        next.maxChars = normalizeOptionalPositiveInteger(next.maxChars);
+        next.maxBytes = normalizeOptionalPositiveInteger(next.maxBytes);
+        next.timeoutSeconds = normalizeOptionalPositiveInteger(next.timeoutSeconds);
+        if (next.maxChars === null) delete next.maxChars;
+        if (next.maxBytes === null) delete next.maxBytes;
+        if (next.timeoutSeconds === null) delete next.timeoutSeconds;
+
+        if (next.headers && typeof next.headers === "object" && !Array.isArray(next.headers)) {
+          const headers = {};
+          for (const [key, item] of Object.entries(next.headers)) {
+            const valueText = toTrimmedString(item);
+            if (!valueText) continue;
+            headers[key] = valueText;
+          }
+          next.headers = Object.keys(headers).length > 0 ? headers : undefined;
+        } else {
+          delete next.headers;
+        }
+
+        const nextProviderOptions = cloneJsonData(next.providerOptions, undefined);
+        if (nextProviderOptions && typeof nextProviderOptions === "object" && !Array.isArray(nextProviderOptions)) {
+          next.providerOptions = nextProviderOptions;
+        } else {
+          delete next.providerOptions;
+        }
+
+        if (next.deepgram && typeof next.deepgram === "object" && !Array.isArray(next.deepgram)) {
+          const deepgram = cloneProviderConfig(next.deepgram);
+          next.deepgram = Object.keys(deepgram).length > 0 ? deepgram : undefined;
+        } else {
+          delete next.deepgram;
+        }
+
+        return Object.keys(next).length > 0 ? next : null;
+      })
+      .filter(Boolean);
+    source.models = models.length > 0 ? models : undefined;
+  } else {
+    delete source.models;
+  }
+
+  if (source.headers === undefined) delete source.headers;
+  if (source.providerOptions === undefined) delete source.providerOptions;
+  if (source.deepgram === undefined) delete source.deepgram;
+  if (source.attachments === undefined) delete source.attachments;
+  if (source.scope === undefined) delete source.scope;
+  if (source.models === undefined) delete source.models;
+
+  return Object.keys(source).length > 0 ? source : null;
+}
+
+function stripManagedTtsConfig(value) {
+  const source = cloneTtsConfig(value);
+  if (!source) return null;
+  delete source.auto;
+  delete source.provider;
+  delete source.summaryModel;
+  delete source.timeoutMs;
+  delete source.maxTextLength;
+
+  if (source.openai && typeof source.openai === "object" && !Array.isArray(source.openai)) {
+    const openai = cloneProviderConfig(source.openai);
+    delete openai.model;
+    delete openai.voice;
+    delete openai.baseUrl;
+    delete openai.apiKey;
+    source.openai = Object.keys(openai).length > 0 ? openai : undefined;
+  }
+
+  if (source.openai === undefined) delete source.openai;
+
+  return Object.keys(source).length > 0 ? source : null;
+}
+
+function stripManagedAudioTranscriptionConfig(value) {
+  const source = cloneAudioTranscriptionConfig(value);
+  if (!source) return null;
+  delete source.enabled;
+  delete source.language;
+  delete source.timeoutSeconds;
+  delete source.maxChars;
+
+  const models = Array.isArray(source.models) ? cloneJsonData(source.models, []) : [];
+  delete source.models;
+  if (models.length > 0) {
+    const extrasModels = models.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+      const next = cloneProviderConfig(entry);
+      if (index < 2) {
+        delete next.provider;
+        delete next.model;
+      }
+      return next;
+    });
+    const hasPrimaryExtra = Object.keys(extrasModels[0] || {}).length > 0;
+    const hasFallbackExtra = Object.keys(extrasModels[1] || {}).length > 0;
+    const hasAdditionalModels = extrasModels.slice(2).some((entry) => entry && Object.keys(entry).length > 0);
+    if (hasPrimaryExtra || hasFallbackExtra || hasAdditionalModels) {
+      source.models = extrasModels;
+    }
+  }
+
+  return Object.keys(source).length > 0 ? source : null;
+}
+
 function normalizeOptionalPositiveNumber(value) {
   if (value === "" || value === null || value === undefined) return null;
   const num = Number(value);
@@ -1766,6 +2371,18 @@ function normalizeComparableMemorySearchConfig(value) {
     if (Object.keys(source.remote).length === 0) delete source.remote;
   }
   return sortKeysDeep(source);
+}
+
+function normalizeComparableTtsConfig(value) {
+  const source = cloneTtsConfig(value);
+  if (!source) return null;
+  return sortKeysDeep(stripSecretLikeFields(source, { removeAll: true }) || null);
+}
+
+function normalizeComparableAudioTranscriptionConfig(value) {
+  const source = cloneAudioTranscriptionConfig(value);
+  if (!source) return null;
+  return sortKeysDeep(stripSecretLikeFields(source, { removeAll: true }) || null);
 }
 
 function listAgentModelRefs(value) {
@@ -1887,7 +2504,9 @@ function captureExpectedModelsState() {
     pdfMaxPages: normalizeOptionalPositiveInteger(state.modelsAdvancedDrafts.pdfMaxPages),
     summarize: cloneOptionalConfigObject(state.modelsAdvancedDrafts.summarize),
     subagents: cloneOptionalConfigObject(state.modelsAdvancedDrafts.subagents),
-    memorySearch: cloneMemorySearchConfig(state.modelsAdvancedDrafts.memorySearch)
+    memorySearch: cloneMemorySearchConfig(state.modelsAdvancedDrafts.memorySearch),
+    ttsConfig: cloneTtsConfig(state.modelsAdvancedDrafts.ttsConfig),
+    audioTranscription: cloneAudioTranscriptionConfig(state.modelsAdvancedDrafts.audioTranscription)
   };
 }
 
@@ -1905,6 +2524,8 @@ function modelsStateMatchesExpected(data, expected) {
   const currentSummarize = normalizeComparableConfigObject(data.summarize);
   const currentSubagents = normalizeComparableConfigObject(data.subagents);
   const currentMemorySearch = normalizeComparableMemorySearchConfig(data.memorySearch);
+  const currentTtsConfig = normalizeComparableTtsConfig(data.ttsConfig);
+  const currentAudioTranscription = normalizeComparableAudioTranscriptionConfig(data.audioTranscription);
 
   const expectedProviders = normalizeComparableProviders(expected.providers || {});
   const expectedAllowlist = normalizeComparableAllowlist(expected.agentsDefaultsModels || {});
@@ -1917,6 +2538,8 @@ function modelsStateMatchesExpected(data, expected) {
   const expectedSummarize = normalizeComparableConfigObject(expected.summarize);
   const expectedSubagents = normalizeComparableConfigObject(expected.subagents);
   const expectedMemorySearch = normalizeComparableMemorySearchConfig(expected.memorySearch);
+  const expectedTtsConfig = normalizeComparableTtsConfig(expected.ttsConfig);
+  const expectedAudioTranscription = normalizeComparableAudioTranscriptionConfig(expected.audioTranscription);
 
   return JSON.stringify(currentProviders) === JSON.stringify(expectedProviders)
     && JSON.stringify(currentAllowlist) === JSON.stringify(expectedAllowlist)
@@ -1928,7 +2551,9 @@ function modelsStateMatchesExpected(data, expected) {
     && currentPdfMaxPages === expectedPdfMaxPages
     && JSON.stringify(currentSummarize) === JSON.stringify(expectedSummarize)
     && JSON.stringify(currentSubagents) === JSON.stringify(expectedSubagents)
-    && JSON.stringify(currentMemorySearch) === JSON.stringify(expectedMemorySearch);
+    && JSON.stringify(currentMemorySearch) === JSON.stringify(expectedMemorySearch)
+    && JSON.stringify(currentTtsConfig) === JSON.stringify(expectedTtsConfig)
+    && JSON.stringify(currentAudioTranscription) === JSON.stringify(expectedAudioTranscription);
 }
 
 function normalizeProviderEditorData(provider) {
@@ -2297,6 +2922,9 @@ function getKnownModelRefs() {
   for (const ref of listAgentModelRefs(state.modelsAdvancedDrafts.pdfModel)) refs.add(ref);
   for (const ref of listAgentModelRefs(state.modelsAdvancedDrafts.summarize?.model)) refs.add(ref);
   for (const ref of listAgentModelRefs(state.modelsAdvancedDrafts.subagents?.model)) refs.add(ref);
+  if (toTrimmedString(state.modelsAdvancedDrafts.ttsConfig?.summaryModel)) {
+    refs.add(toTrimmedString(state.modelsAdvancedDrafts.ttsConfig.summaryModel));
+  }
   return Array.from(refs).sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
 
@@ -2381,6 +3009,50 @@ function getMemorySearchFormState(value = state.modelsAdvancedDrafts.memorySearc
   };
 }
 
+function stringifyAdvancedExtraJson(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length === 0) {
+    return "";
+  }
+  return JSON.stringify(sortKeysDeep(value), null, 2);
+}
+
+function getTtsConfigFormState(value = state.modelsAdvancedDrafts.ttsConfig) {
+  const source = cloneTtsConfig(value) || {};
+  const openai = cloneOptionalConfigObject(source.openai) || {};
+  return {
+    configured: Boolean(cloneTtsConfig(value)),
+    auto: toTrimmedString(source.auto),
+    provider: toTrimmedString(source.provider),
+    summaryModel: toTrimmedString(source.summaryModel),
+    timeoutMs: normalizeOptionalPositiveInteger(source.timeoutMs),
+    maxTextLength: normalizeOptionalPositiveInteger(source.maxTextLength),
+    openaiModel: toTrimmedString(openai.model),
+    openaiVoice: toTrimmedString(openai.voice),
+    openaiBaseUrl: toTrimmedString(openai.baseUrl),
+    openaiApiKey: toTrimmedString(openai.apiKey),
+    extraJson: stringifyAdvancedExtraJson(stripManagedTtsConfig(source))
+  };
+}
+
+function getAudioTranscriptionFormState(value = state.modelsAdvancedDrafts.audioTranscription) {
+  const source = cloneAudioTranscriptionConfig(value) || {};
+  const models = Array.isArray(source.models) ? source.models : [];
+  const primaryEntry = models[0] && typeof models[0] === "object" && !Array.isArray(models[0]) ? models[0] : {};
+  const fallbackEntry = models[1] && typeof models[1] === "object" && !Array.isArray(models[1]) ? models[1] : {};
+  return {
+    configured: Boolean(cloneAudioTranscriptionConfig(value)),
+    enabled: source.enabled === true,
+    language: toTrimmedString(source.language),
+    timeoutSeconds: normalizeOptionalPositiveInteger(source.timeoutSeconds),
+    maxChars: normalizeOptionalPositiveInteger(source.maxChars),
+    primaryProvider: toTrimmedString(primaryEntry.provider),
+    primaryModel: toTrimmedString(primaryEntry.model),
+    fallbackProvider: toTrimmedString(fallbackEntry.provider),
+    fallbackModel: toTrimmedString(fallbackEntry.model),
+    extraJson: stringifyAdvancedExtraJson(stripManagedAudioTranscriptionConfig(source))
+  };
+}
+
 function countConfiguredDedicatedModels() {
   let count = 0;
   for (const item of DEDICATED_MODEL_FIELDS) {
@@ -2395,8 +3067,11 @@ function countConfiguredDedicatedModels() {
 function renderModelsAdvancedSummary() {
   const configuredDedicated = countConfiguredDedicatedModels();
   const memoryInfo = getMemorySearchFormState();
+  const ttsInfo = getTtsConfigFormState();
+  const audioInfo = getAudioTranscriptionFormState();
   const memoryStatus = memoryInfo.enabled ? "已启用" : "未启用";
   const memoryLabel = memoryInfo.provider || "自动选择";
+  const voiceConfiguredCount = Number(ttsInfo.configured) + Number(audioInfo.configured);
   const primaryRefs = [
     getManagedDedicatedModelDraft("imageModel")?.primary,
     getManagedDedicatedModelDraft("pdfModel")?.primary,
@@ -2414,11 +3089,12 @@ function renderModelsAdvancedSummary() {
         <i class="fa-solid fa-sliders"></i>
       </span>
       <span class="models-advanced-summary-main">
-        <span class="models-advanced-summary-title">高级模型与记忆配置</span>
-        <span class="models-advanced-summary-copy">图像、PDF、摘要、子代理和 Embedding 的统一入口。默认收起，只在你要精调时展开。</span>
+        <span class="models-advanced-summary-title">高级模型、记忆与语音配置</span>
+        <span class="models-advanced-summary-copy">图像、PDF、摘要、子代理、Embedding 与语音能力的统一入口。默认收起，只在你要精调时展开。</span>
       </span>
       <span class="models-advanced-summary-meta">
         <span class="status-badge dynamic">专用模型 ${configuredDedicated}/5</span>
+        <span class="status-badge dynamic">语音配置 ${voiceConfiguredCount}/2</span>
         <span class="status-badge ${memoryInfo.enabled ? "ok" : "dynamic"}">记忆搜索 ${memoryStatus}</span>
         <span class="models-advanced-summary-inline">
           <span class="models-advanced-summary-inline-label">Embedding</span>
@@ -2440,7 +3116,9 @@ const ADVANCED_CONFIG_CHIP_DEFS = [
   { key: "pdfModel",              icon: "fa-file-pdf",             title: "PDF 处理" },
   { key: "summarizeModel",        icon: "fa-compress",             title: "摘要模型" },
   { key: "subagentsModel",        icon: "fa-microchip",            title: "子代理" },
-  { key: "memorySearch",          icon: "fa-brain",                title: "记忆搜索" }
+  { key: "memorySearch",          icon: "fa-brain",                title: "记忆搜索" },
+  { key: "ttsConfig",             icon: "fa-volume-high",          title: "TTS 语音播报" },
+  { key: "audioTranscription",    icon: "fa-wave-square",          title: "STT 语音转写" }
 ];
 
 function renderAdvancedConfigChip(def) {
@@ -2454,6 +3132,30 @@ function renderAdvancedConfigChip(def) {
       <div class="adv-config-chip-value">
         <span class="${badgeClass}">${badgeLabel}</span>
         <span class="adv-config-chip-tag muted">${escapeHtml(providerLabel)}</span>
+      </div>`;
+  } else if (def.key === "ttsConfig") {
+    const info = getTtsConfigFormState();
+    const badgeClass = info.configured ? "adv-config-chip-badge ok" : "adv-config-chip-badge muted";
+    const badgeLabel = info.configured ? "已配置" : "未配置";
+    const providerLabel = info.provider || "自动";
+    const modelLabel = info.openaiModel || info.summaryModel;
+    valueHtml = `
+      <div class="adv-config-chip-value">
+        <span class="${badgeClass}">${badgeLabel}</span>
+        <span class="adv-config-chip-tag muted">${escapeHtml(providerLabel)}</span>
+        ${modelLabel ? `<span class="adv-config-chip-tag">${escapeHtml(modelLabel)}</span>` : ""}
+      </div>`;
+  } else if (def.key === "audioTranscription") {
+    const info = getAudioTranscriptionFormState();
+    const badgeClass = info.enabled ? "adv-config-chip-badge ok" : "adv-config-chip-badge muted";
+    const badgeLabel = info.configured ? (info.enabled ? "已启用" : "已关闭") : "自动检测";
+    const providerLabel = info.primaryProvider || "自动";
+    const modelLabel = info.primaryModel || "";
+    valueHtml = `
+      <div class="adv-config-chip-value">
+        <span class="${badgeClass}">${badgeLabel}</span>
+        <span class="adv-config-chip-tag muted">${escapeHtml(providerLabel)}</span>
+        ${modelLabel ? `<span class="adv-config-chip-tag">${escapeHtml(modelLabel)}</span>` : ""}
       </div>`;
   } else {
     const draft = getManagedDedicatedModelDraft(def.key);
@@ -2488,12 +3190,293 @@ function renderModelsAdvancedDetail() {
   return `
     <div class="models-advanced-detail" data-models-advanced-detail>
       <div class="models-config-section-divider">
-        <span class="models-config-section-divider-label">专用模型 &amp; 记忆</span>
+        <span class="models-config-section-divider-label">专用模型、记忆与语音</span>
         <span class="models-config-section-divider-line"></span>
       </div>
       ${renderAdvancedConfigGrid()}
     </div>
   `;
+}
+
+function getAdvancedExtraJsonLabel(configKey) {
+  if (configKey === "ttsConfig") return "TTS 额外 JSON";
+  if (configKey === "audioTranscription") return "STT 额外 JSON";
+  return "高级配置 JSON";
+}
+
+function renderSettingsSwitch({ inputAttr, checked = false, title, descriptionHtml = "" }) {
+  return `
+    <label class="models-toggle-row models-toggle-row-fluid">
+      <span class="models-toggle-copy-block">
+        <span class="models-toggle-title">${escapeHtml(title)}</span>
+        ${descriptionHtml ? `<span class="models-toggle-description">${descriptionHtml}</span>` : ""}
+      </span>
+      <span class="models-switch">
+        <input type="checkbox" ${inputAttr} ${checked ? "checked" : ""} aria-label="${escapeHtml(title)}" />
+        <span class="models-switch-track">
+          <span class="models-switch-glow"></span>
+          <span class="models-switch-thumb"></span>
+        </span>
+      </span>
+    </label>`;
+}
+
+function renderAdvancedExtraJsonEditor(configKey, value, hint) {
+  return `
+    <div class="models-advanced-inner-row">
+      <div class="models-advanced-inner-label">额外 JSON</div>
+      <p class="models-advanced-inner-hint">${hint}</p>
+      <div class="config-row">
+        <label>额外字段</label>
+        <textarea
+          class="skeuo-textarea models-json-config"
+          data-advanced-extra-json="${escapeHtml(configKey)}"
+          placeholder="{\n  &quot;mode&quot;: &quot;final&quot;\n}"
+          spellcheck="false"
+        >${escapeHtml(value || "")}</textarea>
+        <span class="json-error-text is-hidden" data-advanced-extra-json-error="${escapeHtml(configKey)}">
+          <i class="fa-solid fa-triangle-exclamation"></i> JSON 格式必须是对象
+        </span>
+      </div>
+    </div>`;
+}
+
+function renderTtsConfigModalBody() {
+  const info = getTtsConfigFormState();
+  const isRedactedApiKey = info.openaiApiKey === REDACTED_API_KEY_TOKEN;
+  return `
+    <div class="models-advanced-inner-row">
+      <div class="models-advanced-inner-label">自动播报策略</div>
+      <p class="models-advanced-inner-hint">控制自动 TTS 的触发方式、优先 provider，以及用于自动摘要的模型入口。</p>
+      <div class="models-sheet-inline-pair">
+        <div class="config-row">
+          <label>自动播报模式</label>
+          <select class="skeuo-input" data-tts-auto>
+            ${renderSelectOptions(TTS_AUTO_MODE_OPTIONS, info.auto)}
+          </select>
+          <small class="form-hint">留空时保持网关当前默认值；<code>off</code> 会显式关闭自动播报。</small>
+        </div>
+        <div class="config-row">
+          <label>优先 Provider</label>
+          <select class="skeuo-input" data-tts-provider>
+            ${renderSelectOptions(TTS_PROVIDER_OPTIONS, info.provider)}
+          </select>
+          <small class="form-hint">不填时交给 OpenClaw 自动选择可用的语音 provider。</small>
+        </div>
+      </div>
+      <div class="config-row">
+        <label>摘要模型</label>
+        <input
+          type="text"
+          class="skeuo-input form-control-mono"
+          data-tts-summary-model
+          list="models-ref-options"
+          placeholder="如 openai/gpt-4.1-mini"
+          value="${escapeHtml(info.summaryModel || "")}"
+          spellcheck="false"
+        />
+        <small class="form-hint">用于自动 TTS 摘要；建议使用 <code>provider/model</code> 形式。</small>
+      </div>
+    </div>
+    <div class="models-advanced-inner-row">
+      <div class="models-advanced-inner-label">请求限制</div>
+      <p class="models-advanced-inner-hint">这些字段影响网关发起 TTS 时的超时与文本长度限制。</p>
+      <div class="models-sheet-inline-pair">
+        <div class="config-row">
+          <label>超时 (ms)</label>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            class="skeuo-input models-inline-number"
+            data-tts-timeout
+            placeholder="如 30000"
+            value="${escapeHtml(info.timeoutMs ?? "")}"
+          />
+        </div>
+        <div class="config-row">
+          <label>最大文本长度</label>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            class="skeuo-input models-inline-number"
+            data-tts-max-text-length
+            placeholder="如 4000"
+            value="${escapeHtml(info.maxTextLength ?? "")}"
+          />
+        </div>
+      </div>
+    </div>
+    <div class="models-advanced-inner-row">
+      <div class="models-advanced-inner-label">OpenAI TTS 常用字段</div>
+      <p class="models-advanced-inner-hint">首版先把最常用的 OpenAI model / voice / endpoint 做成结构化表单，其余 provider 高级字段交给下方 JSON 兜底。</p>
+      <div class="models-sheet-inline-pair">
+        <div class="config-row">
+          <label>OpenAI 模型</label>
+          <input
+            type="text"
+            class="skeuo-input form-control-mono"
+            data-tts-openai-model
+            placeholder="如 gpt-4o-mini-tts"
+            value="${escapeHtml(info.openaiModel || "")}"
+            spellcheck="false"
+          />
+        </div>
+        <div class="config-row">
+          <label>Voice</label>
+          <input
+            type="text"
+            class="skeuo-input form-control-mono"
+            data-tts-openai-voice
+            placeholder="如 alloy"
+            value="${escapeHtml(info.openaiVoice || "")}"
+            spellcheck="false"
+          />
+        </div>
+      </div>
+      <div class="config-row">
+        <label>OpenAI Base URL</label>
+        <input
+          type="text"
+          class="skeuo-input form-control-mono"
+          data-tts-openai-base-url
+          placeholder="https://api.openai.com/v1"
+          value="${escapeHtml(info.openaiBaseUrl || "")}"
+          spellcheck="false"
+        />
+      </div>
+      <div class="config-row">
+        <label>OpenAI API Key</label>
+        <div class="provider-secret-wrap">
+          <input
+            type="password"
+            class="provider-api-key skeuo-input models-memory-api-key"
+            data-tts-openai-api-key
+            placeholder="${isRedactedApiKey ? "检测到脱敏密钥（不修改可保持原样）" : "sk-..."}"
+            autocomplete="off"
+            value="${escapeHtml(info.openaiApiKey || "")}"
+          />
+          <button
+            type="button"
+            class="provider-secret-toggle"
+            data-tts-secret-toggle
+            aria-label="显示 TTS API Key"
+            title="显示 TTS API Key"
+          >
+            <i class="fa-regular fa-eye"></i>
+          </button>
+        </div>
+        ${isRedactedApiKey ? '<small class="form-hint">当前显示的是脱敏占位符。保持不变会沿用旧密钥，输入新值可覆盖。</small>' : '<small class="form-hint">留空时沿用环境变量或已有 provider 凭证。</small>'}
+      </div>
+    </div>
+    ${renderAdvancedExtraJsonEditor(
+      "ttsConfig",
+      info.extraJson,
+      "用于补充 `mode`、`prefsPath`、`modelOverrides`、`elevenlabs`、`microsoft`，或 `openai.speed` / `openai.instructions` 这类结构化表单未暴露的字段。"
+    )}`;
+}
+
+function renderAudioTranscriptionModalBody() {
+  const info = getAudioTranscriptionFormState();
+  return `
+    <div class="models-memory-toggle-strip">
+      ${renderSettingsSwitch({
+        inputAttr: "data-audio-transcription-enabled",
+        checked: info.enabled,
+        title: "启用语音转写",
+        descriptionHtml: '关闭后会写入 <code>enabled: false</code>，从而停用音频转写的自动检测链路。'
+      })}
+    </div>
+    <div class="models-advanced-inner-row">
+      <div class="models-advanced-inner-label">默认执行策略</div>
+      <p class="models-advanced-inner-hint">这些字段对应 <code>tools.media.audio</code> 的常用根配置，适合用来统一控制转写语言和请求上限。</p>
+      <div class="models-sheet-inline-pair">
+        <div class="config-row">
+          <label>语言提示</label>
+          <input
+            type="text"
+            class="skeuo-input form-control-mono"
+            data-audio-transcription-language
+            placeholder="如 zh / en"
+            value="${escapeHtml(info.language || "")}"
+            spellcheck="false"
+          />
+        </div>
+        <div class="config-row">
+          <label>超时 (秒)</label>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            class="skeuo-input models-inline-number"
+            data-audio-transcription-timeout
+            placeholder="如 30"
+            value="${escapeHtml(info.timeoutSeconds ?? "")}"
+          />
+        </div>
+      </div>
+      <div class="config-row">
+        <label>最大转写字符数</label>
+        <input
+          type="number"
+          min="1"
+          step="1"
+          class="skeuo-input models-inline-number"
+          data-audio-transcription-max-chars
+          placeholder="如 3000"
+          value="${escapeHtml(info.maxChars ?? "")}"
+        />
+        <small class="form-hint">留空表示沿用 OpenClaw 默认行为，不额外裁剪 transcript。</small>
+      </div>
+    </div>
+    <div class="models-advanced-inner-row">
+      <div class="models-advanced-inner-label">主转写链路</div>
+      <p class="models-advanced-inner-hint">首版结构化表单只管理两条常用 provider entry。更复杂的 CLI / 第三条链路 / providerOptions 请写到额外 JSON。</p>
+      <div class="models-sheet-inline-pair">
+        <div class="config-row">
+          <label>主 Provider</label>
+          <select class="skeuo-input" data-audio-transcription-primary-provider>
+            ${renderSelectOptions(AUDIO_TRANSCRIPTION_PROVIDER_OPTIONS, info.primaryProvider)}
+          </select>
+        </div>
+        <div class="config-row">
+          <label>主模型</label>
+          <input
+            type="text"
+            class="skeuo-input form-control-mono"
+            data-audio-transcription-primary-model
+            placeholder="如 gpt-4o-mini-transcribe"
+            value="${escapeHtml(info.primaryModel || "")}"
+            spellcheck="false"
+          />
+        </div>
+      </div>
+      <div class="models-sheet-inline-pair">
+        <div class="config-row">
+          <label>回退 Provider</label>
+          <select class="skeuo-input" data-audio-transcription-fallback-provider>
+            ${renderSelectOptions(AUDIO_TRANSCRIPTION_PROVIDER_OPTIONS, info.fallbackProvider)}
+          </select>
+        </div>
+        <div class="config-row">
+          <label>回退模型</label>
+          <input
+            type="text"
+            class="skeuo-input form-control-mono"
+            data-audio-transcription-fallback-model
+            placeholder="如 nova-3"
+            value="${escapeHtml(info.fallbackModel || "")}"
+            spellcheck="false"
+          />
+        </div>
+      </div>
+    </div>
+    ${renderAdvancedExtraJsonEditor(
+      "audioTranscription",
+      info.extraJson,
+      "这里可补充 `baseUrl`、`headers`、`providerOptions`、`echoTranscript`，以及更复杂的 `models` 链路。若出现 `models: [{}, {}, ...]`，前两个空对象分别代表主链路和回退链路的额外字段占位。"
+    )}`;
 }
 
 function renderAdvancedConfigModalContent(configKey) {
@@ -2502,6 +3485,12 @@ function renderAdvancedConfigModalContent(configKey) {
 
   if (configKey === "memorySearch") {
     return renderMemorySearchModalBody();
+  }
+  if (configKey === "ttsConfig") {
+    return renderTtsConfigModalBody();
+  }
+  if (configKey === "audioTranscription") {
+    return renderAudioTranscriptionModalBody();
   }
 
   const dedicatedDef = DEDICATED_MODEL_FIELDS.find((d) => d.key === configKey);
@@ -2575,11 +3564,12 @@ function renderMemorySearchModalBody() {
   const isRedactedApiKey = info.apiKey === REDACTED_API_KEY_TOKEN;
   return `
     <div class="models-memory-toggle-strip">
-      <label class="models-toggle-row">
-        <input type="checkbox" data-memory-search-enabled ${info.enabled ? "checked" : ""} />
-        <span>启用记忆搜索</span>
-      </label>
-      <p class="models-memory-toggle-copy">关闭时不会主动清空高级配置；再次启用后仍会沿用当前记忆检索设置。</p>
+      ${renderSettingsSwitch({
+        inputAttr: "data-memory-search-enabled",
+        checked: info.enabled,
+        title: "启用记忆搜索",
+        descriptionHtml: "关闭时不会主动清空高级配置；再次启用后仍会沿用当前记忆检索设置。"
+      })}
     </div>
     <div class="models-memory-inner-row">
       <div class="models-memory-inner-label">Embedding Provider 与模型</div>
@@ -2672,9 +3662,15 @@ function openAdvancedConfigModal(configKey) {
     const dedicatedDef = DEDICATED_MODEL_FIELDS.find((d) => d.key === configKey);
     subtitleEl.textContent = configKey === "memorySearch"
       ? "配置 agents.defaults.memorySearch — 控制 Embedding Provider 与记忆检索行为"
-      : (dedicatedDef?.hint || "");
+      : configKey === "ttsConfig"
+        ? "配置 messages.tts — 控制自动语音播报、Provider 与 OpenAI TTS 常用字段"
+        : configKey === "audioTranscription"
+          ? "配置 tools.media.audio — 控制音频转写链路、语言与回退策略"
+          : (dedicatedDef?.hint || "");
   }
   if (bodyEl) bodyEl.innerHTML = renderAdvancedConfigModalContent(configKey);
+  validateAdvancedExtraJsonEditor(configKey, { strict: false });
+  if (bodyEl) bodyEl.scrollTop = 0;
 
   modal.setAttribute("data-config-modal-key", configKey);
   modal.setAttribute("aria-hidden", "false");
@@ -2788,6 +3784,196 @@ function buildMemorySearchDraft(base, managed) {
   return Object.keys(source).length > 0 ? source : null;
 }
 
+function parseAdvancedExtraJsonText(rawValue, { label = "高级配置 JSON", fallback = null, strict = false } = {}) {
+  const raw = toTrimmedString(rawValue);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("JSON 必须是对象");
+    }
+    return cloneJsonData(parsed, null);
+  } catch (err) {
+    if (strict) {
+      throw new Error(`${label} 格式错误：${err.message || err}`);
+    }
+    const fallbackCloned = cloneJsonData(fallback, null);
+    return fallbackCloned && typeof fallbackCloned === "object" && !Array.isArray(fallbackCloned)
+      ? fallbackCloned
+      : null;
+  }
+}
+
+function setAdvancedExtraJsonErrorState(configKey, hasError) {
+  const textarea = document.querySelector(`[data-advanced-extra-json="${configKey}"]`);
+  const errorText = document.querySelector(`[data-advanced-extra-json-error="${configKey}"]`);
+  if (textarea) textarea.classList.toggle("json-error", hasError === true);
+  if (errorText) errorText.classList.toggle("is-hidden", hasError !== true);
+}
+
+function validateAdvancedExtraJsonEditor(configKey, { strict = false } = {}) {
+  const textarea = document.querySelector(`[data-advanced-extra-json="${configKey}"]`);
+  if (!textarea) return true;
+  try {
+    parseAdvancedExtraJsonText(textarea.value, {
+      label: getAdvancedExtraJsonLabel(configKey),
+      strict: true
+    });
+    setAdvancedExtraJsonErrorState(configKey, false);
+    return true;
+  } catch (err) {
+    setAdvancedExtraJsonErrorState(configKey, true);
+    if (strict) throw err;
+    return false;
+  }
+}
+
+function buildTtsConfigDraft(base, managed, extraJsonText, { strictJson = false } = {}) {
+  const extraConfig = parseAdvancedExtraJsonText(extraJsonText, {
+    label: getAdvancedExtraJsonLabel("ttsConfig"),
+    fallback: stripManagedTtsConfig(base),
+    strict: strictJson
+  }) || {};
+  const source = cloneProviderConfig(extraConfig);
+  const openai = source.openai && typeof source.openai === "object" && !Array.isArray(source.openai)
+    ? cloneProviderConfig(source.openai)
+    : {};
+
+  delete source.auto;
+  delete source.provider;
+  delete source.summaryModel;
+  delete source.timeoutMs;
+  delete source.maxTextLength;
+  delete source.openai;
+  delete openai.model;
+  delete openai.voice;
+  delete openai.baseUrl;
+  delete openai.apiKey;
+
+  const auto = toTrimmedString(managed?.auto);
+  const provider = toTrimmedString(managed?.provider);
+  const summaryModel = toTrimmedString(managed?.summaryModel);
+  const openaiModel = toTrimmedString(managed?.openaiModel);
+  const openaiVoice = toTrimmedString(managed?.openaiVoice);
+  const openaiBaseUrl = toTrimmedString(managed?.openaiBaseUrl);
+  const openaiApiKey = toTrimmedString(managed?.openaiApiKey);
+  const timeoutMs = normalizeOptionalPositiveInteger(managed?.timeoutMs);
+  const maxTextLength = normalizeOptionalPositiveInteger(managed?.maxTextLength);
+  const shouldMaterialize = Boolean(
+    auto
+    || provider
+    || summaryModel
+    || openaiModel
+    || openaiVoice
+    || openaiBaseUrl
+    || openaiApiKey
+    || timeoutMs !== null
+    || maxTextLength !== null
+    || Object.keys(source).length > 0
+    || Object.keys(openai).length > 0
+    || cloneTtsConfig(base)
+  );
+
+  if (!shouldMaterialize) return null;
+
+  if (auto) source.auto = auto;
+  if (provider) source.provider = provider;
+  if (summaryModel) source.summaryModel = summaryModel;
+  if (timeoutMs !== null) source.timeoutMs = timeoutMs;
+  if (maxTextLength !== null) source.maxTextLength = maxTextLength;
+  if (openaiModel) openai.model = openaiModel;
+  if (openaiVoice) openai.voice = openaiVoice;
+  if (openaiBaseUrl) openai.baseUrl = openaiBaseUrl;
+  if (openaiApiKey && openaiApiKey !== REDACTED_API_KEY_TOKEN) {
+    openai.apiKey = openaiApiKey;
+  }
+  if (Object.keys(openai).length > 0) {
+    source.openai = openai;
+  }
+
+  return cloneTtsConfig(source);
+}
+
+function buildAudioTranscriptionDraft(base, managed, extraJsonText, { strictJson = false } = {}) {
+  const extraConfig = parseAdvancedExtraJsonText(extraJsonText, {
+    label: getAdvancedExtraJsonLabel("audioTranscription"),
+    fallback: stripManagedAudioTranscriptionConfig(base),
+    strict: strictJson
+  }) || {};
+  const source = cloneProviderConfig(extraConfig);
+  const rawExtraModels = Array.isArray(source.models) ? cloneJsonData(source.models, []) : [];
+
+  delete source.enabled;
+  delete source.language;
+  delete source.timeoutSeconds;
+  delete source.maxChars;
+  delete source.models;
+
+  const primaryProvider = toTrimmedString(managed?.primaryProvider);
+  const primaryModel = toTrimmedString(managed?.primaryModel);
+  const fallbackProvider = toTrimmedString(managed?.fallbackProvider);
+  const fallbackModel = toTrimmedString(managed?.fallbackModel);
+  const language = toTrimmedString(managed?.language);
+  const timeoutSeconds = normalizeOptionalPositiveInteger(managed?.timeoutSeconds);
+  const maxChars = normalizeOptionalPositiveInteger(managed?.maxChars);
+  const nextModels = rawExtraModels.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return {};
+    return cloneProviderConfig(entry);
+  });
+  while (nextModels.length < 2) nextModels.push({});
+
+  for (const [index, pair] of [
+    [0, { provider: primaryProvider, model: primaryModel }],
+    [1, { provider: fallbackProvider, model: fallbackModel }]
+  ]) {
+    const entry = nextModels[index] && typeof nextModels[index] === "object" && !Array.isArray(nextModels[index])
+      ? cloneProviderConfig(nextModels[index])
+      : {};
+    delete entry.provider;
+    delete entry.model;
+    if (pair.provider || pair.model) {
+      delete entry.type;
+      delete entry.command;
+      delete entry.args;
+      if (pair.provider) entry.provider = pair.provider;
+      if (pair.model) entry.model = pair.model;
+    }
+    nextModels[index] = entry;
+  }
+
+  const compactModels = nextModels
+    .map((entry) => {
+      const normalized = entry && typeof entry === "object" && !Array.isArray(entry)
+        ? cloneProviderConfig(entry)
+        : {};
+      return Object.keys(normalized).length > 0 ? normalized : null;
+    })
+    .filter(Boolean);
+  const shouldMaterialize = Boolean(
+    managed?.enabled
+    || primaryProvider
+    || primaryModel
+    || fallbackProvider
+    || fallbackModel
+    || language
+    || timeoutSeconds !== null
+    || maxChars !== null
+    || Object.keys(source).length > 0
+    || compactModels.length > 0
+    || cloneAudioTranscriptionConfig(base)
+  );
+
+  if (!shouldMaterialize) return null;
+
+  source.enabled = managed?.enabled === true;
+  if (language) source.language = language;
+  if (timeoutSeconds !== null) source.timeoutSeconds = timeoutSeconds;
+  if (maxChars !== null) source.maxChars = maxChars;
+  if (compactModels.length > 0) source.models = compactModels;
+
+  return cloneAudioTranscriptionConfig(source);
+}
+
 function readDedicatedModelDraftFromDom(modelKey) {
   const root = document.querySelector(`[data-agent-model-editor="${modelKey}"]`);
   if (!root) return getManagedDedicatedModelDraft(modelKey);
@@ -2798,38 +3984,84 @@ function readDedicatedModelDraftFromDom(modelKey) {
   return cloneAgentModelConfig({ primary, fallbacks });
 }
 
-function buildModelsAdvancedDraftsFromDom() {
+function buildModelsAdvancedDraftsFromDom({ strictJson = false } = {}) {
+  const memoryInfo = getMemorySearchFormState(state.modelsAdvancedDrafts.memorySearch);
+  const ttsInfo = getTtsConfigFormState(state.modelsAdvancedDrafts.ttsConfig);
+  const audioInfo = getAudioTranscriptionFormState(state.modelsAdvancedDrafts.audioTranscription);
   return {
     imageModel: readDedicatedModelDraftFromDom("imageModel"),
     imageGenerationModel: readDedicatedModelDraftFromDom("imageGenerationModel"),
     pdfModel: readDedicatedModelDraftFromDom("pdfModel"),
-    pdfMaxBytesMb: normalizeOptionalPositiveNumber(document.querySelector("[data-pdf-max-bytes]")?.value),
-    pdfMaxPages: normalizeOptionalPositiveInteger(document.querySelector("[data-pdf-max-pages]")?.value),
+    pdfMaxBytesMb: document.querySelector("[data-pdf-max-bytes]")
+      ? normalizeOptionalPositiveNumber(document.querySelector("[data-pdf-max-bytes]")?.value)
+      : normalizeOptionalPositiveNumber(state.modelsAdvancedDrafts.pdfMaxBytesMb),
+    pdfMaxPages: document.querySelector("[data-pdf-max-pages]")
+      ? normalizeOptionalPositiveInteger(document.querySelector("[data-pdf-max-pages]")?.value)
+      : normalizeOptionalPositiveInteger(state.modelsAdvancedDrafts.pdfMaxPages),
     summarize: mergeManagedConfigFields(state.modelsAdvancedDrafts.summarize, {
       model: readDedicatedModelDraftFromDom("summarizeModel"),
-      timeoutSeconds: normalizeOptionalPositiveInteger(document.querySelector("[data-summarize-timeout]")?.value)
+      timeoutSeconds: document.querySelector("[data-summarize-timeout]")
+        ? normalizeOptionalPositiveInteger(document.querySelector("[data-summarize-timeout]")?.value)
+        : normalizeOptionalPositiveInteger(state.modelsAdvancedDrafts.summarize?.timeoutSeconds)
     }),
     subagents: mergeManagedConfigFields(state.modelsAdvancedDrafts.subagents, {
       model: readDedicatedModelDraftFromDom("subagentsModel"),
-      thinking: toTrimmedString(document.querySelector("[data-subagents-thinking]")?.value)
+      thinking: document.querySelector("[data-subagents-thinking]")
+        ? toTrimmedString(document.querySelector("[data-subagents-thinking]")?.value)
+        : toTrimmedString(state.modelsAdvancedDrafts.subagents?.thinking)
     }),
     memorySearch: buildMemorySearchDraft(state.modelsAdvancedDrafts.memorySearch, {
-      enabled: document.querySelector("[data-memory-search-enabled]")?.checked === true,
-      provider: document.querySelector("[data-memory-search-provider]")?.value,
-      model: document.querySelector("[data-memory-search-model]")?.value,
-      baseUrl: document.querySelector("[data-memory-search-base-url]")?.value,
-      apiKey: document.querySelector("[data-memory-search-api-key]")?.value,
-      fallback: document.querySelector("[data-memory-search-fallback]")?.value
-    })
+      enabled: document.querySelector("[data-memory-search-enabled]")
+        ? document.querySelector("[data-memory-search-enabled]")?.checked === true
+        : memoryInfo.enabled,
+      provider: document.querySelector("[data-memory-search-provider]")?.value ?? memoryInfo.provider,
+      model: document.querySelector("[data-memory-search-model]")?.value ?? memoryInfo.model,
+      baseUrl: document.querySelector("[data-memory-search-base-url]")?.value ?? memoryInfo.baseUrl,
+      apiKey: document.querySelector("[data-memory-search-api-key]")?.value ?? memoryInfo.apiKey,
+      fallback: document.querySelector("[data-memory-search-fallback]")?.value ?? memoryInfo.fallback
+    }),
+    ttsConfig: buildTtsConfigDraft(
+      state.modelsAdvancedDrafts.ttsConfig,
+      {
+        auto: document.querySelector("[data-tts-auto]")?.value ?? ttsInfo.auto,
+        provider: document.querySelector("[data-tts-provider]")?.value ?? ttsInfo.provider,
+        summaryModel: document.querySelector("[data-tts-summary-model]")?.value ?? ttsInfo.summaryModel,
+        timeoutMs: document.querySelector("[data-tts-timeout]")?.value ?? ttsInfo.timeoutMs,
+        maxTextLength: document.querySelector("[data-tts-max-text-length]")?.value ?? ttsInfo.maxTextLength,
+        openaiModel: document.querySelector("[data-tts-openai-model]")?.value ?? ttsInfo.openaiModel,
+        openaiVoice: document.querySelector("[data-tts-openai-voice]")?.value ?? ttsInfo.openaiVoice,
+        openaiBaseUrl: document.querySelector("[data-tts-openai-base-url]")?.value ?? ttsInfo.openaiBaseUrl,
+        openaiApiKey: document.querySelector("[data-tts-openai-api-key]")?.value ?? ttsInfo.openaiApiKey
+      },
+      document.querySelector('[data-advanced-extra-json="ttsConfig"]')?.value ?? ttsInfo.extraJson,
+      { strictJson }
+    ),
+    audioTranscription: buildAudioTranscriptionDraft(
+      state.modelsAdvancedDrafts.audioTranscription,
+      {
+        enabled: document.querySelector("[data-audio-transcription-enabled]")
+          ? document.querySelector("[data-audio-transcription-enabled]")?.checked === true
+          : audioInfo.enabled,
+        language: document.querySelector("[data-audio-transcription-language]")?.value ?? audioInfo.language,
+        timeoutSeconds: document.querySelector("[data-audio-transcription-timeout]")?.value ?? audioInfo.timeoutSeconds,
+        maxChars: document.querySelector("[data-audio-transcription-max-chars]")?.value ?? audioInfo.maxChars,
+        primaryProvider: document.querySelector("[data-audio-transcription-primary-provider]")?.value ?? audioInfo.primaryProvider,
+        primaryModel: document.querySelector("[data-audio-transcription-primary-model]")?.value ?? audioInfo.primaryModel,
+        fallbackProvider: document.querySelector("[data-audio-transcription-fallback-provider]")?.value ?? audioInfo.fallbackProvider,
+        fallbackModel: document.querySelector("[data-audio-transcription-fallback-model]")?.value ?? audioInfo.fallbackModel
+      },
+      document.querySelector('[data-advanced-extra-json="audioTranscription"]')?.value ?? audioInfo.extraJson,
+      { strictJson }
+    )
   };
 }
 
-function syncModelsAdvancedDraftsFromDom() {
+function syncModelsAdvancedDraftsFromDom({ strictJson = false } = {}) {
   // sync when the detail panel is visible OR when the config modal is open
   const hasDetail = !!document.querySelector("[data-models-advanced-detail]");
   const hasModal = $("models-config-modal")?.classList.contains("show");
   if (!$("models-advanced-panel") || (!hasDetail && !hasModal)) return;
-  state.modelsAdvancedDrafts = buildModelsAdvancedDraftsFromDom();
+  state.modelsAdvancedDrafts = buildModelsAdvancedDraftsFromDom({ strictJson });
 }
 
 function renderModelsAdvancedPanels() {
@@ -2856,19 +4088,6 @@ function renderModelsBaseLayout() {
       <div id="models-advanced-panel"></div>
     </div>
     <datalist id="models-ref-options"></datalist>
-    <div id="models-config-modal" class="provider-modal-shell" aria-hidden="true">
-      <div class="provider-modal-backdrop" data-config-modal-close></div>
-      <div class="provider-modal-panel">
-        <div class="provider-modal-head">
-          <div>
-            <h3 id="config-modal-title" class="provider-modal-title"></h3>
-            <p id="config-modal-subtitle" class="provider-modal-subtitle"></p>
-          </div>
-          <button class="provider-modal-close" data-config-modal-close aria-label="关闭">×</button>
-        </div>
-        <div class="provider-modal-body" id="config-modal-body" style="padding:24px 30px;overflow-y:auto;"></div>
-      </div>
-    </div>
   `;
   return true;
 }
@@ -2944,7 +4163,9 @@ function applyLoadedModelsData(data) {
     pdfMaxPages: normalizeOptionalPositiveInteger(data.pdfMaxPages),
     summarize: cloneOptionalConfigObject(data.summarize),
     subagents: cloneOptionalConfigObject(data.subagents),
-    memorySearch: cloneMemorySearchConfig(data.memorySearch)
+    memorySearch: cloneMemorySearchConfig(data.memorySearch),
+    ttsConfig: cloneTtsConfig(data.ttsConfig),
+    audioTranscription: cloneAudioTranscriptionConfig(data.audioTranscription)
   };
 
   renderProviderEditor("", {}, "");
@@ -3365,6 +4586,22 @@ function sanitizeMemorySearchForSave(value) {
   return Object.keys(sanitized).length > 0 ? sanitized : null;
 }
 
+function sanitizeTtsConfigForSave(value) {
+  const sanitized = cloneTtsConfig(value);
+  if (!sanitized) return null;
+  const cleaned = stripSecretLikeFields(sanitized, { removeAll: false });
+  if (!cleaned || typeof cleaned !== "object" || Array.isArray(cleaned)) return null;
+  return Object.keys(cleaned).length > 0 ? cleaned : null;
+}
+
+function sanitizeAudioTranscriptionForSave(value) {
+  const sanitized = cloneAudioTranscriptionConfig(value);
+  if (!sanitized) return null;
+  const cleaned = stripSecretLikeFields(sanitized, { removeAll: false });
+  if (!cleaned || typeof cleaned !== "object" || Array.isArray(cleaned)) return null;
+  return Object.keys(cleaned).length > 0 ? cleaned : null;
+}
+
 function syncProviderJsonFromForm(card) {
   if (!card || card.dataset.jsonSyncLock === "1") return;
   const jsonInput = card.querySelector(".provider-json-config");
@@ -3606,7 +4843,7 @@ async function saveModels() {
       return;
     }
 
-    syncModelsAdvancedDraftsFromDom();
+    syncModelsAdvancedDraftsFromDom({ strictJson: true });
 
     const providers = buildProvidersPatchForSave(
       state.modelProvidersDraft,
@@ -3631,6 +4868,8 @@ async function saveModels() {
       summarize: cloneOptionalConfigObject(state.modelsAdvancedDrafts.summarize),
       subagents: cloneOptionalConfigObject(state.modelsAdvancedDrafts.subagents),
       memorySearch: sanitizeMemorySearchForSave(state.modelsAdvancedDrafts.memorySearch),
+      ttsConfig: sanitizeTtsConfigForSave(state.modelsAdvancedDrafts.ttsConfig),
+      audioTranscription: sanitizeAudioTranscriptionForSave(state.modelsAdvancedDrafts.audioTranscription),
       baseHash: state.modelsHash
     };
 
@@ -3648,6 +4887,8 @@ async function saveModels() {
       || payload.summarize
       || payload.subagents
       || payload.memorySearch
+      || payload.ttsConfig
+      || payload.audioTranscription
     );
 
     if (!hasAnyModelsChange) {
@@ -9679,6 +10920,20 @@ function bindEvents() {
       return;
     }
 
+    const ttsSecretToggle = event.target.closest("[data-tts-secret-toggle]");
+    if (ttsSecretToggle) {
+      const input = document.querySelector("[data-tts-openai-api-key]");
+      if (!input) return;
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      ttsSecretToggle.classList.toggle("active", reveal);
+      ttsSecretToggle.setAttribute("aria-label", reveal ? "隐藏 TTS API Key" : "显示 TTS API Key");
+      ttsSecretToggle.setAttribute("title", reveal ? "隐藏 TTS API Key" : "显示 TTS API Key");
+      const icon = ttsSecretToggle.querySelector("i");
+      if (icon) icon.className = reveal ? "fa-regular fa-eye-slash" : "fa-regular fa-eye";
+      return;
+    }
+
     if (event.target.closest("[data-provider-matrix-add]")) {
       openProviderModal({ mode: "create" });
       return;
@@ -9706,12 +10961,101 @@ function bindEvents() {
   modelsContent?.addEventListener("input", (event) => {
     if (!event.target.closest(".models-config-stack") && !event.target.closest("#models-config-modal")) return;
     if (event.target.closest("#models-config-modal")) state.configModalDirty = true;
+    const extraJson = event.target.closest("[data-advanced-extra-json]");
+    if (extraJson) {
+      validateAdvancedExtraJsonEditor(extraJson.getAttribute("data-advanced-extra-json") || "", { strict: false });
+    }
     syncModelsAdvancedDraftsFromDom();
   });
 
   modelsContent?.addEventListener("change", (event) => {
     if (!event.target.closest(".models-config-stack") && !event.target.closest("#models-config-modal")) return;
     if (event.target.closest("#models-config-modal")) state.configModalDirty = true;
+    const extraJson = event.target.closest("[data-advanced-extra-json]");
+    if (extraJson) {
+      validateAdvancedExtraJsonEditor(extraJson.getAttribute("data-advanced-extra-json") || "", { strict: false });
+    }
+    syncModelsAdvancedDraftsFromDom();
+  });
+
+  const modelsConfigModal = $("models-config-modal");
+  modelsConfigModal?.addEventListener("click", async (event) => {
+    const addFallbackBtn = event.target.closest("[data-agent-model-add-fallback]");
+    if (addFallbackBtn) {
+      const modelKey = addFallbackBtn.getAttribute("data-agent-model-add-fallback") || "";
+      const list = document.querySelector(`[data-agent-model-fallback-list="${modelKey}"]`);
+      const nextIndex = list?.querySelectorAll(`[data-agent-model-row="${modelKey}"]`).length || 0;
+      list?.insertAdjacentHTML("beforeend", dedicatedModelFallbackRowTemplate(modelKey, "", nextIndex));
+      list?.querySelector(`[data-agent-model-row="${modelKey}"]:last-child input`)?.focus();
+      syncModelsAdvancedDraftsFromDom();
+      state.configModalDirty = true;
+      return;
+    }
+
+    const removeFallbackBtn = event.target.closest("[data-agent-model-remove-fallback]");
+    if (removeFallbackBtn) {
+      const confirmed = await requestConfirmDialog({
+        title: "删除备选模型",
+        message: "确定删除此备选模型吗？",
+        confirmText: "确认删除",
+        cancelText: "取消",
+        variant: "danger"
+      });
+      if (!confirmed) return;
+      removeFallbackBtn.closest("[data-agent-model-row]")?.remove();
+      state.configModalDirty = true;
+      syncModelsAdvancedDraftsFromDom();
+      return;
+    }
+
+    const memorySecretToggle = event.target.closest("[data-memory-secret-toggle]");
+    if (memorySecretToggle) {
+      const input = document.querySelector("[data-memory-search-api-key]");
+      if (!input) return;
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      memorySecretToggle.classList.toggle("active", reveal);
+      memorySecretToggle.setAttribute("aria-label", reveal ? "隐藏 Embedding API Key" : "显示 Embedding API Key");
+      memorySecretToggle.setAttribute("title", reveal ? "隐藏 Embedding API Key" : "显示 Embedding API Key");
+      const icon = memorySecretToggle.querySelector("i");
+      if (icon) icon.className = reveal ? "fa-regular fa-eye-slash" : "fa-regular fa-eye";
+      return;
+    }
+
+    const ttsSecretToggle = event.target.closest("[data-tts-secret-toggle]");
+    if (ttsSecretToggle) {
+      const input = document.querySelector("[data-tts-openai-api-key]");
+      if (!input) return;
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      ttsSecretToggle.classList.toggle("active", reveal);
+      ttsSecretToggle.setAttribute("aria-label", reveal ? "隐藏 TTS API Key" : "显示 TTS API Key");
+      ttsSecretToggle.setAttribute("title", reveal ? "隐藏 TTS API Key" : "显示 TTS API Key");
+      const icon = ttsSecretToggle.querySelector("i");
+      if (icon) icon.className = reveal ? "fa-regular fa-eye-slash" : "fa-regular fa-eye";
+      return;
+    }
+
+    if (event.target.closest("[data-config-modal-close]")) {
+      await closeAdvancedConfigModal();
+    }
+  });
+
+  modelsConfigModal?.addEventListener("input", (event) => {
+    state.configModalDirty = true;
+    const extraJson = event.target.closest("[data-advanced-extra-json]");
+    if (extraJson) {
+      validateAdvancedExtraJsonEditor(extraJson.getAttribute("data-advanced-extra-json") || "", { strict: false });
+    }
+    syncModelsAdvancedDraftsFromDom();
+  });
+
+  modelsConfigModal?.addEventListener("change", (event) => {
+    state.configModalDirty = true;
+    const extraJson = event.target.closest("[data-advanced-extra-json]");
+    if (extraJson) {
+      validateAdvancedExtraJsonEditor(extraJson.getAttribute("data-advanced-extra-json") || "", { strict: false });
+    }
     syncModelsAdvancedDraftsFromDom();
   });
 
@@ -10197,6 +11541,7 @@ window.applyUpdate = applyUpdate;
 window.rollbackUpdate = rollbackUpdate;
 
 async function bootstrap() {
+  initGlobalFormControlEnhancer();
   bindEvents();
   setModelsApplyState("idle");
   initLogsView();

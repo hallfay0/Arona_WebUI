@@ -109,14 +109,14 @@ Notes:
 
 ## OpenClaw Gateway Source
 
-`openclaw-src/` 包含 OpenClaw 网关完整源码，可用于分析网关 RPC 协议和数据结构。当需要了解某个 gateway method 的返回格式时，应直接查阅网关源码而非猜测。
+`../openclaw-repo/` 包含 OpenClaw 网关完整源码，可用于分析网关 RPC 协议和数据结构。当需要了解某个 gateway method 的返回格式时，应直接查阅网关源码而非猜测。
 
 ### 强制规范：后端改动必须先查阅网关源码
 
-**任何涉及后端改动或功能新增的任务，在实现前必须先查阅 `openclaw-src/` 中的相关源码**，确认：
+**任何涉及后端改动或功能新增的任务，在实现前必须先查阅 `../openclaw-repo/` 中的相关源码**，确认：
 
-1. **RPC 方法签名和返回格式** — 查看 `openclaw-src/src/gateway/server-methods/` 下对应的 handler
-2. **配置结构** — 查看 `openclaw-src/src/config/` 了解 config schema 和字段定义
+1. **RPC 方法签名和返回格式** — 查看 `../openclaw-repo/src/gateway/server-methods/` 下对应的 handler
+2. **配置结构** — 查看 `../openclaw-repo/src/config/` 了解 config schema 和字段定义
 3. **业务逻辑** — 查看相关模块理解网关侧的处理流程和约束
 4. **已有能力** — 确认网关是否已提供所需 RPC，避免重复造轮子
 
