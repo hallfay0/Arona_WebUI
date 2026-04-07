@@ -41,6 +41,14 @@ No tests or lint scripts exist in this project.
 
 ---
 
+## External Codebase
+
+- **OpenClaw 网关源码**: `/home/lingshi/workspace/openclaw/openclaw-repo/`
+- 涉及后端改动时，必须先查阅网关源码确认 RPC 方法、配置结构和业务逻辑（详见 `backend/architecture.md`）
+- GitNexus 索引和 ABCoder AST 解析均应覆盖此目录，供 MCP 工具查询
+
+---
+
 ## Deployment
 
 - Server on `127.0.0.1:18790`
