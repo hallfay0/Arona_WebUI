@@ -2009,14 +2009,36 @@ body {
 
 .chat-input-actions {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: center;
   gap: 12px;
 }
 
-.chat-input-hint {
-  font-size: 0.76rem;
-  color: var(--foreground-muted);
+#chat-send-btn {
+  flex: 0 0 auto;
+}
+
+.chat-create-modal-panel {
+  max-width: 560px;
+}
+
+.chat-create-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  overflow: visible;
+}
+
+.chat-create-modal-body .config-row {
+  gap: 8px;
+}
+
+.chat-create-modal-body .select-field-shell {
+  width: 100%;
+}
+
+.chat-create-modal-body .select-dropdown {
+  z-index: 140;
 }
 
 .chat-mobile-toggle {
@@ -3719,10 +3741,39 @@ button {
   background: var(--glass-bg);
   padding: 10px;
   border-radius: 8px;
-  color: white;
+  color: var(--foreground);
+  border: 1px solid var(--border-default);
+  transition: opacity var(--motion-duration-fast) var(--motion-ease-out),
+    transform var(--motion-duration-fast) var(--motion-ease-out);
+}
+
+.mobile-menu-btn.sidebar-open {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-20px);
+}
+
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: var(--bg-deep, rgba(0, 0, 0, 0.45));
+  z-index: 98;
+  opacity: 0;
+  transition: opacity var(--motion-duration-base) var(--motion-ease-out);
+  pointer-events: none;
+}
+
+.sidebar-overlay.active {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 @media (max-width: 1024px) {
+  .sidebar-overlay {
+    display: block;
+  }
+
   .admin-sidebar {
     position: fixed;
     left: -260px;
@@ -3846,10 +3897,6 @@ button {
   .chat-input-actions {
     flex-direction: column;
     align-items: stretch;
-  }
-
-  .chat-input-hint {
-    order: 2;
   }
 
   #chat-send-btn {

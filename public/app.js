@@ -114,7 +114,12 @@ const state = {
     historyBatchSize: 10,
     historyMaxLimit: 1000,
     hasOlderMessages: false,
-    loadingOlderMessages: false
+    loadingOlderMessages: false,
+    globalDefaultModelRef: "",
+    selectedAgentId: "",
+    selectedModelRef: "",
+    chatAgents: [],
+    chatModels: []
   }
 };
 
@@ -2413,6 +2418,53 @@ function buildProviderModelRef(providerKey, modelId) {
   return `${provider}/${model}`;
 }
 
+function collectProviderModelRefs(providersPayload = {}) {
+  const refs = [];
+  for (const [providerKey, provider] of Object.entries(providersPayload || {})) {
+    for (const row of getProviderModelRows(provider)) {
+      const ref = buildProviderModelRef(providerKey, row?.id);
+      if (ref) refs.push(ref);
+    }
+  }
+  return Array.from(new Set(refs));
+}
+
+function normalizeModelCatalogRefs(modelListPayload, providersPayload = null) {
+  const entries = Array.isArray(modelListPayload?.models)
+    ? modelListPayload.models
+    : Array.isArray(modelListPayload)
+      ? modelListPayload
+      : [];
+
+  const refs = Array.from(new Set(entries.map((entry) => {
+    if (typeof entry === "string") {
+      return String(entry).trim();
+    }
+
+    const provider = String(entry?.provider || "").trim();
+    const modelId = String(entry?.id || entry?.name || "").trim();
+    return buildProviderModelRef(provider, modelId);
+  }).filter(Boolean)));
+
+  if (refs.length > 0) return refs;
+  return collectProviderModelRefs(providersPayload);
+}
+
+async function ensurePersonaModelDefaultOptionsLoaded() {
+  if (Array.isArray(state.modelDefaultOptions) && state.modelDefaultOptions.length > 0) {
+    return state.modelDefaultOptions;
+  }
+
+  try {
+    const data = await api("/api/models");
+    state.modelDefaultOptions = normalizeModelCatalogRefs(data?.modelList, data?.modelsConfig?.providers);
+  } catch (error) {
+    console.error("Failed to load persona model options:", error);
+  }
+
+  return state.modelDefaultOptions;
+}
+
 function getProviderModelRefs(providerKey, provider) {
   return getProviderModelRows(provider)
     .map((row) => buildProviderModelRef(providerKey, row.id))
@@ -4153,6 +4205,7 @@ function applyLoadedModelsData(data) {
   for (const [key, provider] of Object.entries(providers)) {
     state.modelProvidersDraft[key] = cloneProviderConfig(provider);
   }
+  state.modelDefaultOptions = normalizeModelCatalogRefs(data?.modelList, providers);
   state.agentsDefaultsModelsDraft = cloneAgentModelsConfig(data.agentsDefaultsModels || {});
   state.agentsDefaultModelDraft = cloneAgentDefaultModelConfig(data.agentsDefaultModel);
   state.modelsAdvancedDrafts = {
@@ -7934,6 +7987,7 @@ function normalizePersonaAgent(source, fallbackKey = "", index = 0) {
     avatar: toTrimmedString(identity.avatar || item.avatar || ""),
     avatarUrl: toTrimmedString(identity.avatarUrl || item.avatarUrl || ""),
     theme: toTrimmedString(identity.theme || item.theme || ""),
+    model: toTrimmedString(item.model || ""),
     memorySearch: normalizePersonaMemorySearch(item.memorySearch),
     raw: item
   };
@@ -8133,14 +8187,16 @@ function isPersonaMetadataDirty() {
   const nameInput = $("persona-agent-name");
   const workspaceInput = $("persona-agent-workspace");
   const avatarInput = $("persona-agent-avatar");
-  if (!agent || !nameInput || !workspaceInput || !avatarInput) return false;
+  const modelInput = $("persona-agent-model");
+  if (!agent || !nameInput || !workspaceInput || !avatarInput || !modelInput) return false;
 
   const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
   const isDefaultAgent = agent.agentId === state.persona.defaultId;
 
   return toTrimmedString(nameInput.value) !== agent.displayName
     || (!isDefaultAgent && toTrimmedString(workspaceInput.value) !== effectiveWorkspace)
-    || toTrimmedString(avatarInput.value) !== (agent.avatar || "");
+    || toTrimmedString(avatarInput.value) !== (agent.avatar || "")
+    || toTrimmedString(modelInput.value) !== (agent.model || "");
 }
 
 function getPersonaDirtyDraftLabels({ ignore = [] } = {}) {
@@ -8295,6 +8351,23 @@ function renderPersonaMetadataBar() {
 
   const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
   const workspaceSourceLabel = getPersonaWorkspaceSourceLabel(agent);
+  const currentModelRef = toTrimmedString(agent.model);
+  const modelOptions = Array.isArray(state.modelDefaultOptions) ? state.modelDefaultOptions : [];
+  const hasCurrentModelRef = currentModelRef && modelOptions.includes(currentModelRef);
+  const personaModelSelectOptions = [
+    '<option value="">留空使用全局默认</option>',
+    ...(currentModelRef && !hasCurrentModelRef
+      ? [`<option value="${escapeHtml(currentModelRef)}" selected>${escapeHtml(`${currentModelRef}（当前值，未在目录中）`)}</option>`]
+      : []),
+    ...modelOptions.map((ref) => (
+      `<option value="${escapeHtml(ref)}"${ref === currentModelRef ? " selected" : ""}>${escapeHtml(ref)}</option>`
+    ))
+  ].join("");
+  const personaModelNote = currentModelRef && !hasCurrentModelRef
+    ? "当前值未出现在模型目录中；你可以保留它，也可以改选目录中的模型。"
+    : modelOptions.length > 0
+      ? "设置后该 Agent 的对话将优先使用此模型。"
+      : "暂未加载到模型目录，留空将使用全局默认模型。";
 
   return `
     <div class="persona-meta-bar" id="persona-meta-bar">
@@ -8326,6 +8399,13 @@ function renderPersonaMetadataBar() {
             <div class="config-row persona-field-full">
               <label for="persona-agent-avatar">头像字段</label>
               <input id="persona-agent-avatar" type="text" placeholder="可选：填写头像标识或短文本" />
+            </div>
+            <div class="config-row persona-field-full">
+              <label for="persona-agent-model">默认模型</label>
+              <select id="persona-agent-model" aria-label="选择 Agent 默认模型">
+                ${personaModelSelectOptions}
+              </select>
+              <p class="persona-field-note">${escapeHtml(personaModelNote)}</p>
             </div>
           </div>
 
@@ -8361,9 +8441,14 @@ function resetPersonaMetadataDraft() {
   const nameInput = $("persona-agent-name");
   const workspaceInput = $("persona-agent-workspace");
   const avatarInput = $("persona-agent-avatar");
+  const modelInput = $("persona-agent-model");
   if (nameInput) nameInput.value = agent.displayName;
   if (workspaceInput) workspaceInput.value = getPersonaEffectiveWorkspace(agent);
   if (avatarInput) avatarInput.value = agent.avatar || "";
+  if (modelInput) {
+    modelInput.value = agent.model || "";
+    syncCustomSelect(modelInput);
+  }
   syncPersonaMetadataActionState();
 }
 
@@ -8487,9 +8572,14 @@ function renderPersonaFilesPanel() {
     const nameInput = $("persona-agent-name");
     const workspaceInput = $("persona-agent-workspace");
     const avatarInput = $("persona-agent-avatar");
+    const modelInput = $("persona-agent-model");
     if (nameInput) nameInput.value = agent2.displayName;
     if (workspaceInput) workspaceInput.value = getPersonaEffectiveWorkspace(agent2);
     if (avatarInput) avatarInput.value = agent2.avatar || "";
+    if (modelInput) {
+      modelInput.value = agent2.model || "";
+      syncCustomSelect(modelInput);
+    }
     syncPersonaMetadataActionState();
   }
 
@@ -8561,8 +8651,13 @@ async function loadPersona({ preferredAgentId = "", preferredWorkspace = "", pre
   renderPersonaAgentList();
   renderPersonaFilesPanel();
 
+  const personaModelOptionsPromise = ensurePersonaModelDefaultOptionsLoaded().catch((error) => {
+    console.error("Failed to warm persona model options:", error);
+  });
+
   try {
     const data = await api("/api/agents");
+    await personaModelOptionsPromise;
     if (requestId !== state.persona.listRequestId) return;
 
     const normalized = normalizePersonaListPayload(data);
@@ -8589,6 +8684,7 @@ async function loadPersona({ preferredAgentId = "", preferredWorkspace = "", pre
       await loadPersonaFiles(state.persona.selectedAgentId, { preferredFileName });
     }
   } catch (err) {
+    await personaModelOptionsPromise;
     if (requestId !== state.persona.listRequestId) return;
     state.persona.loading = false;
     state.persona.listError = err.message || String(err);
@@ -8810,6 +8906,7 @@ async function saveSelectedPersonaAgent() {
   const draftName = toTrimmedString($("persona-agent-name")?.value);
   const draftWorkspace = toTrimmedString($("persona-agent-workspace")?.value);
   const draftAvatar = toTrimmedString($("persona-agent-avatar")?.value);
+  const draftModel = toTrimmedString($("persona-agent-model")?.value);
   const effectiveWorkspace = getPersonaEffectiveWorkspace(agent);
   const isDefaultAgent = agent.agentId === state.persona.defaultId;
 
@@ -8830,6 +8927,7 @@ async function saveSelectedPersonaAgent() {
   if (draftName !== agent.displayName) payload.name = draftName;
   if (!isDefaultAgent && draftWorkspace !== effectiveWorkspace) payload.workspace = draftWorkspace;
   if (draftAvatar !== (agent.avatar || "")) payload.avatar = draftAvatar;
+  if (draftModel !== (agent.model || "")) payload.model = draftModel;
 
   if (Object.keys(payload).length === 1) {
     showToast("当前没有需要保存的元数据改动", "warning");
@@ -9771,6 +9869,134 @@ function updateChatMessageRows(messageIds, { scrollOnUpdate = false, forceFull =
   return updated;
 }
 
+function parseAgentFromSessionKey(key) {
+  const match = String(key || "").match(/^agent:([^:]+):/);
+  return match ? match[1] : null;
+}
+
+function findChatAgentById(agentId) {
+  return state.chat.chatAgents.find((a) => a.agentId === agentId) || null;
+}
+
+function getChatSessionEffectiveModelLabel(session, agent = null) {
+  const explicitModel = toTrimmedString(session?.model);
+  if (explicitModel) return explicitModel;
+  if (agent?.model) return agent.model;
+  if (state.chat.globalDefaultModelRef) return state.chat.globalDefaultModelRef;
+  return toTrimmedString(session?.channel);
+}
+
+function renderChatAgentSelector() {
+  const select = $("chat-create-agent-select");
+  if (!select) return;
+  const agents = state.chat.chatAgents;
+  if (agents.length === 0) {
+    select.innerHTML = '<option value="">无可用 Agent</option>';
+    state.chat.selectedAgentId = "";
+    syncCustomSelect(select);
+    return;
+  }
+  const previousSelection = state.chat.selectedAgentId;
+  select.innerHTML = agents.map((a) =>
+    `<option value="${escapeHtml(a.agentId)}"${a.isDefault ? " selected" : ""}>` +
+    `${a.emoji ? a.emoji + " " : ""}${escapeHtml(a.displayName)}</option>`
+  ).join("");
+  if (previousSelection && agents.some((a) => a.agentId === previousSelection)) {
+    select.value = previousSelection;
+  } else {
+    const defaultAgent = agents.find((a) => a.isDefault);
+    state.chat.selectedAgentId = defaultAgent?.agentId || agents[0]?.agentId || "";
+    select.value = state.chat.selectedAgentId;
+  }
+  syncCustomSelect(select);
+}
+
+function renderChatModelSelector() {
+  const select = $("chat-create-model-select");
+  if (!select) return;
+  const previousSelection = state.chat.selectedModelRef;
+  select.innerHTML = '<option value="">跟随 Agent 默认</option>' +
+    state.chat.chatModels.map((m) =>
+      `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`
+    ).join("");
+  if (previousSelection && state.chat.chatModels.includes(previousSelection)) {
+    select.value = previousSelection;
+  } else {
+    state.chat.selectedModelRef = "";
+  }
+  syncCustomSelect(select);
+}
+
+function normalizeChatAgentsList(agentsPayload, defaultId = "") {
+  const normalizedDefaultId = String(defaultId || "").trim().toLowerCase();
+  if (Array.isArray(agentsPayload)) {
+    return agentsPayload.map((agent) => ({
+      agentId: agent?.agentId || agent?.id || agent?.key || "",
+      displayName: agent?.displayName || agent?.name || agent?.agentId || agent?.id || agent?.key || "",
+      emoji: agent?.emoji || "",
+      model: toTrimmedString(agent?.model),
+      isDefault: !!agent?.isDefault || String(agent?.agentId || agent?.id || agent?.key || "").trim().toLowerCase() === normalizedDefaultId
+    })).filter((agent) => Boolean(agent.agentId));
+  }
+
+  if (agentsPayload && typeof agentsPayload === "object") {
+    return Object.entries(agentsPayload).map(([agentKey, agent]) => ({
+      agentId: agent?.agentId || agent?.id || agent?.key || agentKey || "",
+      displayName: agent?.displayName || agent?.name || agent?.agentId || agent?.id || agent?.key || agentKey || "",
+      emoji: agent?.emoji || "",
+      model: toTrimmedString(agent?.model),
+      isDefault: !!agent?.isDefault || String(agent?.agentId || agent?.id || agent?.key || agentKey || "").trim().toLowerCase() === normalizedDefaultId
+    })).filter((agent) => Boolean(agent.agentId));
+  }
+
+  return [];
+}
+
+function getSelectedChatAgent() {
+  return state.chat.chatAgents.find((agent) => agent.agentId === state.chat.selectedAgentId) || null;
+}
+
+function renderChatCreateModalHint() {
+  const note = $("chat-create-model-note");
+  if (!note) return;
+
+  const selectedAgent = getSelectedChatAgent();
+  const selectedModelRef = toTrimmedString(state.chat.selectedModelRef);
+  if (selectedModelRef) {
+    note.textContent = `将为新会话临时覆盖模型：${selectedModelRef}。`;
+    return;
+  }
+
+  if (selectedAgent?.model) {
+    note.textContent = `将跟随 ${selectedAgent.displayName} 的默认模型：${selectedAgent.model}。`;
+    return;
+  }
+
+  if (state.chat.globalDefaultModelRef) {
+    note.textContent = `该 Agent 未配置专属默认模型，将回退到全局默认：${state.chat.globalDefaultModelRef}。`;
+    return;
+  }
+
+  note.textContent = "留空时跟随 Agent 默认；若 Agent 未配置专属模型，则回退到网关全局默认。";
+}
+
+async function loadChatAgentsAndModels() {
+  try {
+    const [agentsResp, modelsResp] = await Promise.all([
+      api("/api/agents"),
+      api("/api/models")
+    ]);
+    state.chat.chatAgents = normalizeChatAgentsList(agentsResp?.agents, agentsResp?.defaultId);
+    state.chat.chatModels = normalizeModelCatalogRefs(modelsResp?.modelList, modelsResp?.modelsConfig?.providers);
+    state.chat.globalDefaultModelRef = getAgentDefaultModelPrimary(modelsResp?.agentsDefaultModel);
+  } catch (err) {
+    console.error("Failed to load chat agents/models:", err);
+  }
+  renderChatAgentSelector();
+  renderChatModelSelector();
+  renderChatCreateModalHint();
+}
+
 function renderChatSessions() {
   const container = $("chat-session-list");
   if (!container) return;
@@ -9789,7 +10015,10 @@ function renderChatSessions() {
     .map((session) => {
       const active = session.key === state.chat.sessionKey;
       const timeText = formatChatTime(session.updatedAt) || "--:--:--";
-      const subtitle = session.model || session.channel || "未标注模型";
+      const agentId = parseAgentFromSessionKey(session.key);
+      const agent = agentId ? findChatAgentById(agentId) : null;
+      const agentTag = agent ? `${agent.emoji || ""} ${escapeHtml(agent.displayName)}`.trim() : "";
+      const subtitle = agentTag || session.model || session.channel || "未标注模型";
       return `
         <button type="button" class="chat-session-item${active ? " active" : ""}" data-session-key="${escapeHtml(session.key)}">
           <span class="chat-session-title">${escapeHtml(session.title)}</span>
@@ -9813,8 +10042,14 @@ function updateChatSessionHeader() {
   }
 
   const session = state.chat.sessions.find((item) => item.key === state.chat.sessionKey);
+  const agentId = parseAgentFromSessionKey(state.chat.sessionKey);
+  const agent = agentId ? findChatAgentById(agentId) : null;
+  const agentLabel = agent ? `${agent.emoji || ""} ${agent.displayName}`.trim() : "";
+  const modelLabel = getChatSessionEffectiveModelLabel(session, agent) || state.chat.sessionKey;
   title.textContent = session?.title || state.chat.sessionKey;
-  subtitle.textContent = session?.model || state.chat.sessionKey;
+  subtitle.textContent = agentLabel
+    ? `${agentLabel} · ${modelLabel}`
+    : modelLabel;
 }
 
 function scrollChatToBottom(force = false) {
@@ -9869,10 +10104,25 @@ function setChatSending(sending) {
   const sendBtn = $("chat-send-btn");
   if (!sendBtn) return;
 
-  sendBtn.disabled = state.chat.sending;
-  sendBtn.innerHTML = state.chat.sending
-    ? '<i class="fa-solid fa-spinner fa-spin"></i> 发送中'
-    : '<i class="fa-solid fa-paper-plane"></i> 发送';
+  if (state.chat.sending) {
+    sendBtn.disabled = true;
+    sendBtn.type = "submit";
+    sendBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 发送中';
+    sendBtn.classList.add("btn-primary");
+    sendBtn.classList.remove("btn-danger");
+  } else if (state.chat.pendingRuns.size > 0) {
+    sendBtn.disabled = false;
+    sendBtn.type = "button";
+    sendBtn.innerHTML = '<i class="fa-solid fa-stop"></i> 停止';
+    sendBtn.classList.remove("btn-primary");
+    sendBtn.classList.add("btn-danger");
+  } else {
+    sendBtn.disabled = false;
+    sendBtn.type = "submit";
+    sendBtn.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送';
+    sendBtn.classList.add("btn-primary");
+    sendBtn.classList.remove("btn-danger");
+  }
 }
 
 function scheduleChatHistoryRefresh(sessionKey, delayMs = 180) {
@@ -10194,6 +10444,7 @@ async function ensureChatClientConnected() {
 
         if (eventState === "final" || eventState === "aborted" || eventState === "error") {
           state.chat.pendingRuns.delete(runId);
+          setChatSending(false);
           if (state.chat.streamTargetByMessage.size === 0) {
             clearChatStreamAnimationScheduler({ clearTargets: false });
           }
@@ -10325,6 +10576,7 @@ async function loadChatHistory(sessionKey, { silent = false, limit, preserveScro
   }
 
   state.chat.pendingRuns.clear();
+  setChatSending(false);
   renderChatMessages({ autoScroll: !preserveScroll });
 
   if (preserveScroll && container) {
@@ -10394,14 +10646,50 @@ async function selectChatSession(sessionKey, { reload = true } = {}) {
   }
 }
 
-async function createChatSession() {
+function setChatCreateModalOpen(open) {
+  const modal = $("chat-create-modal");
+  if (!modal) return;
+  modal.classList.toggle("open", open);
+  modal.setAttribute("aria-hidden", open ? "false" : "true");
+  document.body.classList.toggle("provider-modal-open", open);
+  if (open) {
+    captureModalFocus("chat-create-modal", { initialSelector: "#chat-create-agent-select" });
+  } else {
+    releaseModalFocus("chat-create-modal");
+  }
+}
+
+async function openChatCreateModal() {
+  if (state.chat.chatAgents.length === 0 || state.chat.chatModels.length === 0) {
+    await loadChatAgentsAndModels();
+  } else {
+    renderChatAgentSelector();
+    renderChatModelSelector();
+    renderChatCreateModalHint();
+  }
+  setChatCreateModalOpen(true);
+}
+
+function closeChatCreateModal() {
+  setChatCreateModalOpen(false);
+}
+
+async function createChatSession({
+  agentId = state.chat.selectedAgentId,
+  modelRef = state.chat.selectedModelRef
+} = {}) {
   const now = new Date();
   const label = `WebUI ${now.toLocaleString("zh-CN")}`;
-  const tempKey = `webui-${Date.now()}`;
-  const result = await chatRequest("sessions.patch", {
-    key: tempKey,
-    label
-  });
+  const tempKey = agentId
+    ? `agent:${agentId}:webui-${Date.now()}`
+    : `webui-${Date.now()}`;
+
+  const patchParams = { key: tempKey, label };
+  if (modelRef) {
+    patchParams.model = modelRef;
+  }
+
+  const result = await chatRequest("sessions.patch", patchParams);
 
   const resolvedKey = String(result?.key || tempKey).trim();
   await loadChatSessions({ preserveSelection: false });
@@ -10409,6 +10697,27 @@ async function createChatSession() {
     await selectChatSession(resolvedKey, { reload: true });
   }
   showToast("已创建新会话", "success", 1800);
+}
+
+async function submitChatCreateModal() {
+  const submitBtn = $("chat-create-submit");
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 创建中...';
+  }
+
+  try {
+    await createChatSession({
+      agentId: state.chat.selectedAgentId,
+      modelRef: state.chat.selectedModelRef
+    });
+    closeChatCreateModal();
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.innerHTML = '<i class="fa-solid fa-plus"></i> 创建并进入会话';
+    }
+  }
 }
 
 async function sendChatMessage(text) {
@@ -10454,6 +10763,7 @@ async function sendChatMessage(text) {
     const runId = String(result?.runId || "").trim();
     if (runId) {
       state.chat.pendingRuns.set(runId, pendingAssistant.id);
+      setChatSending(false);
     } else {
       pendingAssistant.pending = false;
       pendingAssistant.text = "回复已提交，请稍后刷新会话查看结果";
@@ -10492,10 +10802,32 @@ function ensureChatBindings() {
 
   $("chat-new-session")?.addEventListener("click", async () => {
     try {
-      await createChatSession();
+      await openChatCreateModal();
     } catch (error) {
       showToast(error.message || String(error), "error");
     }
+  });
+
+  $("chat-create-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await submitChatCreateModal();
+    } catch (error) {
+      showToast(error.message || String(error), "error");
+    }
+  });
+
+  $("chat-create-submit")?.addEventListener("click", async () => {
+    try {
+      await submitChatCreateModal();
+    } catch (error) {
+      showToast(error.message || String(error), "error");
+    }
+  });
+
+  $("chat-create-modal")?.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-chat-create-close]")) return;
+    closeChatCreateModal();
   });
 
   const input = $("chat-input");
@@ -10544,6 +10876,12 @@ function ensureChatBindings() {
 
   $("chat-input-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (state.chat.pendingRuns.size > 0 && !state.chat.sending) {
+      chatRequest("chat.abort", { sessionKey: state.chat.sessionKey }).catch((err) => {
+        showToast("中断失败：" + (err.message || String(err)), "error");
+      });
+      return;
+    }
     const text = $("chat-input")?.value || "";
     if (!text.trim()) return;
     try {
@@ -10557,6 +10895,24 @@ function ensureChatBindings() {
     }
   });
 
+  $("chat-send-btn")?.addEventListener("click", (e) => {
+    if (state.chat.pendingRuns.size > 0 && !state.chat.sending) {
+      e.preventDefault();
+      chatRequest("chat.abort", { sessionKey: state.chat.sessionKey }).catch((err) => {
+        showToast("中断失败：" + (err.message || String(err)), "error");
+      });
+    }
+  });
+
+  $("chat-create-agent-select")?.addEventListener("change", (e) => {
+    state.chat.selectedAgentId = e.target.value;
+    renderChatCreateModalHint();
+  });
+  $("chat-create-model-select")?.addEventListener("change", (e) => {
+    state.chat.selectedModelRef = e.target.value;
+    renderChatCreateModalHint();
+  });
+
   state.chat.bindingsReady = true;
 }
 
@@ -10567,6 +10923,7 @@ async function loadChat() {
   try {
     setChatStatus(state.chat.initialized ? state.chat.status : "connecting");
     await ensureChatClientConnected();
+    await loadChatAgentsAndModels();
     await loadChatSessions({ preserveSelection: true });
 
     if (!state.chat.sessionKey) {
@@ -10696,7 +11053,7 @@ function bindEvents() {
       const nextView = nav.dataset.view || "";
       if (!nextView) return;
       if (nextView === state.currentView) {
-        $("sidebar")?.classList.remove("active");
+        closeMobileSidebar();
         return;
       }
 
@@ -10706,12 +11063,33 @@ function bindEvents() {
       }
 
       setView(nextView);
-      $("sidebar")?.classList.remove("active");
+      closeMobileSidebar();
     });
   }
 
+  function closeMobileSidebar() {
+    $("sidebar")?.classList.remove("active");
+    $("sidebar-overlay")?.classList.remove("active");
+    $("mobile-toggle")?.classList.remove("sidebar-open");
+  }
+
   $("mobile-toggle")?.addEventListener("click", () => {
-    $("sidebar")?.classList.toggle("active");
+    const sidebar = $("sidebar");
+    if (sidebar?.classList.contains("active")) {
+      closeMobileSidebar();
+    } else {
+      sidebar?.classList.add("active");
+      $("sidebar-overlay")?.classList.add("active");
+      $("mobile-toggle")?.classList.add("sidebar-open");
+    }
+  });
+
+  $("sidebar-overlay")?.addEventListener("click", closeMobileSidebar);
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && $("sidebar")?.classList.contains("active")) {
+      closeMobileSidebar();
+    }
   });
 
   $("logout-btn")?.addEventListener("click", (event) => {
@@ -10864,7 +11242,13 @@ function bindEvents() {
       syncPersonaFileEditorState();
       return;
     }
-    if (["persona-agent-name", "persona-agent-workspace", "persona-agent-avatar"].includes(event.target.id)) {
+    if (["persona-agent-name", "persona-agent-workspace", "persona-agent-avatar", "persona-agent-model"].includes(event.target.id)) {
+      syncPersonaMetadataActionState();
+    }
+  });
+
+  $("persona-files-panel")?.addEventListener("change", (event) => {
+    if (["persona-agent-name", "persona-agent-workspace", "persona-agent-avatar", "persona-agent-model"].includes(event.target.id)) {
       syncPersonaMetadataActionState();
     }
   });
@@ -11098,6 +11482,11 @@ function bindEvents() {
     if (state.skillModalOpen) {
       event.preventDefault();
       setSkillModalOpen(false);
+      return;
+    }
+    if ($("chat-create-modal")?.classList.contains("open")) {
+      event.preventDefault();
+      closeChatCreateModal();
       return;
     }
     if (state.currentView === "chat" && state.chat.mobileSessionsOpen) {

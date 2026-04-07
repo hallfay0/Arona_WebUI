@@ -36,17 +36,23 @@
 #### `GET /api/agents` merge behavior
 - Backend calls both `agents.list` and `config.get`.
 - Returned agent entries are currently treated as strings or objects; array/tuple entries are **not** a documented supported shape in the current browser contract.
+- Backend resolves per-agent config from either:
+  - `config.get.parsed.agents.list[]`
+  - `config.get.parsed.agents.<agentId>`
 - Each normalized agent entry may include:
   - `workspace`
   - `defaultWorkspace`
   - `effectiveWorkspace`
   - `workspaceSource`
+  - `model`
+  - `name`
+  - `avatar`
   - `memorySearch`
 
 #### Workspace precedence
 - Effective workspace resolution is:
   1. workspace present in `agents.list` payload (`workspace | root | path | dir`)
-  2. matching `config.get.parsed.agents.list[].workspace`
+  2. matching `config.get.parsed.agents.list[].workspace` or `config.get.parsed.agents.<agentId>.workspace`
   3. `config.get.parsed.agents.defaults.workspace`
   4. `~/.openclaw/workspace`
 - `workspaceSource` values used by the browser are:
@@ -76,6 +82,7 @@
 - Default agent cannot be deleted. Backend returns `409` with a protection error.
 - `deleteFiles` is optional input. Only `true` is forwarded downstream as “also remove files”; `false` / absence omits the field.
 - `model` is passed through to gateway `agents.update` as a plain `provider/model` string; the current Persona UI does not surface it yet, but the browser route contract supports it.
+- `GET /api/agents` should surface the effective per-agent `model` to the browser when it exists in config, even if upstream `agents.list` omits that field.
 
 #### Persona file whitelist and missing-file behavior
 - `/api/agents/files` may also return a `workspace` field alongside `files[]`.

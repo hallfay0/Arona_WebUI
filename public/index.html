@@ -7,7 +7,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>灵诗控制台 | OpenClaw</title>
   <link rel="stylesheet" href="/assets/fontawesome/css/all.min.css">
-  <link rel="stylesheet" href="/styles.css?v=20260324-form-controls-v3" />
+  <link rel="stylesheet" href="/styles.css?v=20260407-chat-create-modal-v4" />
   <script src="/theme.js"></script>
   <style>
     /* 针对由 JS 动态渲染的表格特殊列的限宽，防止撑开页面 */
@@ -38,9 +38,11 @@
 
   <div id="app" class="app-container">
     <!-- 移动端汉堡菜单 -->
-    <button type="button" class="mobile-menu-btn" id="mobile-toggle">
+    <button type="button" class="mobile-menu-btn panel-action-btn btn-secondary" id="mobile-toggle" aria-label="打开侧边栏">
       <i class="fa-solid fa-bars"></i>
     </button>
+    <!-- 移动端侧边栏遮罩 -->
+    <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
     <!-- 侧边栏 -->
     <aside class="admin-sidebar" id="sidebar">
@@ -751,11 +753,44 @@
               <textarea id="chat-input" class="chat-input" rows="4" aria-label="输入聊天消息"
                 placeholder="输入消息后按 Enter 发送，Shift+Enter 换行"></textarea>
               <div class="chat-input-actions">
-                <span class="chat-input-hint">Enter 发送，Shift+Enter 换行，Esc 收起移动端会话列表</span>
                 <button type="submit" id="chat-send-btn" class="btn-primary"><i class="fa-solid fa-paper-plane"></i>
                   发送</button>
               </div>
             </form>
+          </section>
+        </div>
+
+        <div id="chat-create-modal" class="provider-modal-shell" aria-hidden="true">
+          <div class="provider-modal-backdrop" data-chat-create-close></div>
+          <section class="provider-modal-panel chat-create-modal-panel" role="dialog" aria-modal="true" aria-labelledby="chat-create-modal-title">
+            <div class="provider-modal-head">
+              <div>
+                <h3 id="chat-create-modal-title" class="provider-modal-title">新建会话</h3>
+                <p class="provider-modal-subtitle">选择本次新会话要使用的 Agent 与模型覆盖。不会修改当前已打开会话。</p>
+              </div>
+              <button type="button" class="provider-modal-close" data-chat-create-close aria-label="关闭新建会话弹窗">
+                <i class="fa-solid fa-xmark"></i>
+              </button>
+            </div>
+            <form id="chat-create-form" class="provider-modal-body chat-create-modal-body">
+              <div class="config-row">
+                <label for="chat-create-agent-select">新会话 Agent</label>
+                <select id="chat-create-agent-select" class="chat-selector-select" aria-label="选择新会话 Agent"></select>
+              </div>
+              <div class="config-row">
+                <label for="chat-create-model-select">模型覆盖（可选）</label>
+                <select id="chat-create-model-select" class="chat-selector-select" aria-label="选择新会话模型">
+                  <option value="">跟随 Agent 默认</option>
+                </select>
+                <p id="chat-create-model-note" class="form-help-muted">留空时跟随 Agent 默认；若 Agent 未配置专属模型，则回退到全局默认模型。</p>
+              </div>
+            </form>
+            <div class="provider-modal-foot">
+              <button type="button" class="panel-action-btn btn-secondary btn-ghost" data-chat-create-close>取消</button>
+              <button type="button" id="chat-create-submit" class="btn-primary btn-primary-strong">
+                <i class="fa-solid fa-plus"></i> 创建并进入会话
+              </button>
+            </div>
           </section>
         </div>
       </section>
@@ -927,7 +962,7 @@
       </div>
     </section>
   </div>
-  <script type="module" src="/app.js?v=20260324-form-controls-v3"></script>
+  <script type="module" src="/app.js?v=20260407-chat-create-modal-v5"></script>
   <div id="toast-container" class="toast-container"></div>
 </body>
 

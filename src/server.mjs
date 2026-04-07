@@ -892,24 +892,51 @@ function readTrimmedStringArray(value) {
   return deduped;
 }
 
-function readConfigAgentEntry(configPayload, agentId) {
+function readConfigAgentsRoot(configPayload) {
   const parsed = configPayload && typeof configPayload === "object" ? configPayload.parsed : null;
-  const agentsRoot = parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+  return parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+}
+
+function readConfigAgentId(value, fallback = "") {
+  return readRequiredString(value || fallback).toLowerCase();
+}
+
+function readConfigAgentEntry(configPayload, agentId) {
+  const agentsRoot = readConfigAgentsRoot(configPayload);
   const list = Array.isArray(agentsRoot?.list) ? agentsRoot.list : [];
-  const normalizedAgentId = readRequiredString(agentId).toLowerCase();
+  const normalizedAgentId = readConfigAgentId(agentId);
+  if (!normalizedAgentId) return null;
+
+  let listEntry = null;
 
   for (const entry of list) {
     if (!entry || typeof entry !== "object") continue;
-    const entryId = readRequiredString(entry.id).toLowerCase();
+    const entryId = readConfigAgentId(entry.id || entry.agentId || entry.key);
     if (!entryId || entryId !== normalizedAgentId) continue;
-    return entry;
+    listEntry = entry;
+    break;
   }
-  return null;
+
+  let directEntry = null;
+  if (agentsRoot && typeof agentsRoot === "object") {
+    for (const [key, value] of Object.entries(agentsRoot)) {
+      if (key === "defaults" || key === "list") continue;
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const entryId = readConfigAgentId(value.id || value.agentId || value.key, key);
+      if (!entryId || entryId !== normalizedAgentId) continue;
+      directEntry = value;
+      break;
+    }
+  }
+
+  if (listEntry && directEntry) {
+    return { ...listEntry, ...directEntry };
+  }
+  return directEntry || listEntry || null;
 }
 
 function readConfigAgentWorkspaceInfo(configPayload, agentId, fallbackWorkspace = "") {
-  const parsed = configPayload && typeof configPayload === "object" ? configPayload.parsed : null;
-  const agentsRoot = parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+  const agentsRoot = readConfigAgentsRoot(configPayload);
   const configuredDefaultWorkspace = readRequiredString(agentsRoot?.defaults?.workspace) || fallbackWorkspace;
   const defaultWorkspace = configuredDefaultWorkspace || DEFAULT_AGENT_WORKSPACE;
   const entry = readConfigAgentEntry(configPayload, agentId);
@@ -937,7 +964,7 @@ function readConfigAgentWorkspace(configPayload, agentId, fallbackWorkspace = ""
 
 function readAgentMemoryInfo(configPayload, agentId) {
   const parsed = configPayload && typeof configPayload === "object" ? configPayload.parsed : null;
-  const agentsRoot = parsed && typeof parsed.agents === "object" ? parsed.agents : null;
+  const agentsRoot = readConfigAgentsRoot(configPayload);
   const defaultsMemory = agentsRoot?.defaults?.memorySearch;
   const entry = readConfigAgentEntry(configPayload, agentId);
   const agentMemory = entry?.memorySearch && typeof entry.memorySearch === "object" ? entry.memorySearch : null;
@@ -973,13 +1000,30 @@ function mergeAgentsListWithConfig(agentsPayload, configPayload) {
       defaultWorkspace: agentDefaultWorkspace,
       source: configWorkspaceSource
     } = readConfigAgentWorkspaceInfo(configPayload, agentId, defaultWorkspace);
+    const configEntry = readConfigAgentEntry(configPayload, agentId || fallbackAgentId);
+    const configuredModel = readRequiredString(configEntry?.model);
+    const configuredName = readRequiredString(configEntry?.name || configEntry?.displayName || configEntry?.label);
+    const configuredAvatar = readRequiredString(configEntry?.avatar);
+    const currentModel = isObjectAgent ? readRequiredString(nextAgent.model) : "";
     const memorySearch = readAgentMemoryInfo(configPayload, agentId || fallbackAgentId);
     const effectiveWorkspace = currentWorkspace || workspace || agentDefaultWorkspace || DEFAULT_AGENT_WORKSPACE;
     const workspaceSource = currentWorkspace ? "agents.list.workspace" : configWorkspaceSource;
+    const effectiveModel = currentModel || configuredModel;
 
     if (nextAgent) {
       if (workspace && (matchedAgent || !currentWorkspace)) {
         nextAgent.workspace = workspace;
+      }
+      if (effectiveModel) {
+        nextAgent.model = effectiveModel;
+      } else {
+        delete nextAgent.model;
+      }
+      if (!readRequiredString(nextAgent.name || nextAgent.displayName || nextAgent.label) && configuredName) {
+        nextAgent.name = configuredName;
+      }
+      if (!readRequiredString(nextAgent.avatar) && configuredAvatar) {
+        nextAgent.avatar = configuredAvatar;
       }
       nextAgent.defaultWorkspace = agentDefaultWorkspace || DEFAULT_AGENT_WORKSPACE;
       nextAgent.effectiveWorkspace = effectiveWorkspace;
@@ -998,6 +1042,15 @@ function mergeAgentsListWithConfig(agentsPayload, configPayload) {
 
     if (workspace) {
       payload.workspace = workspace;
+    }
+    if (effectiveModel) {
+      payload.model = effectiveModel;
+    }
+    if (configuredName) {
+      payload.name = configuredName;
+    }
+    if (configuredAvatar) {
+      payload.avatar = configuredAvatar;
     }
 
     return payload;
