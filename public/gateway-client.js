@@ -31,21 +31,42 @@ function normalizeAuthMode(value) {
   return "unknown";
 }
 
-function isMissingEndpointResponse(res, data) {
-  if (res.status === 404) return true;
-  const text = String(data?.error || "").toLowerCase();
-  if (!text) return false;
-  return text.includes("api endpoint not found") || text.includes("not found");
+function normalizeTransport(value) {
+  const transport = String(value || "").toLowerCase();
+  if (transport === "proxy" || transport === "direct") return transport;
+  return "";
 }
 
-async function fetchGatewayHealthMode(headers) {
-  try {
-    const res = await fetch("/api/health", { method: "GET", headers });
-    const data = await res.json().catch(() => ({}));
-    return normalizeAuthMode(data?.gateway?.authMode);
-  } catch {
-    return "unknown";
-  }
+function appendQueryParam(url, key, value) {
+  const base = String(url || "");
+  const separator = base.includes("?") ? "&" : "?";
+  return `${base}${separator}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+}
+
+function normalizeProxyBootstrap(proxy) {
+  if (!proxy || typeof proxy !== "object") return null;
+  const url = resolveWsUrl(proxy.url);
+  const ticket = String(proxy.ticket || "").trim();
+  const expiresAt = Number(proxy.expiresAt || 0);
+  if (!url || !ticket) return null;
+  return {
+    url,
+    ticket,
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    connectUrl: appendQueryParam(url, "ticket", ticket)
+  };
+}
+
+function normalizeDirectBootstrap(direct) {
+  if (!direct || typeof direct !== "object") return null;
+  const url = resolveWsUrl(direct.url);
+  if (!url) return null;
+  return {
+    url,
+    authMode: normalizeAuthMode(direct.authMode),
+    password: typeof direct.password === "string" && direct.password ? direct.password : undefined,
+    token: typeof direct.token === "string" && direct.token ? direct.token : undefined
+  };
 }
 
 export async function fetchGatewayAuthConfig({ endpoint = "/api/gateway-auth", tokenKey = "openclaw_token" } = {}) {
@@ -66,25 +87,37 @@ export async function fetchGatewayAuthConfig({ endpoint = "/api/gateway-auth", t
     throw new Error("Unauthorized");
   }
 
-  if (isMissingEndpointResponse(res, data)) {
-    return {
-      url: resolveWsUrl(""),
-      password: undefined,
-      token: undefined,
-      authMode: await fetchGatewayHealthMode(headers),
-      source: "fallback"
-    };
-  }
-
   if (!res.ok || data.ok === false) {
     throw new Error(data.error || `request failed (${res.status})`);
   }
 
+  const transport = normalizeTransport(data?.transport);
+  const proxy = normalizeProxyBootstrap(data?.proxy);
+  const direct = normalizeDirectBootstrap(data?.direct);
+  const allowDirectFallback = data?.allowDirectFallback === true;
+
+  if (!transport) {
+    throw new Error("gateway auth bootstrap missing transport");
+  }
+  if (transport === "proxy" && !proxy) {
+    throw new Error("gateway auth bootstrap missing proxy config");
+  }
+  if (transport === "direct" && !direct) {
+    throw new Error("gateway auth bootstrap missing direct config");
+  }
+  if (allowDirectFallback && !direct) {
+    throw new Error("gateway auth bootstrap missing fallback direct config");
+  }
+
   return {
-    url: resolveWsUrl(data.url),
-    password: data.password,
-    token: data.token,
-    authMode: normalizeAuthMode(data?.authMode),
+    transport,
+    allowDirectFallback,
+    proxy,
+    direct,
+    meta: {
+      version: Number(data?.meta?.version || 0),
+      source: String(data?.meta?.source || "endpoint")
+    },
     source: "endpoint"
   };
 }
@@ -153,7 +186,7 @@ export class GatewayClient {
     return this.connected;
   }
 
-  async connect(url, auth = {}) {
+  async connect(url, auth = {}, meta = {}) {
     const normalizedUrl = resolveWsUrl(url);
     if (!normalizedUrl) {
       throw new Error("gateway websocket url is required");
@@ -161,7 +194,8 @@ export class GatewayClient {
 
     this.connectionConfig = {
       url: normalizedUrl,
-      auth: normalizeAuth(auth)
+      auth: normalizeAuth(auth),
+      meta: meta && typeof meta === "object" ? { ...meta } : {}
     };
     this.explicitClose = false;
     this.clearReconnectTimer();
@@ -184,7 +218,8 @@ export class GatewayClient {
 
     this.setStatus("connecting", {
       url: this.connectionConfig.url,
-      reconnectAttempt: this.reconnectAttempt
+      reconnectAttempt: this.reconnectAttempt,
+      transport: String(this.connectionConfig?.meta?.transport || "")
     });
 
     this.connectPromise = new Promise((resolve, reject) => {
@@ -201,7 +236,9 @@ export class GatewayClient {
 
       socket.addEventListener("message", (event) => {
         if (socket !== this.ws) return;
-        this.handleRawMessage(event.data);
+        Promise.resolve(this.handleRawMessage(event.data)).catch(() => {
+          // Ignore malformed frames; close events will still surface transport failures.
+        });
       });
 
       socket.addEventListener("close", (event) => {
@@ -307,10 +344,19 @@ export class GatewayClient {
     );
   }
 
-  handleRawMessage(rawData) {
+  async handleRawMessage(rawData) {
+    let decoded = rawData;
+    if (typeof Blob !== "undefined" && rawData instanceof Blob) {
+      decoded = await rawData.text();
+    } else if (rawData instanceof ArrayBuffer) {
+      decoded = new TextDecoder().decode(new Uint8Array(rawData));
+    } else if (ArrayBuffer.isView(rawData)) {
+      decoded = new TextDecoder().decode(rawData);
+    }
+
     let message;
     try {
-      message = JSON.parse(rawData);
+      message = JSON.parse(decoded);
     } catch {
       return;
     }
@@ -337,7 +383,8 @@ export class GatewayClient {
       this.reconnectAttempt = 0;
       this.resolveConnect(message.payload);
       this.setStatus("connected", {
-        protocol: message.payload?.protocol || 3
+        protocol: message.payload?.protocol || 3,
+        transport: String(this.connectionConfig?.meta?.transport || "")
       });
       return;
     }

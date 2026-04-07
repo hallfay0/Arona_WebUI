@@ -1,4 +1,4 @@
-import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260307-model-fix-v12";
+import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260407-chat-proxy-v2";
 
 const state = {
   updateInfo: null,
@@ -98,11 +98,30 @@ const state = {
     status: "disconnected",
     needsRefresh: false,
     historyRefreshTimer: null,
+    sessionsRefreshTimer: null,
     bindingsReady: false,
     mobileSessionsOpen: false,
     sending: false,
-    manualAuthSecret: "",
     lastStatusReason: "",
+    transport: {
+      requested: "proxy",
+      active: "",
+      allowDirectFallback: false,
+      proxyUrl: "",
+      proxyTicketExpiresAt: 0,
+      directUrl: "",
+      directAuthMode: "unknown"
+    },
+    subscriptions: {
+      sessionEvents: false,
+      messageKey: "",
+      supported: true
+    },
+    refresh: {
+      busy: false,
+      reason: "",
+      lastAt: 0
+    },
     streamTargetByMessage: new Map(),
     streamAnimationTimer: null,
     streamAnimationIsRaf: false,
@@ -9050,9 +9069,17 @@ function setChatViewActive(active) {
     return;
   }
 
-  if (state.chat.needsRefresh && state.chat.sessionKey) {
-    state.chat.needsRefresh = false;
-    scheduleChatHistoryRefresh(state.chat.sessionKey, 0);
+  if (state.chat.needsRefresh) {
+    refreshChatNow({
+      reason: "view-activation",
+      reloadSessions: true,
+      reloadHistory: Boolean(state.chat.sessionKey),
+      silentHistory: true,
+      preserveScroll: true,
+      allowReconnect: false
+    }).catch((error) => {
+      console.error(error);
+    });
   }
 }
 
@@ -9063,17 +9090,42 @@ function setChatStatus(status, metadata = {}) {
   updateChatReconnectButton(state.chat.status, metadata);
   if (!pill) return;
 
+  const transport = String(
+    metadata.transport
+    || state.chat.transport.active
+    || state.chat.transport.requested
+    || ""
+  ).toLowerCase();
+  const transportLabel = transport === "proxy"
+    ? "代理"
+    : transport === "direct"
+      ? "直连"
+      : "";
+
   const statusMap = {
-    connected: { text: "网关已连接", cls: "ok" },
-    connecting: { text: "网关连接中", cls: "warn" },
-    reconnecting: { text: "网关重连中", cls: "warn" },
-    disconnected: { text: "网关未连接", cls: "bad" }
+    connected: { text: transportLabel ? `Chat ${transportLabel}已连接` : "网关已连接", cls: "ok" },
+    connecting: { text: transportLabel ? `Chat ${transportLabel}连接中` : "网关连接中", cls: "warn" },
+    reconnecting: { text: transportLabel ? `Chat ${transportLabel}重连中` : "网关重连中", cls: "warn" },
+    disconnected: { text: transportLabel ? `Chat ${transportLabel}未连接` : "网关未连接", cls: "bad" }
   };
 
   const normalized = statusMap[state.chat.status] || statusMap.disconnected;
   let text = normalized.text;
+  const reason = state.chat.lastStatusReason.toLowerCase();
+  if (state.chat.status === "disconnected" && transport === "proxy") {
+    if (reason.includes("upstream") || reason.includes("gateway")) {
+      text = "Gateway 上游不可用";
+    } else {
+      text = "Chat 代理未连接";
+    }
+  } else if (state.chat.status === "disconnected" && transport === "direct") {
+    text = "Gateway 直连未连接";
+  }
   if (Number.isFinite(metadata.attempt) && state.chat.status === "reconnecting") {
     text = `${normalized.text} (${metadata.attempt})`;
+  }
+  if (state.chat.status === "connected" && state.chat.needsRefresh) {
+    text = `${text} · 待刷新`;
   }
 
   pill.classList.remove("ok", "warn", "bad");
@@ -10134,7 +10186,20 @@ function scheduleChatHistoryRefresh(sessionKey, delayMs = 180) {
 
   state.chat.historyRefreshTimer = setTimeout(() => {
     state.chat.historyRefreshTimer = null;
-    loadChatHistory(sessionKey, { silent: true }).catch((error) => {
+    if (!state.chat.viewActive) {
+      state.chat.needsRefresh = true;
+      return;
+    }
+    if (sessionKey !== state.chat.sessionKey) {
+      state.chat.needsRefresh = true;
+      return;
+    }
+    refreshCurrentSessionHistory({
+      reason: "message-event",
+      silent: true,
+      preserveScroll: true,
+      allowReconnect: false
+    }).catch((error) => {
       console.error(error);
     });
   }, delayMs);
@@ -10283,51 +10348,232 @@ function normalizeGatewayAuthMode(value) {
   return "unknown";
 }
 
-async function ensureChatAuthForFallback(authConfig) {
-  if (String(authConfig?.source || "").toLowerCase() !== "fallback") return;
-  if (authConfig?.password || authConfig?.token) return;
-
-  const authMode = normalizeGatewayAuthMode(authConfig?.authMode);
-  if (authMode === "none") return;
-  if (state.chat.manualAuthSecret) return;
-
-  const label = authMode === "token" ? "令牌" : "密码";
-  const value = window.prompt(`检测到旧版后端未提供 /api/gateway-auth，请输入网关${label}继续连接：`, "");
-  const secret = String(value || "").trim();
-  if (!secret) {
-    throw new Error(`未提供网关${label}，Chat 无法建立连接`);
-  }
-  state.chat.manualAuthSecret = secret;
-}
-
-function buildChatConnectAuth(authConfig) {
-  const auth = {};
-  if (typeof authConfig?.password === "string" && authConfig.password) {
-    auth.password = authConfig.password;
-  }
-  if (typeof authConfig?.token === "string" && authConfig.token) {
-    auth.token = authConfig.token;
-  }
-
-  if (!auth.password && !auth.token && state.chat.manualAuthSecret) {
-    const mode = normalizeGatewayAuthMode(authConfig?.authMode);
-    if (mode === "token") {
-      auth.token = state.chat.manualAuthSecret;
-    } else {
-      auth.password = state.chat.manualAuthSecret;
-    }
-  }
-
-  return auth;
-}
-
 function isGatewayDisconnectedError(error) {
   const message = String(error?.message || error || "").toLowerCase();
   return message.includes("gateway websocket is not connected") || message.includes("gateway websocket closed");
 }
 
-async function chatRequest(method, params = {}) {
-  await ensureChatClientConnected();
+function updateChatTransportStateFromBootstrap(authConfig) {
+  state.chat.transport.requested = String(authConfig?.transport || "proxy");
+  state.chat.transport.allowDirectFallback = authConfig?.allowDirectFallback === true;
+  state.chat.transport.proxyUrl = authConfig?.proxy?.url || "";
+  state.chat.transport.proxyTicketExpiresAt = Number(authConfig?.proxy?.expiresAt || 0);
+  state.chat.transport.directUrl = authConfig?.direct?.url || "";
+  state.chat.transport.directAuthMode = normalizeGatewayAuthMode(authConfig?.direct?.authMode);
+}
+
+function resetChatSubscriptionState() {
+  state.chat.subscriptions.sessionEvents = false;
+  state.chat.subscriptions.messageKey = "";
+}
+
+function destroyChatClient() {
+  if (state.chat.client) {
+    try {
+      state.chat.client.close();
+    } catch {
+      // Ignore chat transport shutdown errors during reconnect.
+    }
+  }
+  state.chat.client = null;
+  state.chat.authConfig = null;
+  state.chat.transport.active = "";
+  state.chat.refresh.busy = false;
+  state.chat.refresh.reason = "";
+  resetChatSubscriptionState();
+  if (state.chat.historyRefreshTimer) {
+    clearTimeout(state.chat.historyRefreshTimer);
+    state.chat.historyRefreshTimer = null;
+  }
+  if (state.chat.sessionsRefreshTimer) {
+    clearTimeout(state.chat.sessionsRefreshTimer);
+    state.chat.sessionsRefreshTimer = null;
+  }
+  setChatRefreshBusy(false);
+}
+
+function createChatClient() {
+  const client = new GatewayClient({
+    requestTimeoutMs: 15000,
+    connectTimeoutMs: 15000,
+    reconnectBaseDelayMs: 600,
+    reconnectMaxDelayMs: 10000,
+    maxReconnectAttempts: 10,
+    autoReconnect: false
+  });
+
+  client.onStatusChange((info) => {
+    setChatStatus(info.status, info);
+    if (info.status === "disconnected") {
+      resetChatSubscriptionState();
+      clearChatStreamAnimationScheduler();
+      clearChatStreamCursorFadeState();
+    }
+  });
+
+  client.onEvent((frame) => {
+    handleChatGatewayEvent(frame);
+  });
+
+  return client;
+}
+
+function buildChatConnectOptions(authConfig, transport) {
+  if (transport === "proxy") {
+    if (!authConfig?.proxy?.connectUrl) {
+      throw new Error("chat proxy bootstrap missing connect url");
+    }
+    return {
+      url: authConfig.proxy.connectUrl,
+      auth: {},
+      meta: { transport: "proxy" }
+    };
+  }
+
+  if (transport === "direct") {
+    if (!authConfig?.direct?.url) {
+      throw new Error("chat direct bootstrap missing url");
+    }
+    return {
+      url: authConfig.direct.url,
+      auth: {
+        password: authConfig?.direct?.password,
+        token: authConfig?.direct?.token
+      },
+      meta: { transport: "direct" }
+    };
+  }
+
+  throw new Error(`unsupported chat transport: ${transport}`);
+}
+
+async function connectChatClientWithTransport(client, authConfig, transport) {
+  const options = buildChatConnectOptions(authConfig, transport);
+  await client.connect(options.url, options.auth, options.meta);
+  state.chat.transport.active = transport;
+  setChatStatus("connected", { transport });
+}
+
+async function connectChatClientFromBootstrap(client, authConfig) {
+  const requestedTransport = String(authConfig?.transport || "proxy");
+  updateChatTransportStateFromBootstrap(authConfig);
+  state.chat.transport.active = "";
+
+  if (requestedTransport === "direct") {
+    await connectChatClientWithTransport(client, authConfig, "direct");
+    return;
+  }
+
+  try {
+    await connectChatClientWithTransport(client, authConfig, "proxy");
+  } catch (error) {
+    if (!(authConfig?.allowDirectFallback === true && authConfig?.direct?.url)) {
+      throw error;
+    }
+    state.chat.transport.active = "";
+    setChatStatus("disconnected", {
+      reason: `代理连接失败，准备直连回退：${error?.message || String(error)}`,
+      transport: "proxy"
+    });
+    await connectChatClientWithTransport(client, authConfig, "direct");
+  }
+}
+
+function isUnsupportedSubscriptionError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("unknown method")
+    || message.includes("not found")
+    || message.includes("unsupported")
+    || message.includes("invalid request");
+}
+
+async function ensureChatSessionEventsSubscription() {
+  if (!state.chat.client?.isConnected()) return;
+  if (!state.chat.subscriptions.supported) return;
+  if (state.chat.subscriptions.sessionEvents) return;
+
+  try {
+    await state.chat.client.request("sessions.subscribe", {});
+    state.chat.subscriptions.sessionEvents = true;
+  } catch (error) {
+    if (isUnsupportedSubscriptionError(error)) {
+      state.chat.subscriptions.supported = false;
+      state.chat.subscriptions.sessionEvents = false;
+      return;
+    }
+    throw error;
+  }
+}
+
+async function clearChatSessionSubscription(sessionKey = state.chat.subscriptions.messageKey) {
+  const key = String(sessionKey || "").trim();
+  if (!key) return;
+  if (!state.chat.client?.isConnected()) {
+    state.chat.subscriptions.messageKey = "";
+    return;
+  }
+  if (!state.chat.subscriptions.supported) {
+    state.chat.subscriptions.messageKey = "";
+    return;
+  }
+  try {
+    await state.chat.client.request("sessions.messages.unsubscribe", { key });
+  } catch (error) {
+    if (!isUnsupportedSubscriptionError(error)) {
+      console.warn("unsubscribe current chat session failed:", error);
+    }
+  } finally {
+    if (state.chat.subscriptions.messageKey === key) {
+      state.chat.subscriptions.messageKey = "";
+    }
+  }
+}
+
+async function ensureChatSessionSubscription(sessionKey = state.chat.sessionKey) {
+  const nextKey = String(sessionKey || "").trim();
+  if (!nextKey) {
+    await clearChatSessionSubscription();
+    return;
+  }
+  if (!state.chat.client?.isConnected()) return;
+  if (!state.chat.subscriptions.supported) return;
+
+  await ensureChatSessionEventsSubscription();
+  if (state.chat.subscriptions.messageKey && state.chat.subscriptions.messageKey !== nextKey) {
+    await clearChatSessionSubscription(state.chat.subscriptions.messageKey);
+  }
+  if (state.chat.subscriptions.messageKey === nextKey) return;
+
+  try {
+    await state.chat.client.request("sessions.messages.subscribe", { key: nextKey });
+    state.chat.subscriptions.messageKey = nextKey;
+  } catch (error) {
+    if (isUnsupportedSubscriptionError(error)) {
+      state.chat.subscriptions.supported = false;
+      state.chat.subscriptions.messageKey = "";
+      return;
+    }
+    throw error;
+  }
+}
+
+async function resubscribeChatState() {
+  resetChatSubscriptionState();
+  if (!state.chat.client?.isConnected()) return;
+  if (!state.chat.subscriptions.supported) return;
+  await ensureChatSessionEventsSubscription();
+  if (state.chat.sessionKey) {
+    await ensureChatSessionSubscription(state.chat.sessionKey);
+  }
+}
+
+async function chatRequest(method, params = {}, { allowReconnect = true } = {}) {
+
+  if (allowReconnect) {
+    await ensureChatClientConnected();
+  } else if (!state.chat.client?.isConnected()) {
+    throw new Error("当前连接已断开，请先点击“立即重连”");
+  }
   if (!state.chat.client) {
     throw new Error("chat client is not ready");
   }
@@ -10335,10 +10581,10 @@ async function chatRequest(method, params = {}) {
   try {
     return await state.chat.client.request(method, params);
   } catch (error) {
-    if (!isGatewayDisconnectedError(error)) {
+    if (!allowReconnect || !isGatewayDisconnectedError(error)) {
       throw error;
     }
-    await ensureChatClientConnected();
+    await ensureChatClientConnected({ forceReconnect: true });
     if (!state.chat.client) {
       throw new Error("chat client is not ready");
     }
@@ -10346,167 +10592,290 @@ async function chatRequest(method, params = {}) {
   }
 }
 
-async function ensureChatClientConnected() {
+async function ensureChatClientConnected({ forceReconnect = false } = {}) {
+  if (forceReconnect) {
+    destroyChatClient();
+  }
+
+  if (state.chat.client?.isConnected()) {
+    await resubscribeChatState();
+    return state.chat.client;
+  }
+
   if (!state.chat.client) {
-    const authConfig = await fetchGatewayAuthConfig();
-    await ensureChatAuthForFallback(authConfig);
-    const connectAuth = buildChatConnectAuth(authConfig);
-    const client = new GatewayClient({
-      requestTimeoutMs: 15000,
-      connectTimeoutMs: 15000,
-      reconnectBaseDelayMs: 600,
-      reconnectMaxDelayMs: 10000,
-      maxReconnectAttempts: 10,
-      autoReconnect: true
-    });
+    state.chat.client = createChatClient();
+  }
 
-    client.onStatusChange((info) => {
-      setChatStatus(info.status, info);
-      if (info.status === "disconnected") {
-        clearChatStreamAnimationScheduler();
-        clearChatStreamCursorFadeState();
-      }
-      if (info.status === "connected" && state.chat.viewActive) {
-        loadChatSessions({ preserveSelection: true }).catch((error) => {
-          console.error(error);
-        });
-      }
-    });
+  const authConfig = await fetchGatewayAuthConfig();
+  state.chat.authConfig = authConfig;
+  updateChatTransportStateFromBootstrap(authConfig);
 
-    client.onEvent((frame) => {
-      if (!frame || frame.event !== "chat") return;
-
-      const payload = frame.payload || {};
-      const eventSessionKey = String(payload.sessionKey || "").trim();
-      if (!eventSessionKey) return;
-
-      const runId = String(payload.runId || "").trim();
-      const eventState = String(payload.state || "").toLowerCase();
-      const isCurrentSession = eventSessionKey === state.chat.sessionKey;
-
-      if (!isCurrentSession || !state.chat.viewActive) {
-        state.chat.needsRefresh = true;
-        return;
-      }
-
-      if (runId && state.chat.pendingRuns.has(runId)) {
-        const eventSegments = [
-          ...extractEventMessageSegments(payload.message),
-          ...extractEventMessageSegments(payload.thinking),
-          ...extractEventMessageSegments(payload.reasoning),
-          ...extractEventMessageSegments(payload.reasoningDelta)
-        ];
-        let structuredChanged = false;
-        const pendingMessageId = String(state.chat.pendingRuns.get(runId) || "").trim();
-
-        patchPendingAssistantByRun(runId, (message) => {
-          if (eventState === "delta") {
-            structuredChanged = mergeStructuredSegmentsIntoMessage(message, eventSegments) || structuredChanged;
-            const delta = joinStreamTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: false });
-            if (delta) queuePendingRunDelta(runId, delta);
-            return;
-          }
-
-          if (eventState === "final" || eventState === "aborted" || eventState === "error") {
-            // Pipeline simplified: no more delta flush queue, just snap target text
-          }
-
-          if (eventState === "error") {
-            message.pending = false;
-            message.text = payload.errorMessage || "模型回复失败";
-            message.segments = [{ type: "text", text: message.text }];
-            state.chat.streamTargetByMessage.delete(message.id);
-            clearChatStreamCursorFadeState(message.id);
-            return;
-          }
-
-          if (eventState === "aborted") {
-            message.pending = false;
-            message.text = "本次回复已中止";
-            message.segments = [{ type: "text", text: message.text }];
-            state.chat.streamTargetByMessage.delete(message.id);
-            clearChatStreamCursorFadeState(message.id);
-            return;
-          }
-
-          if (eventState === "final") {
-            const finalText = joinTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: true });
-            if (finalText) message.text = finalText;
-            if (eventSegments.length > 0) {
-              message.segments = eventSegments;
-            }
-            syncMessageTextSegment(message);
-            message.pending = false;
-            state.chat.streamTargetByMessage.delete(message.id);
-            startChatStreamCursorFade(message.id);
-          }
-        });
-
-        if (eventState === "final" || eventState === "aborted" || eventState === "error") {
-          state.chat.pendingRuns.delete(runId);
-          setChatSending(false);
-          if (state.chat.streamTargetByMessage.size === 0) {
-            clearChatStreamAnimationScheduler({ clearTargets: false });
-          }
-        }
-
-        if (eventState !== "delta") {
-          if (pendingMessageId && (eventState === "final")) {
-            // Keep the existing node for one brief fade-out before the final non-streaming render lands.
-            const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: true });
-            if (!updated) renderChatMessages();
-          } else {
-            renderChatMessages();
-          }
-        } else if (structuredChanged && pendingMessageId) {
-          const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: false, forceFull: true });
-          if (!updated) {
-            renderChatMessages({ autoScroll: false });
-          }
-        }
-      }
-
-      if (eventState === "final" || eventState === "aborted" || eventState === "error") {
-        // Delay history refresh so the streaming→final transition is seamless
-        scheduleChatHistoryRefresh(eventSessionKey, 1500);
-        loadChatSessions({ preserveSelection: true }).catch((error) => {
-          console.error(error);
-        });
-      }
-    });
-
-    state.chat.authConfig = authConfig;
-    state.chat.client = client;
-    try {
-      await client.connect(authConfig.url, connectAuth);
-    } catch (error) {
-      if (String(authConfig?.source || "").toLowerCase() === "fallback") {
-        state.chat.manualAuthSecret = "";
-      }
-      throw error;
-    }
+  try {
+    await connectChatClientFromBootstrap(state.chat.client, authConfig);
+    await resubscribeChatState();
     state.chat.initialized = true;
+    return state.chat.client;
+  } catch (error) {
+    destroyChatClient();
+    throw error;
+  }
+}
+
+function scheduleChatSessionsRefresh(reason = "session-event", delayMs = 180) {
+  if (state.chat.sessionsRefreshTimer) {
+    clearTimeout(state.chat.sessionsRefreshTimer);
+    state.chat.sessionsRefreshTimer = null;
+  }
+
+  state.chat.sessionsRefreshTimer = setTimeout(() => {
+    state.chat.sessionsRefreshTimer = null;
+    if (!state.chat.viewActive) {
+      state.chat.needsRefresh = true;
+      return;
+    }
+    refreshChatSessions({ reason, allowReconnect: false }).catch((error) => {
+      console.error(error);
+    });
+  }, delayMs);
+}
+
+function setChatRefreshBusy(busy, reason = "") {
+  state.chat.refresh.busy = busy === true;
+  state.chat.refresh.reason = String(reason || "");
+  const button = $("chat-refresh-btn");
+  if (!button) return;
+  if (state.chat.refresh.busy) {
+    button.disabled = true;
+    button.innerHTML = '<i class="fa-solid fa-rotate-right fa-spin"></i> 刷新中';
+    return;
+  }
+  button.disabled = false;
+  button.innerHTML = '<i class="fa-solid fa-rotate-right"></i> 刷新';
+}
+
+async function refreshChatSessions({
+  reason = "manual",
+  preserveSelection = true,
+  allowReconnect = false
+} = {}) {
+  state.chat.refresh.lastAt = state.chat.refresh.lastAt || 0;
+  await loadChatSessions({ preserveSelection, allowReconnect });
+  await ensureChatSessionSubscription(state.chat.sessionKey);
+  updateChatSessionHeader();
+  state.chat.refresh.lastAt = Date.now();
+  state.chat.refresh.reason = reason;
+}
+
+async function refreshCurrentSessionHistory({
+  reason = "manual",
+  silent = true,
+  preserveScroll = true,
+  limit,
+  allowReconnect = false
+} = {}) {
+  const sessionKey = String(state.chat.sessionKey || "").trim();
+  if (!sessionKey) {
+    await clearChatSessionSubscription();
+    state.chat.messages = [];
+    state.chat.hasOlderMessages = false;
+    state.chat.loadingOlderMessages = false;
+    renderChatMessages();
+    updateChatSessionHeader();
+    state.chat.refresh.lastAt = Date.now();
+    state.chat.refresh.reason = reason;
+    return { count: 0, limit: 0, skipped: false };
+  }
+
+  await ensureChatSessionSubscription(sessionKey);
+
+  if (state.chat.sending || state.chat.pendingRuns.size > 0) {
+    state.chat.needsRefresh = true;
+    return { skipped: true, reason: "pending-run" };
+  }
+
+  const result = await loadChatHistory(sessionKey, {
+    silent,
+    limit,
+    preserveScroll,
+    allowReconnect
+  });
+  updateChatSessionHeader();
+  state.chat.refresh.lastAt = Date.now();
+  state.chat.refresh.reason = reason;
+  return { ...result, skipped: false };
+}
+
+async function refreshChatNow({
+  reason = "manual",
+  reloadSessions = true,
+  reloadHistory = true,
+  silentHistory = true,
+  preserveScroll = true,
+  preserveSelection = true,
+  allowReconnect = false
+} = {}) {
+  setChatRefreshBusy(true, reason);
+  try {
+    if (reloadSessions) {
+      await refreshChatSessions({ reason, preserveSelection, allowReconnect });
+    } else {
+      await ensureChatSessionSubscription(state.chat.sessionKey);
+      updateChatSessionHeader();
+    }
+
+    if (reloadHistory) {
+      await refreshCurrentSessionHistory({
+        reason,
+        silent: silentHistory,
+        preserveScroll,
+        allowReconnect
+      });
+    }
+
+    state.chat.needsRefresh = false;
+    state.chat.refresh.lastAt = Date.now();
+    state.chat.refresh.reason = reason;
+    setChatStatus(state.chat.status, {
+      reason: state.chat.lastStatusReason,
+      transport: state.chat.transport.active || state.chat.transport.requested
+    });
+  } finally {
+    setChatRefreshBusy(false);
+  }
+}
+
+function handleChatEventFrame(frame) {
+  if (!frame || frame.event !== "chat") return;
+
+  const payload = frame.payload || {};
+  const eventSessionKey = String(payload.sessionKey || "").trim();
+  if (!eventSessionKey) return;
+
+  const runId = String(payload.runId || "").trim();
+  const eventState = String(payload.state || "").toLowerCase();
+  const isCurrentSession = eventSessionKey === state.chat.sessionKey;
+
+  if (!isCurrentSession || !state.chat.viewActive) {
+    state.chat.needsRefresh = true;
     return;
   }
 
-  if (!state.chat.client.isConnected()) {
-    const authConfig = state.chat.authConfig || (await fetchGatewayAuthConfig());
-    await ensureChatAuthForFallback(authConfig);
-    const connectAuth = buildChatConnectAuth(authConfig);
-    state.chat.authConfig = authConfig;
-    try {
-      await state.chat.client.connect(authConfig.url, connectAuth);
-    } catch (error) {
-      if (String(authConfig?.source || "").toLowerCase() === "fallback") {
-        state.chat.manualAuthSecret = "";
+  if (runId && state.chat.pendingRuns.has(runId)) {
+    const eventSegments = [
+      ...extractEventMessageSegments(payload.message),
+      ...extractEventMessageSegments(payload.thinking),
+      ...extractEventMessageSegments(payload.reasoning),
+      ...extractEventMessageSegments(payload.reasoningDelta)
+    ];
+    let structuredChanged = false;
+    const pendingMessageId = String(state.chat.pendingRuns.get(runId) || "").trim();
+
+    patchPendingAssistantByRun(runId, (message) => {
+      if (eventState === "delta") {
+        structuredChanged = mergeStructuredSegmentsIntoMessage(message, eventSegments) || structuredChanged;
+        const delta = joinStreamTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: false });
+        if (delta) queuePendingRunDelta(runId, delta);
+        return;
       }
-      throw error;
+
+      if (eventState === "error") {
+        message.pending = false;
+        message.text = payload.errorMessage || "模型回复失败";
+        message.segments = [{ type: "text", text: message.text }];
+        state.chat.streamTargetByMessage.delete(message.id);
+        clearChatStreamCursorFadeState(message.id);
+        return;
+      }
+
+      if (eventState === "aborted") {
+        message.pending = false;
+        message.text = "本次回复已中止";
+        message.segments = [{ type: "text", text: message.text }];
+        state.chat.streamTargetByMessage.delete(message.id);
+        clearChatStreamCursorFadeState(message.id);
+        return;
+      }
+
+      if (eventState === "final") {
+        const finalText = joinTextFromSegments(eventSegments) || extractEventMessageText(payload.message, { trim: true });
+        if (finalText) message.text = finalText;
+        if (eventSegments.length > 0) {
+          message.segments = eventSegments;
+        }
+        syncMessageTextSegment(message);
+        message.pending = false;
+        state.chat.streamTargetByMessage.delete(message.id);
+        startChatStreamCursorFade(message.id);
+      }
+    });
+
+    if (eventState === "final" || eventState === "aborted" || eventState === "error") {
+      state.chat.pendingRuns.delete(runId);
+      setChatSending(false);
+      if (state.chat.streamTargetByMessage.size === 0) {
+        clearChatStreamAnimationScheduler({ clearTargets: false });
+      }
+    }
+
+    if (eventState !== "delta") {
+      if (pendingMessageId && eventState === "final") {
+        const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: true });
+        if (!updated) renderChatMessages();
+      } else {
+        renderChatMessages();
+      }
+    } else if (structuredChanged && pendingMessageId) {
+      const updated = updateChatMessageRows([pendingMessageId], { scrollOnUpdate: false, forceFull: true });
+      if (!updated) {
+        renderChatMessages({ autoScroll: false });
+      }
+    }
+  }
+
+  if (eventState === "final" || eventState === "aborted" || eventState === "error") {
+    scheduleChatHistoryRefresh(eventSessionKey, 1500);
+    scheduleChatSessionsRefresh("chat-final", 240);
+  }
+}
+
+function handleChatGatewayEvent(frame) {
+  if (!frame || typeof frame !== "object") return;
+
+  if (frame.event === "chat") {
+    handleChatEventFrame(frame);
+    return;
+  }
+
+  if (frame.event === "sessions.changed") {
+    const payload = frame.payload || {};
+    const sessionKey = String(payload.sessionKey || "").trim();
+    const phase = String(payload.phase || payload.reason || "").toLowerCase();
+    scheduleChatSessionsRefresh("session-event", 180);
+    if (sessionKey && sessionKey === state.chat.sessionKey && state.chat.viewActive) {
+      if (["message", "start", "end", "error", "patch", "abort", "send", "reset", "new", "create"].includes(phase)) {
+        scheduleChatHistoryRefresh(sessionKey, 240);
+      }
+    } else if (sessionKey) {
+      state.chat.needsRefresh = true;
+    }
+    return;
+  }
+
+  if (frame.event === "session.message") {
+    const payload = frame.payload || {};
+    const sessionKey = String(payload.sessionKey || "").trim();
+    if (!sessionKey) return;
+    scheduleChatSessionsRefresh("message-event", 160);
+    if (sessionKey === state.chat.sessionKey && state.chat.viewActive) {
+      scheduleChatHistoryRefresh(sessionKey, 180);
+    } else {
+      state.chat.needsRefresh = true;
     }
   }
 }
 
-async function loadChatSessions({ preserveSelection = true } = {}) {
-  const payload = await chatRequest("sessions.list", { limit: 60, includeLastMessage: true });
+async function loadChatSessions({ preserveSelection = true, allowReconnect = true } = {}) {
+  const payload = await chatRequest("sessions.list", { limit: 60, includeLastMessage: true }, { allowReconnect });
   const sessions = getChatSessionItems(payload)
     .map((item) => normalizeChatSession(item))
     .filter(Boolean);
@@ -10523,15 +10892,20 @@ async function loadChatSessions({ preserveSelection = true } = {}) {
     state.chat.sessionKey = sessions[0]?.key || "";
   }
 
+  if (!state.chat.sessionKey) {
+    await clearChatSessionSubscription();
+  }
+
   renderChatSessions();
   updateChatSessionHeader();
 }
 
-async function loadChatHistory(sessionKey, { silent = false, limit, preserveScroll = false } = {}) {
+async function loadChatHistory(sessionKey, { silent = false, limit, preserveScroll = false, allowReconnect = true } = {}) {
   if (!sessionKey) {
     state.chat.messages = [];
     state.chat.hasOlderMessages = false;
     state.chat.loadingOlderMessages = false;
+    await clearChatSessionSubscription();
     clearChatStreamAnimationScheduler();
     clearChatStreamCursorFadeState();
     renderChatMessages();
@@ -10560,7 +10934,7 @@ async function loadChatHistory(sessionKey, { silent = false, limit, preserveScro
   const payload = await chatRequest("chat.history", {
     sessionKey,
     limit: requestedLimit
-  });
+  }, { allowReconnect });
 
   const messagesRaw = Array.isArray(payload?.messages) ? payload.messages : [];
   state.chat.messages = messagesRaw.map((message, index) => normalizeChatMessage(message, index));
@@ -10640,6 +11014,7 @@ async function selectChatSession(sessionKey, { reload = true } = {}) {
   state.chat.loadingOlderMessages = false;
   renderChatSessions();
   updateChatSessionHeader();
+  await ensureChatSessionSubscription(nextKey);
 
   if (reload) {
     await loadChatHistory(nextKey);
@@ -10861,16 +11236,36 @@ function ensureChatBindings() {
   $("chat-reconnect-btn")?.addEventListener("click", async () => {
     try {
       setChatStatus("connecting", { reason: state.chat.lastStatusReason });
-      await ensureChatClientConnected();
-      await loadChatSessions({ preserveSelection: true });
-      if (state.chat.sessionKey) {
-        await loadChatHistory(state.chat.sessionKey, { silent: true });
-      }
-      showToast("网关连接已恢复", "success", 1600);
+      await ensureChatClientConnected({ forceReconnect: true });
+      await refreshChatNow({
+        reason: "reconnect",
+        reloadSessions: true,
+        reloadHistory: Boolean(state.chat.sessionKey),
+        silentHistory: true,
+        preserveScroll: true,
+        allowReconnect: false
+      });
+      showToast("Chat 连接已恢复", "success", 1600);
     } catch (error) {
       const message = error?.message || String(error);
       setChatStatus("disconnected", { reason: message });
       showToast(message, "error");
+    }
+  });
+
+  $("chat-refresh-btn")?.addEventListener("click", async () => {
+    try {
+      await refreshChatNow({
+        reason: "manual",
+        reloadSessions: true,
+        reloadHistory: true,
+        silentHistory: false,
+        preserveScroll: true,
+        allowReconnect: false
+      });
+      showToast("Chat 数据已刷新", "success", 1200);
+    } catch (error) {
+      showToast(error?.message || String(error), "error");
     }
   });
 
@@ -10924,7 +11319,15 @@ async function loadChat() {
     setChatStatus(state.chat.initialized ? state.chat.status : "connecting");
     await ensureChatClientConnected();
     await loadChatAgentsAndModels();
-    await loadChatSessions({ preserveSelection: true });
+    const shouldReloadHistory = state.chat.needsRefresh || state.chat.messages.length === 0;
+    await refreshChatNow({
+      reason: "view-activation",
+      reloadSessions: true,
+      reloadHistory: shouldReloadHistory,
+      silentHistory: !shouldReloadHistory,
+      preserveScroll: true,
+      allowReconnect: false
+    });
 
     if (!state.chat.sessionKey) {
       state.chat.messages = [];
@@ -10934,12 +11337,7 @@ async function loadChat() {
       return;
     }
 
-    updateChatSessionHeader();
-    const shouldReloadHistory = state.chat.needsRefresh || state.chat.messages.length === 0;
-    state.chat.needsRefresh = false;
-    if (shouldReloadHistory) {
-      await loadChatHistory(state.chat.sessionKey);
-    } else {
+    if (!shouldReloadHistory) {
       renderChatMessages();
     }
   } catch (error) {

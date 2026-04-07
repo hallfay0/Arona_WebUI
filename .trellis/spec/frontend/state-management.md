@@ -18,30 +18,30 @@
 
 ```js
 const state = {
-  currentView: "overview",        // 当前激活的导航视图
-  modelsHash: "",                 // 模型配置的哈希（用于脏检测）
-  modelProvidersDraft: {},        // 模型提供商编辑草稿
-  agentsDefaultsModelsDraft: {},  // Agent 默认模型 allowlist 草稿
-  agentsDefaultModelDraft: null,  // Agent 默认主模型草稿
-  modelsAdvancedDrafts: { ... },  // 专用模型 / memorySearch 草稿（保留未暴露高级字段）
-  deletedModelProviderKeys: new Set(), // 待作为 tombstone 下发的 Provider 删除集合
-  deletedAllowlistModelRefs: new Set(), // 待作为 tombstone 下发的 allowlist 模型引用集合
-  modelsApply: { ... },           // 模型配置保存/热重启恢复状态
-  providerModalOpen: false,       // Provider 编辑弹窗是否打开
-  skillModalOpen: false,          // Skill 配置弹窗是否打开
-  providerEditor: { ... },       // Provider 编辑器元数据
-  confirmDialog: { ... },        // 确认对话框状态
-  modalFocus: { ... },           // 焦点管理状态
-  logsCursor: null,               // 日志分页游标
-  logsTimer: null,                // 日志轮询定时器
-  logsLive: false,                // 日志是否正在实时拉取
-  systemTimer: null,              // 系统负载轮询定时器
-  overviewTimer: null,            // 概览视图轮询定时器
-  nodeCommandDefaults: [],        // 节点命令默认选项
-  modelDefaultOptions: [],        // 模型默认选项
-  cronJsonMode: false,            // Cron 编辑是否为 JSON 模式
-  persona: { ... },               // Persona 编辑器子状态（列表/文件/保存）
-  chat: { ... }                   // Playground 对话子状态（嵌套对象）
+  currentView: "overview",
+  modelsHash: "",
+  modelProvidersDraft: {},
+  agentsDefaultsModelsDraft: {},
+  agentsDefaultModelDraft: null,
+  modelsAdvancedDrafts: { ... },
+  deletedModelProviderKeys: new Set(),
+  deletedAllowlistModelRefs: new Set(),
+  modelsApply: { ... },
+  providerModalOpen: false,
+  skillModalOpen: false,
+  providerEditor: { ... },
+  confirmDialog: { ... },
+  modalFocus: { ... },
+  logsCursor: null,
+  logsTimer: null,
+  logsLive: false,
+  systemTimer: null,
+  overviewTimer: null,
+  nodeCommandDefaults: [],
+  modelDefaultOptions: [],
+  cronJsonMode: false,
+  persona: { ... },
+  chat: { ... }
 };
 ```
 
@@ -55,7 +55,7 @@ const state = {
 ### 3. 模块级缓存
 
 ```js
-let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
+let _skillsCache = [];
 ```
 
 业务数据应优先进入 `state`。当前仓库仍保留少量模块级 UI/runtime 运行态（例如 spotlight 指针与 reduced-motion 媒体查询结果），但不要继续把新的业务状态散落到 `state` 之外。
@@ -66,6 +66,7 @@ let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
 - `status`：`"disconnected"` / `"connecting"` / `"connected"` / `"reconnecting"`
 - `statusListeners` / `eventListeners`：回调监听器集合
 - `pending`：请求-响应 Promise 映射
+- `connectionConfig.meta.transport`：当前连接使用的 `"proxy"` 或 `"direct"`
 
 ### 5. Persona 编辑器异步子状态
 
@@ -88,7 +89,103 @@ let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
 - `modelsApply.phase`：`"idle" | "restarting" | "error"`，驱动“网关热重启中”状态徽标和按钮禁用 / 重试连接状态。
 - `modelsApply.message`：当前热重启提示文案；在轮询恢复期间动态更新。
 
-### 7. Chat 流式渲染运行态
+### 7. Chat 状态对象
+
+当前 `state.chat` 除了会话与消息数据，还承载 transport、订阅与刷新状态：
+
+```js
+chat: {
+  client: null,
+  authConfig: null,
+  initialized: false,
+  viewActive: false,
+  sessions: [],
+  sessionKey: "",
+  messages: [],
+  pendingRuns: new Map(),
+  status: "disconnected",
+  needsRefresh: false,
+  historyRefreshTimer: null,
+  sessionsRefreshTimer: null,
+  bindingsReady: false,
+  mobileSessionsOpen: false,
+  sending: false,
+  lastStatusReason: "",
+  transport: {
+    requested: "proxy",
+    active: "",
+    allowDirectFallback: false,
+    proxyUrl: "",
+    proxyTicketExpiresAt: 0,
+    directUrl: "",
+    directAuthMode: "unknown"
+  },
+  subscriptions: {
+    sessionEvents: false,
+    messageKey: "",
+    supported: true
+  },
+  refresh: {
+    busy: false,
+    reason: "",
+    lastAt: 0
+  },
+  streamTargetByMessage: new Map(),
+  streamAnimationTimer: null,
+  streamAnimationIsRaf: false,
+  streamAnimationLastTs: 0,
+  streamLastDomUpdateTs: 0,
+  streamCursorFadeIds: new Set(),
+  streamCursorFadeTimers: new Map(),
+  historyLimit: 10,
+  historyBatchSize: 10,
+  historyMaxLimit: 1000,
+  hasOlderMessages: false,
+  loadingOlderMessages: false,
+  globalDefaultModelRef: "",
+  selectedAgentId: "",
+  selectedModelRef: "",
+  chatAgents: [],
+  chatModels: []
+}
+```
+
+#### Chat transport 子状态
+
+- `requested`
+  - 最近一次 bootstrap 请求返回的目标 transport
+  - 当前实现默认是 `"proxy"`
+- `active`
+  - 当前已实际建立的 transport：`"proxy"` 或 `"direct"`
+  - 未连接时为空字符串
+- `allowDirectFallback`
+  - 仅由后端 bootstrap 决定
+  - 前端不能本地猜测
+- `proxyUrl` / `proxyTicketExpiresAt`
+  - 用于显示与调试当前 proxy bootstrap
+- `directUrl` / `directAuthMode`
+  - 用于 direct 模式和 fallback 判定
+
+#### Chat 订阅子状态
+
+- `sessionEvents`
+  - 当前 transport 上是否已完成 `sessions.subscribe`
+- `messageKey`
+  - 当前 transport 正在监听的 `sessions.messages.subscribe` 会话 key
+- `supported`
+  - 若订阅接口返回 unknown/unsupported/not found，则置为 `false`
+  - 降级后不能再自动重试订阅，避免每次刷新都报错
+
+#### Chat 刷新子状态
+
+- `busy`
+  - 由“刷新”按钮与统一刷新 helper 共享
+- `reason`
+  - 最近一次刷新原因：如 `manual` / `reconnect` / `view-activation`
+- `lastAt`
+  - 最近一次刷新完成时间戳
+
+### 8. Chat 流式渲染运行态
 
 - `state.chat.streamTargetByMessage`：按 `messageId` 记录“目标文本”；WebSocket delta 到达时直接更新这里，不再维护额外的 delta flush 队列。
 - `state.chat.streamAnimationTimer` / `streamAnimationIsRaf` / `streamAnimationLastTs`：单一动画循环的调度状态；由一个 rAF / timeout 驱动逐字推进。
@@ -120,14 +217,11 @@ let _skillsCache = [];  // 技能数据缓存，供配置弹窗读取
 ### 直接赋值 + 手动 DOM 更新
 
 ```js
-// 切换视图
 function setView(view) {
   state.currentView = view;
-  // 手动更新 DOM
   for (const section of document.querySelectorAll(".view")) {
     section.classList.toggle("active", section.id === `view-${view}`);
   }
-  // 触发视图加载
   const load = viewLoaders[view];
   if (load) load();
 }
@@ -140,11 +234,58 @@ function setView(view) {
 ```js
 async function loadOverview() {
   const container = $("overview-content");
-  container.innerHTML = renderSkeleton(5);  // 加载骨架屏
+  container.innerHTML = renderSkeleton(5);
   const data = await api("/api/overview");
   container.innerHTML = `...渲染完整 HTML...`;
 }
 ```
+
+### Chat 统一刷新模式
+
+Chat 不再把刷新逻辑散落在连接、切页、事件回调里。统一从以下 helpers 进入：
+
+```js
+async function refreshChatSessions({ reason, preserveSelection, allowReconnect })
+async function refreshCurrentSessionHistory({ reason, silent, preserveScroll, allowReconnect })
+async function refreshChatNow({ reason, reloadSessions, reloadHistory, silentHistory, preserveScroll, allowReconnect })
+```
+
+规则：
+- “立即重连”：
+  - `ensureChatClientConnected({ forceReconnect: true })`
+  - 然后 `refreshChatNow({ reason: "reconnect", allowReconnect: false })`
+- “刷新”：
+  - 只调用 `refreshChatNow({ reason: "manual", allowReconnect: false })`
+  - 当前 transport 断开时应直接报错，不做隐式重连
+- `setChatViewActive(true)`：
+  - 仅在 `needsRefresh=true` 时触发一次视图激活刷新
+
+### Chat transport / subscription 模式
+
+```js
+async function ensureChatClientConnected({ forceReconnect = false } = {}) {
+  if (forceReconnect) destroyChatClient();
+  if (state.chat.client?.isConnected()) {
+    await resubscribeChatState();
+    return state.chat.client;
+  }
+  const authConfig = await fetchGatewayAuthConfig();
+  await connectChatClientFromBootstrap(state.chat.client, authConfig);
+  await resubscribeChatState();
+}
+```
+
+关键约束：
+- `destroyChatClient()` 必须同时：
+  - 关闭 transport
+  - 清空 subscription state
+  - 清理 `historyRefreshTimer` / `sessionsRefreshTimer`
+  - 清空 `state.chat.transport.active`
+- `resubscribeChatState()` 必须在每次重建连接后重新执行
+- 选中会话后必须 `ensureChatSessionSubscription(nextKey)`
+- 当会话列表刷新后不再存在当前会话时，必须：
+  - 清空 `state.chat.sessionKey`
+  - 调用 `clearChatSessionSubscription()`
 
 ### 定时器轮询模式
 
@@ -157,21 +298,29 @@ function startOverviewTimers() {
 }
 ```
 
+Chat 当前额外使用两类 `setTimeout`：
+- `historyRefreshTimer`
+  - 合并 `session.message` / `chat final` 触发的静默历史刷新
+- `sessionsRefreshTimer`
+  - 合并 `sessions.changed` / `session.message` 的摘要刷新
+
 ---
 
 ## Server State
 
-- **无缓存层**：每次视图切换或定时器触发时直接从 API 获取最新数据
+- **无缓存层**：每次视图切换或显式刷新时直接从 API / WS 拉取最新数据
 - **API 调用通过 `api()` 辅助函数**：自动附加 auth header，401 时重定向到登录页
 - **WebSocket 实时数据**：Chat/Playground 视图通过 `GatewayClient` 接收流式事件
+- **Chat transport 不是全局单例服务**：其生命周期跟随 `state.chat.client` 管理
 
 ---
 
 ## Common Mistakes
 
 - **不要把新的业务状态散落到 `state` 对象之外**：现有模块级运行态主要是 UI/媒体查询辅助，不应成为继续扩散的理由
-- **不要忘记在视图切换时清理定时器**：参见 `stopOverviewTimers()` / `stopLogStream()`
+- **不要忘记在视图切换时清理定时器**：参见 `stopOverviewTimers()` / `stopLogStream()` / `destroyChatClient()`
 - **不要假设 `state.chat.client` 已连接**：始终检查 `isConnected()` 或使用 `ensureChatClientConnected()`
-- **修改状态后必须手动更新 DOM**：本项目无响应式绑定
+- **不要让“刷新”隐式重连**：手动刷新必须失败快，重连由独立按钮负责
+- **不要在 transport 重建后假设订阅还在**：必须重新 `sessions.subscribe` / `sessions.messages.subscribe`
 - **不要把 `openclaw_token` 当成 JWT 解析**：它只是后端 `SESSIONS` Map 里的 opaque session token
 - **不要让过期的 Persona 异步结果覆盖当前编辑目标**：必须同时校验 request id 与当前选中项

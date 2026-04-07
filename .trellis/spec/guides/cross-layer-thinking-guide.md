@@ -83,6 +83,35 @@ This overwrites the user's latest UI-only selections with stale serialized state
 - if JSON and form both exist, only run JSON -> form backfill on an explicit user action
 - never do implicit backfill inside `collect*()` / submit helpers unless every state dimension is serialized
 
+### Mistake 5: WebSocket Payload-Type Drift
+
+**Bad**:
+- backend proxy receives a gateway text frame as `Buffer`
+- proxy forwards the raw value without normalizing
+- browser receives `Blob` / `ArrayBuffer`
+- frontend still does `JSON.parse(event.data)` and silently drops the frame
+
+This often looks like:
+- socket `open` succeeded
+- but app-level handshake times out because `hello-ok` was never parsed
+
+**Good**:
+- document payload type at each hop: upstream ws library -> proxy -> browser ws API
+- normalize text frames to UTF-8 strings before forwarding across runtime boundaries
+- browser frame parser must explicitly handle `string`, `Blob`, `ArrayBuffer`, and typed array views
+
+### Mistake 6: Assuming Close Codes Can Be Round-Tripped
+
+**Bad**:
+- receive browser/upstream close code like `1005` / `1006` / `1015`
+- pass it directly into another `ws.close(code, reason)`
+- proxy crashes because the runtime refuses invalid outgoing close codes
+
+**Good**:
+- treat received close codes and emitted close codes as different contracts
+- normalize to a legal outgoing code at the proxy boundary
+- document which codes are preserved and which fall back to `1000` / `1011`
+
 ---
 
 ## Checklist for Cross-Layer Features
@@ -93,12 +122,16 @@ Before implementation:
 - [ ] Defined format at each boundary
 - [ ] Decided where validation happens
 - [ ] If the UI has both structured form fields and raw JSON, defined the single source of truth for submit
+- [ ] If the feature uses WebSocket across different runtimes/libraries, verified payload types at every hop
+- [ ] If the feature forwards WebSocket close events, verified outgoing close codes are legal for the destination runtime
 
 After implementation:
 - [ ] Tested with edge cases (null, empty, invalid)
 - [ ] Verified error handling at each boundary
 - [ ] Checked data survives round-trip
 - [ ] Checked that save-time normalization does not overwrite newer UI state with older serialized state
+- [ ] Verified handshake frames are observable at the final consumer, not just at the transport source
+- [ ] Verified boundary adapters do not silently coerce text/binary frames into a different runtime type
 
 ---
 

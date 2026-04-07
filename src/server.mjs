@@ -50,15 +50,26 @@ let updateInProgress = false;
 
 import cronstruePlugin from "cronstrue/i18n.js";
 const cronstrue = cronstruePlugin.default || cronstruePlugin;
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 const SESSIONS = new Map();
+const CHAT_PROXY_TICKETS = new Map();
 const REDACTED_API_KEY_TOKEN = "__OPENCLAW_REDACTED__";
 
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return parsed;
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 function hasOwn(obj, key) {
@@ -217,6 +228,15 @@ const GATEWAY_POOL_CLEANUP_INTERVAL_MS = parsePositiveInt(
   process.env.GATEWAY_POOL_CLEANUP_INTERVAL_MS || "10000",
   10_000
 );
+const CHAT_PROXY_TICKET_TTL_MS = parsePositiveInt(process.env.CHAT_PROXY_TICKET_TTL_MS || "60000", 60_000);
+const CHAT_PROXY_TICKET_CLEANUP_INTERVAL_MS = parsePositiveInt(
+  process.env.CHAT_PROXY_TICKET_CLEANUP_INTERVAL_MS || "30000",
+  30_000
+);
+const CHAT_TRANSPORT_MODE = String(process.env.CHAT_TRANSPORT_MODE || "proxy").trim().toLowerCase() === "direct"
+  ? "direct"
+  : "proxy";
+const CHAT_ALLOW_DIRECT_FALLBACK = parseBoolean(process.env.CHAT_ALLOW_DIRECT_FALLBACK, false);
 
 const gatewayPool = {
   session: null,
@@ -262,6 +282,104 @@ function cleanupExpiredSessions() {
       SESSIONS.delete(token);
     }
   }
+}
+
+function createChatProxyTicketRecord({ sessionToken = "", allowDirectFallback = false } = {}) {
+  const ticket = crypto.randomUUID();
+  const now = Date.now();
+  const record = {
+    ticket,
+    issuedAt: now,
+    expiresAt: now + CHAT_PROXY_TICKET_TTL_MS,
+    sessionToken: typeof sessionToken === "string" ? sessionToken.trim() : "",
+    allowDirectFallback: allowDirectFallback === true
+  };
+  CHAT_PROXY_TICKETS.set(ticket, record);
+  return record;
+}
+
+function consumeChatProxyTicketRecord(ticket) {
+  const normalized = typeof ticket === "string" ? ticket.trim() : "";
+  if (!normalized) return null;
+  const record = CHAT_PROXY_TICKETS.get(normalized);
+  if (!record) return null;
+  CHAT_PROXY_TICKETS.delete(normalized);
+  if (!Number.isFinite(record.expiresAt) || record.expiresAt <= Date.now()) {
+    return null;
+  }
+  return record;
+}
+
+function cleanupExpiredChatProxyTickets() {
+  const now = Date.now();
+  for (const [ticket, record] of CHAT_PROXY_TICKETS) {
+    if (!record || !Number.isFinite(record.expiresAt) || record.expiresAt <= now) {
+      CHAT_PROXY_TICKETS.delete(ticket);
+    }
+  }
+}
+
+function truncateWsCloseReason(reason) {
+  const text = String(reason || "").trim() || "chat proxy closed";
+  return text.length <= 120 ? text : `${text.slice(0, 117)}...`;
+}
+
+function normalizeWsCloseCode(code, fallback = 1000) {
+  const value = Number(code);
+  if (!Number.isInteger(value)) return fallback;
+  if (value === 1000) return value;
+  if (value >= 3000 && value <= 4999) return value;
+  if ([1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014].includes(value)) {
+    return value;
+  }
+  return fallback;
+}
+
+function parseWsJson(raw) {
+  const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw || "");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function waitForSocketOpen(socket, timeoutMs = 15000, timeoutLabel = "websocket connect timeout") {
+  if (!socket) {
+    return Promise.reject(new Error("websocket is missing"));
+  }
+  if (socket.readyState === WebSocket.OPEN) {
+    return Promise.resolve();
+  }
+  if (socket.readyState !== WebSocket.CONNECTING) {
+    return Promise.reject(new Error(timeoutLabel));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("open", onOpen);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onOpen = () => settle(resolve);
+    const onError = (error) => settle(reject, error instanceof Error ? error : new Error(String(error)));
+    const onClose = (code, reason) => {
+      const reasonText = reason?.toString?.() || "no reason";
+      settle(reject, new Error(`websocket closed (${code}): ${reasonText}`));
+    };
+    const timer = setTimeout(() => settle(reject, new Error(timeoutLabel)), timeoutMs);
+    socket.on("open", onOpen);
+    socket.on("error", onError);
+    socket.on("close", onClose);
+  });
 }
 
 // ── Version / Update helpers ─────────────────────────────────────
@@ -546,6 +664,8 @@ const gatewayConfig = {
   token: process.env.GATEWAY_TOKEN ?? gatewayDefaults.token
 };
 
+const chatProxyWss = new WebSocketServer({ noServer: true });
+
 function resolveGatewayClientUrl(req) {
   const override = process.env.GATEWAY_PUBLIC_WS_URL;
   if (typeof override === "string" && override.trim()) {
@@ -575,6 +695,51 @@ function resolveGatewayClientUrl(req) {
   }
 
   return gatewayConfig.url;
+}
+
+function resolveChatProxyClientUrl() {
+  return "/api/chat/ws";
+}
+
+function resolveGatewayDirectAuthMode() {
+  if (gatewayConfig.token) return "token";
+  if (gatewayConfig.password) return "password";
+  return "none";
+}
+
+function buildDirectGatewayBootstrap(req) {
+  const direct = {
+    url: resolveGatewayClientUrl(req),
+    authMode: resolveGatewayDirectAuthMode()
+  };
+  if (gatewayConfig.password) direct.password = gatewayConfig.password;
+  if (gatewayConfig.token) direct.token = gatewayConfig.token;
+  return direct;
+}
+
+function readBearerToken(authHeader) {
+  return String(authHeader || "").replace(/^Bearer\s+/i, "").trim();
+}
+
+function writeUpgradeError(socket, statusCode, statusText, payload = { ok: false, error: statusText }) {
+  if (!socket || socket.destroyed) return;
+  try {
+    socket.write(
+      `HTTP/1.1 ${statusCode} ${statusText}\r\n`
+      + "Connection: close\r\n"
+      + "Content-Type: application/json; charset=utf-8\r\n"
+      + `Content-Length: ${Buffer.byteLength(JSON.stringify(payload))}\r\n`
+      + "\r\n"
+      + JSON.stringify(payload)
+    );
+  } catch {
+    // Ignore socket write failures during rejected upgrades.
+  }
+  try {
+    socket.destroy();
+  } catch {
+    // Ignore socket cleanup failures.
+  }
 }
 
 const PORT = Number.parseInt(process.env.PORT || "18790", 10);
@@ -776,6 +941,144 @@ class GatewaySession {
     this.closed = true;
     this.rejectPending(new Error("gateway session closed"));
     if (this.ws && this.ws.readyState <= WebSocket.OPEN) this.ws.close();
+  }
+}
+
+class ChatProxySession {
+  constructor({ browserSocket, gatewayConfig, ticketRecord }) {
+    this.browserSocket = browserSocket;
+    this.gatewayConfig = gatewayConfig;
+    this.ticketRecord = ticketRecord;
+    this.upstreamSocket = null;
+    this.closed = false;
+  }
+
+  attach() {
+    this.browserSocket.on("message", (raw) => {
+      this.handleBrowserMessage(raw).catch((error) => {
+        this.closeWithReason(1011, error instanceof Error ? error.message : String(error));
+      });
+    });
+
+    this.browserSocket.on("close", (code, reason) => {
+      if (this.closed) return;
+      const reasonText = reason?.toString?.() || "browser websocket closed";
+      this.closeUpstream(code || 1000, reasonText);
+      this.closed = true;
+    });
+
+    this.browserSocket.on("error", (error) => {
+      if (this.closed) return;
+      this.closeUpstream(1011, error instanceof Error ? error.message : String(error));
+      this.closed = true;
+    });
+  }
+
+  async handleBrowserMessage(raw) {
+    if (this.closed) return;
+
+    const message = parseWsJson(raw);
+    if (!message || typeof message !== "object") {
+      this.closeWithReason(1003, "invalid browser websocket frame");
+      return;
+    }
+
+    if (message.type === "req" && message.method === "connect") {
+      await this.ensureUpstreamSocket();
+      this.sendToUpstream(this.buildConnectFrame(message));
+      return;
+    }
+
+    if (!this.upstreamSocket || this.upstreamSocket.readyState !== WebSocket.OPEN) {
+      this.closeWithReason(1011, "gateway upstream is not connected");
+      return;
+    }
+
+    this.sendToUpstream(message);
+  }
+
+  async ensureUpstreamSocket() {
+    if (this.upstreamSocket && this.upstreamSocket.readyState === WebSocket.OPEN) {
+      return this.upstreamSocket;
+    }
+
+    if (this.upstreamSocket && this.upstreamSocket.readyState === WebSocket.CONNECTING) {
+      await waitForSocketOpen(this.upstreamSocket, 15000, "gateway upstream connect timeout");
+      return this.upstreamSocket;
+    }
+
+    const upstreamSocket = new WebSocket(this.gatewayConfig.url, { origin: this.gatewayConfig.origin });
+    this.upstreamSocket = upstreamSocket;
+
+    upstreamSocket.on("message", (raw, isBinary) => {
+      if (this.closed || upstreamSocket !== this.upstreamSocket) return;
+      if (this.browserSocket.readyState !== WebSocket.OPEN) return;
+      this.browserSocket.send(isBinary ? raw : Buffer.from(raw).toString("utf8"));
+    });
+
+    upstreamSocket.on("close", (code, reason) => {
+      if (upstreamSocket !== this.upstreamSocket) return;
+      this.upstreamSocket = null;
+      if (this.closed) return;
+      const reasonText = reason?.toString?.() || "gateway upstream closed";
+      this.closeWithReason(1011, `gateway upstream closed (${code}): ${reasonText}`);
+    });
+
+    upstreamSocket.on("error", (error) => {
+      if (this.closed || upstreamSocket !== this.upstreamSocket) return;
+      this.closeWithReason(1011, error instanceof Error ? error.message : String(error));
+    });
+
+    await waitForSocketOpen(upstreamSocket, 15000, "gateway upstream connect timeout");
+    return upstreamSocket;
+  }
+
+  buildConnectFrame(message) {
+    const next = { ...message };
+    const params = message?.params && typeof message.params === "object" && !Array.isArray(message.params)
+      ? { ...message.params }
+      : {};
+    delete params.auth;
+
+    const auth = {};
+    if (this.gatewayConfig.password) auth.password = this.gatewayConfig.password;
+    if (this.gatewayConfig.token) auth.token = this.gatewayConfig.token;
+    if (Object.keys(auth).length > 0) {
+      params.auth = auth;
+    }
+
+    next.params = params;
+    return next;
+  }
+
+  sendToUpstream(frame) {
+    if (!this.upstreamSocket || this.upstreamSocket.readyState !== WebSocket.OPEN) {
+      throw new Error("gateway upstream is not connected");
+    }
+    this.upstreamSocket.send(JSON.stringify(frame));
+  }
+
+  closeUpstream(code = 1000, reason = "chat proxy closed") {
+    const socket = this.upstreamSocket;
+    this.upstreamSocket = null;
+    if (socket && socket.readyState <= WebSocket.OPEN) {
+      socket.close(
+        normalizeWsCloseCode(code, 1000),
+        truncateWsCloseReason(reason)
+      );
+    }
+  }
+
+  closeWithReason(code = 1011, reason = "chat proxy closed") {
+    if (this.closed) return;
+    this.closed = true;
+    this.closeUpstream(code, reason);
+    if (this.browserSocket && this.browserSocket.readyState <= WebSocket.OPEN) {
+      this.browserSocket.close(
+        normalizeWsCloseCode(code, 1011),
+        truncateWsCloseReason(reason)
+      );
+    }
   }
 }
 
@@ -1263,13 +1566,41 @@ async function handleApi(req, res, pathname, query) {
     }
 
     if (req.method === "GET" && pathname === "/api/gateway-auth") {
-      const payload = {
+      const direct = buildDirectGatewayBootstrap(req);
+      if (CHAT_TRANSPORT_MODE === "direct") {
+        return jsonResponse(res, 200, {
+          ok: true,
+          transport: "direct",
+          allowDirectFallback: false,
+          proxy: null,
+          direct,
+          meta: {
+            version: 1,
+            source: "endpoint"
+          }
+        });
+      }
+
+      const ticketRecord = createChatProxyTicketRecord({
+        sessionToken: readBearerToken(req.headers.authorization),
+        allowDirectFallback: CHAT_ALLOW_DIRECT_FALLBACK
+      });
+
+      return jsonResponse(res, 200, {
         ok: true,
-        url: resolveGatewayClientUrl(req)
-      };
-      if (gatewayConfig.password) payload.password = gatewayConfig.password;
-      if (gatewayConfig.token) payload.token = gatewayConfig.token;
-      return jsonResponse(res, 200, payload);
+        transport: "proxy",
+        allowDirectFallback: CHAT_ALLOW_DIRECT_FALLBACK,
+        proxy: {
+          url: resolveChatProxyClientUrl(req),
+          ticket: ticketRecord.ticket,
+          expiresAt: ticketRecord.expiresAt
+        },
+        direct: CHAT_ALLOW_DIRECT_FALLBACK ? direct : null,
+        meta: {
+          version: 1,
+          source: "endpoint"
+        }
+      });
     }
 
     if (req.method === "GET" && pathname === "/api/overview") {
@@ -2159,14 +2490,65 @@ const server = http.createServer(async (req, res) => {
   sendFile(res, path.join(publicDir, "index.html"));
 });
 
+server.on("upgrade", (req, socket, head) => {
+  if (!req.url) {
+    writeUpgradeError(socket, 400, "Bad Request", { ok: false, error: "missing upgrade url" });
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  if (url.pathname !== "/api/chat/ws") {
+    writeUpgradeError(socket, 404, "Not Found", { ok: false, error: "upgrade endpoint not found" });
+    return;
+  }
+
+  if (CHAT_TRANSPORT_MODE !== "proxy") {
+    writeUpgradeError(socket, 409, "Conflict", { ok: false, error: "chat proxy transport is disabled" });
+    return;
+  }
+
+  const ticketRecord = consumeChatProxyTicketRecord(url.searchParams.get("ticket"));
+  if (!ticketRecord) {
+    writeUpgradeError(socket, 401, "Unauthorized", { ok: false, error: "invalid or expired chat proxy ticket" });
+    return;
+  }
+
+  const hasConfiguredAuth = Boolean(gatewayConfig.password || gatewayConfig.token);
+  if (hasConfiguredAuth) {
+    const sessionToken = typeof ticketRecord.sessionToken === "string" ? ticketRecord.sessionToken.trim() : "";
+    const sessionRecord = getSessionRecord(sessionToken);
+    if (!sessionToken || !sessionRecord) {
+      writeUpgradeError(socket, 401, "Unauthorized", { ok: false, error: "chat proxy ticket session expired" });
+      return;
+    }
+    touchSessionRecord(sessionToken, sessionRecord);
+  }
+
+  chatProxyWss.handleUpgrade(req, socket, head, (browserSocket) => {
+    const proxySession = new ChatProxySession({
+      browserSocket,
+      gatewayConfig,
+      ticketRecord
+    });
+    proxySession.attach();
+  });
+});
+
 cleanupExpiredSessions();
 cleanupIdleGatewaySession();
+cleanupExpiredChatProxyTickets();
 
 const sessionCleanupTimer = setInterval(cleanupExpiredSessions, SESSION_CLEANUP_INTERVAL_MS);
 if (typeof sessionCleanupTimer.unref === "function") sessionCleanupTimer.unref();
 
 const gatewayCleanupTimer = setInterval(cleanupIdleGatewaySession, GATEWAY_POOL_CLEANUP_INTERVAL_MS);
 if (typeof gatewayCleanupTimer.unref === "function") gatewayCleanupTimer.unref();
+
+const chatProxyTicketCleanupTimer = setInterval(
+  cleanupExpiredChatProxyTickets,
+  CHAT_PROXY_TICKET_CLEANUP_INTERVAL_MS
+);
+if (typeof chatProxyTicketCleanupTimer.unref === "function") chatProxyTicketCleanupTimer.unref();
 
 // Version check: startup + periodic
 checkForUpdate({ suppressErrors: true }).catch(() => {});
