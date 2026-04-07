@@ -62,6 +62,11 @@ openclaw-src/
 .trellis/tasks/
 .trellis/workspace/
 .opencode/
+.codex
+.codex/
+.codex/**
+.codex/*
+skills-lock.json
 .agent/
 .backup/
 .cursor/
