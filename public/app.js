@@ -1,4 +1,4 @@
-import { GatewayClient, fetchGatewayAuthConfig } from "./gateway-client.js?v=20260407-chat-proxy-v2";
+import { createChatTransport } from "./chat-transport.js?v=20260408-chat-live-sse-v1";
 
 const state = {
   updateInfo: null,
@@ -104,13 +104,12 @@ const state = {
     sending: false,
     lastStatusReason: "",
     transport: {
-      requested: "proxy",
+      requested: "http-sse",
       active: "",
-      allowDirectFallback: false,
-      proxyUrl: "",
-      proxyTicketExpiresAt: 0,
-      directUrl: "",
-      directAuthMode: "unknown"
+      mode: "http-sse",
+      syncMode: "events",
+      fallbackMode: "legacy-ws",
+      degraded: false
     },
     subscriptions: {
       sessionEvents: false,
@@ -134,6 +133,8 @@ const state = {
     historyMaxLimit: 1000,
     hasOlderMessages: false,
     loadingOlderMessages: false,
+    compensationTimer: null,
+    compensationRecovered: false,
     globalDefaultModelRef: "",
     selectedAgentId: "",
     selectedModelRef: "",
@@ -9063,20 +9064,27 @@ async function savePersonaFile() {
 function setChatViewActive(active) {
   state.chat.viewActive = active === true;
   if (!state.chat.viewActive) {
+    stopChatCompensationPolling();
     clearChatStreamAnimationScheduler();
     clearChatStreamCursorFadeState();
     toggleChatSessionsPanel(false);
     return;
   }
 
-  if (state.chat.needsRefresh) {
+  if (shouldUseChatCompensationPolling()) {
+    scheduleChatCompensationPoll("view-activation", 1200);
+  }
+
+  if (state.chat.needsRefresh || state.chat.compensationRecovered) {
+    state.chat.compensationRecovered = false;
     refreshChatNow({
       reason: "view-activation",
       reloadSessions: true,
       reloadHistory: Boolean(state.chat.sessionKey),
       silentHistory: true,
       preserveScroll: true,
-      allowReconnect: false
+      allowReconnect: false,
+      background: true
     }).catch((error) => {
       console.error(error);
     });
@@ -9089,43 +9097,28 @@ function setChatStatus(status, metadata = {}) {
   const pill = $("chat-connection-pill");
   updateChatReconnectButton(state.chat.status, metadata);
   if (!pill) return;
-
-  const transport = String(
-    metadata.transport
-    || state.chat.transport.active
-    || state.chat.transport.requested
-    || ""
-  ).toLowerCase();
-  const transportLabel = transport === "proxy"
-    ? "代理"
-    : transport === "direct"
-      ? "直连"
-      : "";
+  const transportMode = getCurrentChatTransportMode();
+  const isRealtimeFallbackConnected = state.chat.status === "degraded" && transportMode === "http-sse";
 
   const statusMap = {
-    connected: { text: transportLabel ? `Chat ${transportLabel}已连接` : "网关已连接", cls: "ok" },
-    connecting: { text: transportLabel ? `Chat ${transportLabel}连接中` : "网关连接中", cls: "warn" },
-    reconnecting: { text: transportLabel ? `Chat ${transportLabel}重连中` : "网关重连中", cls: "warn" },
-    disconnected: { text: transportLabel ? `Chat ${transportLabel}未连接` : "网关未连接", cls: "bad" }
+    connected: { text: "Chat 已连接", cls: "ok" },
+    connecting: { text: "Chat 连接中", cls: "warn" },
+    reconnecting: { text: "Chat 重连中", cls: "warn" },
+    degraded: { text: "Chat 同步中", cls: "warn" },
+    disconnected: { text: "Chat 未连接", cls: "bad" }
   };
 
-  const normalized = statusMap[state.chat.status] || statusMap.disconnected;
+  const normalized = isRealtimeFallbackConnected
+    ? statusMap.connected
+    : statusMap[state.chat.status] || statusMap.disconnected;
   let text = normalized.text;
-  const reason = state.chat.lastStatusReason.toLowerCase();
-  if (state.chat.status === "disconnected" && transport === "proxy") {
-    if (reason.includes("upstream") || reason.includes("gateway")) {
-      text = "Gateway 上游不可用";
-    } else {
-      text = "Chat 代理未连接";
-    }
-  } else if (state.chat.status === "disconnected" && transport === "direct") {
-    text = "Gateway 直连未连接";
-  }
-  if (Number.isFinite(metadata.attempt) && state.chat.status === "reconnecting") {
-    text = `${normalized.text} (${metadata.attempt})`;
-  }
-  if (state.chat.status === "connected" && state.chat.needsRefresh) {
-    text = `${text} · 待刷新`;
+  if (
+    (state.chat.status === "connected" || isRealtimeFallbackConnected)
+    && state.chat.needsRefresh
+    && !state.chat.sending
+    && state.chat.pendingRuns.size === 0
+  ) {
+    text = "Chat 同步中";
   }
 
   pill.classList.remove("ok", "warn", "bad");
@@ -9139,8 +9132,11 @@ function updateChatReconnectButton(status, metadata = {}) {
 
   const normalized = String(status || "disconnected");
   const reason = String(metadata.reason || "").trim();
+  const transportMode = getCurrentChatTransportMode();
+  const shouldHideReconnect = normalized === "connected"
+    || (normalized === "degraded" && transportMode === "http-sse");
 
-  if (normalized === "connected") {
+  if (shouldHideReconnect) {
     button.classList.add("is-hidden");
     button.disabled = false;
     button.innerHTML = '<i class="fa-solid fa-plug-circle-bolt"></i> 立即重连';
@@ -10342,24 +10338,13 @@ function mergeStructuredSegmentsIntoMessage(message, incomingSegments) {
   return changed;
 }
 
-function normalizeGatewayAuthMode(value) {
-  const mode = String(value || "").toLowerCase();
-  if (mode === "none" || mode === "password" || mode === "token") return mode;
-  return "unknown";
-}
-
 function isGatewayDisconnectedError(error) {
   const message = String(error?.message || error || "").toLowerCase();
-  return message.includes("gateway websocket is not connected") || message.includes("gateway websocket closed");
-}
-
-function updateChatTransportStateFromBootstrap(authConfig) {
-  state.chat.transport.requested = String(authConfig?.transport || "proxy");
-  state.chat.transport.allowDirectFallback = authConfig?.allowDirectFallback === true;
-  state.chat.transport.proxyUrl = authConfig?.proxy?.url || "";
-  state.chat.transport.proxyTicketExpiresAt = Number(authConfig?.proxy?.expiresAt || 0);
-  state.chat.transport.directUrl = authConfig?.direct?.url || "";
-  state.chat.transport.directAuthMode = normalizeGatewayAuthMode(authConfig?.direct?.authMode);
+  return message.includes("gateway websocket is not connected")
+    || message.includes("gateway websocket closed")
+    || message.includes("chat transport closed")
+    || message.includes("chat event stream closed")
+    || message.includes("chat events request failed");
 }
 
 function resetChatSubscriptionState() {
@@ -10367,7 +10352,105 @@ function resetChatSubscriptionState() {
   state.chat.subscriptions.messageKey = "";
 }
 
+function stopChatCompensationPolling() {
+  if (!state.chat.compensationTimer) return;
+  clearTimeout(state.chat.compensationTimer);
+  state.chat.compensationTimer = null;
+}
+
+function parseChatTransportModePreference(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "legacy-ws") return "legacy-ws";
+  if (normalized === "http-poll") return "http-poll";
+  return "http-sse";
+}
+
+function resolveChatTransportMode(value, fallback = state.chat.transport.mode || "http-sse") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "legacy-ws" || normalized === "proxy" || normalized === "direct") {
+    return "legacy-ws";
+  }
+  if (normalized === "http-sse") return "http-sse";
+  if (normalized === "http-poll" || normalized === "polling") return "http-poll";
+  return parseChatTransportModePreference(fallback);
+}
+
+function getCurrentChatTransportMode() {
+  return resolveChatTransportMode(
+    state.chat.transport.active || state.chat.transport.requested || state.chat.transport.mode,
+    state.chat.transport.mode
+  );
+}
+
+function resolveChatTransportSyncMode(value, transportMode = getCurrentChatTransportMode()) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "polling" || normalized === "http-poll") return "polling";
+  if (normalized === "events" || normalized === "live") return "events";
+  return transportMode === "http-poll" ? "polling" : "events";
+}
+
+function getCurrentChatTransportSyncMode() {
+  return resolveChatTransportSyncMode(state.chat.transport.syncMode, getCurrentChatTransportMode());
+}
+
+function shouldUseChatCompensationPolling() {
+  if (!state.chat.viewActive || !state.chat.client) return false;
+  const transportMode = getCurrentChatTransportMode();
+  const syncMode = getCurrentChatTransportSyncMode();
+  if (transportMode === "http-poll") {
+    return state.chat.status === "connected";
+  }
+  if (transportMode === "http-sse") {
+    if (syncMode === "polling") return true;
+    return state.chat.status !== "connected";
+  }
+  return false;
+}
+
+function getChatCompensationDelayMs() {
+  if (state.chat.sending || state.chat.pendingRuns.size > 0) {
+    return 1500;
+  }
+  return 5000;
+}
+
+function scheduleChatCompensationPoll(reason = "transport-degraded", delayMs = getChatCompensationDelayMs()) {
+  stopChatCompensationPolling();
+  if (!shouldUseChatCompensationPolling()) return;
+
+  state.chat.compensationTimer = setTimeout(async () => {
+    state.chat.compensationTimer = null;
+    if (!shouldUseChatCompensationPolling()) return;
+    if (state.chat.refresh.busy) {
+      scheduleChatCompensationPoll(reason, getChatCompensationDelayMs());
+      return;
+    }
+
+    try {
+      await refreshChatNow({
+        reason,
+        reloadSessions: true,
+        reloadHistory: Boolean(state.chat.sessionKey),
+        silentHistory: true,
+        preserveScroll: true,
+        allowReconnect: false,
+        background: true
+      });
+      if (getCurrentChatTransportMode() === "http-sse" && getCurrentChatTransportSyncMode() === "events") {
+        state.chat.compensationRecovered = true;
+      }
+    } catch (error) {
+      console.warn("chat compensation refresh failed:", error);
+    } finally {
+      if (shouldUseChatCompensationPolling()) {
+        scheduleChatCompensationPoll(reason);
+      }
+    }
+  }, delayMs);
+}
+
 function destroyChatClient() {
+  stopChatCompensationPolling();
   if (state.chat.client) {
     try {
       state.chat.client.close();
@@ -10378,8 +10461,11 @@ function destroyChatClient() {
   state.chat.client = null;
   state.chat.authConfig = null;
   state.chat.transport.active = "";
+  state.chat.transport.syncMode = state.chat.transport.mode === "http-poll" ? "polling" : "events";
+  state.chat.transport.degraded = false;
   state.chat.refresh.busy = false;
   state.chat.refresh.reason = "";
+  state.chat.compensationRecovered = false;
   resetChatSubscriptionState();
   if (state.chat.historyRefreshTimer) {
     clearTimeout(state.chat.historyRefreshTimer);
@@ -10393,21 +10479,91 @@ function destroyChatClient() {
 }
 
 function createChatClient() {
-  const client = new GatewayClient({
+  const requestedMode = parseChatTransportModePreference(
+    state.chat.transport.mode || "http-sse"
+  );
+
+  state.chat.transport.requested = requestedMode;
+  state.chat.transport.mode = requestedMode;
+  state.chat.transport.syncMode = requestedMode === "http-poll" ? "polling" : "events";
+
+  const client = createChatTransport({
+    mode: requestedMode,
+    requestJson: api,
     requestTimeoutMs: 15000,
     connectTimeoutMs: 15000,
     reconnectBaseDelayMs: 600,
     reconnectMaxDelayMs: 10000,
-    maxReconnectAttempts: 10,
-    autoReconnect: false
+    autoReconnect: requestedMode === "http-sse"
   });
 
   client.onStatusChange((info) => {
+    const transport = String(
+      info.transport
+      || state.chat.transport.active
+      || state.chat.transport.requested
+      || requestedMode
+    );
+    state.chat.transport.active = transport;
+    state.chat.transport.requested = transport;
+    state.chat.transport.mode = resolveChatTransportMode(transport, requestedMode);
+    state.chat.transport.syncMode = resolveChatTransportSyncMode(
+      info.syncMode || info.mode,
+      state.chat.transport.mode
+    );
+    state.chat.transport.degraded =
+      info.status !== "connected"
+      || (
+        state.chat.transport.mode === "http-sse"
+        && state.chat.transport.syncMode === "polling"
+      );
     setChatStatus(info.status, info);
-    if (info.status === "disconnected") {
+    const transportMode = getCurrentChatTransportMode();
+    const syncMode = getCurrentChatTransportSyncMode();
+    if (info.status === "connected") {
+      if (transportMode === "http-poll" || (transportMode === "http-sse" && syncMode === "polling")) {
+        scheduleChatCompensationPoll("chat-sync", getChatCompensationDelayMs());
+      } else {
+        stopChatCompensationPolling();
+      }
+      if (state.chat.viewActive && (state.chat.needsRefresh || state.chat.compensationRecovered)) {
+        state.chat.compensationRecovered = false;
+        refreshChatNow({
+          reason: "transport-recovered",
+          reloadSessions: true,
+          reloadHistory: Boolean(state.chat.sessionKey),
+          silentHistory: true,
+          preserveScroll: true,
+          allowReconnect: false,
+          background: true
+        }).catch((error) => {
+          console.error(error);
+        });
+      }
+      return;
+    }
+
+    if (
+      info.status === "disconnected"
+      || info.status === "reconnecting"
+      || info.status === "connecting"
+      || info.status === "degraded"
+    ) {
       resetChatSubscriptionState();
       clearChatStreamAnimationScheduler();
       clearChatStreamCursorFadeState();
+      if (shouldUseChatCompensationPolling()) {
+        scheduleChatCompensationPoll(
+          info.status === "reconnecting"
+            ? "transport-reconnecting"
+            : info.status === "degraded"
+              ? "transport-degraded"
+              : "transport-disconnected",
+          info.status === "connecting" ? 1200 : getChatCompensationDelayMs()
+        );
+      } else {
+        stopChatCompensationPolling();
+      }
     }
   });
 
@@ -10416,67 +10572,6 @@ function createChatClient() {
   });
 
   return client;
-}
-
-function buildChatConnectOptions(authConfig, transport) {
-  if (transport === "proxy") {
-    if (!authConfig?.proxy?.connectUrl) {
-      throw new Error("chat proxy bootstrap missing connect url");
-    }
-    return {
-      url: authConfig.proxy.connectUrl,
-      auth: {},
-      meta: { transport: "proxy" }
-    };
-  }
-
-  if (transport === "direct") {
-    if (!authConfig?.direct?.url) {
-      throw new Error("chat direct bootstrap missing url");
-    }
-    return {
-      url: authConfig.direct.url,
-      auth: {
-        password: authConfig?.direct?.password,
-        token: authConfig?.direct?.token
-      },
-      meta: { transport: "direct" }
-    };
-  }
-
-  throw new Error(`unsupported chat transport: ${transport}`);
-}
-
-async function connectChatClientWithTransport(client, authConfig, transport) {
-  const options = buildChatConnectOptions(authConfig, transport);
-  await client.connect(options.url, options.auth, options.meta);
-  state.chat.transport.active = transport;
-  setChatStatus("connected", { transport });
-}
-
-async function connectChatClientFromBootstrap(client, authConfig) {
-  const requestedTransport = String(authConfig?.transport || "proxy");
-  updateChatTransportStateFromBootstrap(authConfig);
-  state.chat.transport.active = "";
-
-  if (requestedTransport === "direct") {
-    await connectChatClientWithTransport(client, authConfig, "direct");
-    return;
-  }
-
-  try {
-    await connectChatClientWithTransport(client, authConfig, "proxy");
-  } catch (error) {
-    if (!(authConfig?.allowDirectFallback === true && authConfig?.direct?.url)) {
-      throw error;
-    }
-    state.chat.transport.active = "";
-    setChatStatus("disconnected", {
-      reason: `代理连接失败，准备直连回退：${error?.message || String(error)}`,
-      transport: "proxy"
-    });
-    await connectChatClientWithTransport(client, authConfig, "direct");
-  }
 }
 
 function isUnsupportedSubscriptionError(error) {
@@ -10606,12 +10701,8 @@ async function ensureChatClientConnected({ forceReconnect = false } = {}) {
     state.chat.client = createChatClient();
   }
 
-  const authConfig = await fetchGatewayAuthConfig();
-  state.chat.authConfig = authConfig;
-  updateChatTransportStateFromBootstrap(authConfig);
-
   try {
-    await connectChatClientFromBootstrap(state.chat.client, authConfig);
+    await state.chat.client.connect();
     await resubscribeChatState();
     state.chat.initialized = true;
     return state.chat.client;
@@ -10688,7 +10779,13 @@ async function refreshCurrentSessionHistory({
 
   await ensureChatSessionSubscription(sessionKey);
 
-  if (state.chat.sending || state.chat.pendingRuns.size > 0) {
+  const transportMode = getCurrentChatTransportMode();
+  const canRelyOnLiveEvents = (transportMode === "http-sse" || transportMode === "legacy-ws")
+    && state.chat.client?.isConnected?.()
+    && state.chat.status !== "connecting"
+    && state.chat.status !== "reconnecting"
+    && state.chat.status !== "disconnected";
+  if ((state.chat.sending || state.chat.pendingRuns.size > 0) && canRelyOnLiveEvents) {
     state.chat.needsRefresh = true;
     return { skipped: true, reason: "pending-run" };
   }
@@ -10712,9 +10809,16 @@ async function refreshChatNow({
   silentHistory = true,
   preserveScroll = true,
   preserveSelection = true,
-  allowReconnect = false
+  allowReconnect = false,
+  background = false
 } = {}) {
-  setChatRefreshBusy(true, reason);
+  if (background && state.chat.refresh.busy) {
+    return { skipped: true, reason: "foreground-busy" };
+  }
+
+  if (!background) {
+    setChatRefreshBusy(true, reason);
+  }
   try {
     if (reloadSessions) {
       await refreshChatSessions({ reason, preserveSelection, allowReconnect });
@@ -10740,7 +10844,9 @@ async function refreshChatNow({
       transport: state.chat.transport.active || state.chat.transport.requested
     });
   } finally {
-    setChatRefreshBusy(false);
+    if (!background) {
+      setChatRefreshBusy(false);
+    }
   }
 }
 
@@ -11326,7 +11432,8 @@ async function loadChat() {
       reloadHistory: shouldReloadHistory,
       silentHistory: !shouldReloadHistory,
       preserveScroll: true,
-      allowReconnect: false
+      allowReconnect: false,
+      background: true
     });
 
     if (!state.chat.sessionKey) {

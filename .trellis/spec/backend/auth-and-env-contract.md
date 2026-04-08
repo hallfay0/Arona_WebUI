@@ -1,14 +1,14 @@
 # Auth and Env Contract
 
-> Executable contract for browser login, in-memory session auth, Chat transport bootstrap, and proxy ticket lifecycle.
+> Executable contract for browser login, in-memory session auth, modern Chat HTTP/SSE routes, and legacy WS bootstrap fallback.
 
 ---
 
-## Scenario: WebUI Login, Session TTL, and Chat Gateway Bootstrap
+## Scenario: WebUI Login, Session TTL, Chat HTTP/SSE Auth, and Legacy WS Bootstrap
 
 ### 1. Scope / Trigger
-- Trigger: changes to `/api/login`, `/api/health`, `/api/gateway-auth`, `/api/chat/ws`, env wiring, session TTL, or reverse-proxy deployment.
-- Why code-spec depth is required: these values are shared across backend runtime, browser auth flow, Chat proxy upgrade, and direct/proxy transport fallback. A small drift here breaks the whole Chat UI.
+- Trigger: changes to `/api/login`, `/api/health`, `/api/chat/*`, `/api/gateway-auth`, `/api/chat/ws`, env wiring, session TTL, or reverse-proxy deployment.
+- Why code-spec depth is required: these values are shared across backend runtime, browser auth flow, Chat HTTP/SSE bridge, and the retained legacy WS compatibility path. A small drift here breaks the whole Chat UI.
 
 ### 2. Signatures
 - `POST /api/login`
@@ -26,7 +26,25 @@
     }
   }
   ```
+- `GET /api/chat/events`
+  - SSE endpoint
+  - default modern Chat realtime path
+- `GET /api/chat/sessions?limit=<n>&includeLastMessage=true|false`
+- `GET /api/chat/history?sessionKey=<key>&limit=<n>`
+- `POST /api/chat/send`
+  ```json
+  { "sessionKey": "<key>", "message": "<text>", "idempotencyKey": "<uuid>" }
+  ```
+- `POST /api/chat/abort`
+  ```json
+  { "sessionKey": "<key>", "runId": "<optional>" }
+  ```
+- `POST /api/chat/session`
+  ```json
+  { "key": "<session key>", "label": "<title>", "model": "<optional model ref>" }
+  ```
 - `GET /api/gateway-auth`
+  - legacy bootstrap only
   - Proxy-first response:
     ```json
     {
@@ -66,7 +84,7 @@
     ```
 - `GET /api/chat/ws?ticket=<opaque>`
   - HTTP upgrade to WebSocket
-  - `ticket` is mandatory in proxy mode
+  - `ticket` is mandatory in legacy proxy mode
 - Runtime env keys:
   - Login/env precedence: `WEBUI_USERNAME`, `WEBUI_PASSWORD`, `GATEWAY_USERNAME`, `GATEWAY_PASSWORD`, `GATEWAY_TOKEN`
   - Gateway endpoint/origin: `GATEWAY_URL`, `GATEWAY_ORIGIN`, `GATEWAY_PUBLIC_WS_URL`
@@ -101,6 +119,13 @@
 - `/api/login`: always public.
 - `/api/health`: always public.
 - All other `/api/*` routes require `Authorization: Bearer <token>` **only when** `gatewayConfig.password || gatewayConfig.token` is truthy.
+- This includes:
+  - `/api/chat/events`
+  - `/api/chat/sessions`
+  - `/api/chat/history`
+  - `/api/chat/send`
+  - `/api/chat/abort`
+  - `/api/chat/session`
 - `/api/chat/ws` is not covered by the generic `/api/*` middleware path. It authenticates through the proxy ticket:
   - ticket contains the bearer session token that requested `/api/gateway-auth`
   - upgrade re-checks that token with `getSessionRecord()`
@@ -114,17 +139,31 @@
 - `cleanupExpiredSessions()` runs on an interval and prunes stale tokens.
 - `POST /api/login` reuses the shared status mapping for malformed JSON / oversize bodies.
 
-#### `/api/health` and `/api/gateway-auth`
+#### `/api/health`, `/api/chat/*`, and `/api/gateway-auth`
 - `/api/health.gateway.authMode` remains **coarse-grained**: `enabled | none`.
   - It does **not** distinguish `password` vs `token`.
   - Browser Chat must use `/api/gateway-auth.direct.authMode` instead of guessing from `/api/health`.
-- `/api/gateway-auth` is the **only supported Chat bootstrap source** for current WebUI.
-  - Frontend must require `transport`
-  - Frontend must reject missing / malformed `proxy` or `direct` blocks
-  - Frontend must not treat `404`, bad JSON, or any other failure as permission to direct-connect
+- Current modern WebUI Chat does **not** require `/api/gateway-auth`.
+  - default `http-sse` uses `/api/chat/events` + `/api/chat/*`
+  - `http-poll` uses `/api/chat/*`
+  - only `legacy-ws` uses `/api/gateway-auth` + `/api/chat/ws`
+- `/api/gateway-auth` must still:
+  - require `transport`
+  - reject malformed `proxy` / `direct` blocks
+  - never be interpreted as permission for implicit direct-connect on failure
 - `meta.version` is currently fixed to `1`.
 
-#### Transport bootstrap contract
+#### Chat HTTP/SSE contract
+- `/api/chat/events`
+  - is the default browser realtime entry point
+  - returns SSE, not JSON
+  - must keep working even when upstream `sessions.subscribe` is unsupported
+  - in that case the bridge stays connected but reports `mode: "polling"`
+- `/api/chat/sessions`, `/api/chat/history`, `/api/chat/send`, `/api/chat/abort`, `/api/chat/session`
+  - are modern browser-facing Chat routes
+  - run under the same bearer-session auth as other `/api/*` routes
+
+#### Legacy transport bootstrap contract
 - `CHAT_TRANSPORT_MODE=proxy` (default):
   - `/api/gateway-auth.transport === "proxy"`
   - `proxy.url === "/api/chat/ws"`
@@ -170,9 +209,12 @@
 | Request body exceeds `2_000_000` bytes on `POST /api/login` | 413 | `{ "ok": false, "error": "payload too large" }` |
 | Invalid JSON / oversize body on `handleApi()` routes | 400 / 413 | shared `handleApi()` error mapping |
 | `/api/gateway-auth` hit while auth enabled without bearer | 401 | same unauthorized envelope |
+| `/api/chat/events` hit while auth enabled without bearer | 401 | same unauthorized envelope |
+| `/api/chat/sessions` / `history` / `send` / `abort` / `session` without bearer | 401 | same unauthorized envelope |
 | `CHAT_TRANSPORT_MODE=direct` | 200 | `/api/gateway-auth.transport === "direct"` and `proxy === null` |
 | `CHAT_TRANSPORT_MODE=proxy` | 200 | `/api/gateway-auth.transport === "proxy"` and fresh `proxy.ticket` returned |
 | `GATEWAY_PUBLIC_WS_URL` configured | 200 | `/api/gateway-auth.direct.url` must equal the override exactly |
+| modern `http-sse` Chat path | 200 / SSE | browser does not need `/api/gateway-auth`; `/api/chat/events` is enough to establish realtime channel |
 | `/api/chat/ws` without `ticket` | 401 upgrade reject | `{ "ok": false, "error": "invalid or expired chat proxy ticket" }` |
 | expired / reused ticket | 401 upgrade reject | same invalid ticket response |
 | auth enabled and ticket session expired | 401 upgrade reject | `{ "ok": false, "error": "chat proxy ticket session expired" }` |
@@ -181,8 +223,9 @@
 
 ### 5. Good / Base / Bad Cases
 - Good:
-  - deployment behind HTTPS reverse proxy only exposes WebUI; browser gets `/api/chat/ws` ticket and never needs direct Gateway reachability
+  - deployment behind HTTPS reverse proxy only exposes WebUI; browser uses `/api/chat/events` + `/api/chat/*` and does not need direct Gateway reachability
   - WebUI auth is enabled; `/api/gateway-auth` and `/api/chat/ws` both remain session-bound through the bearer token + ticket pairing
+  - WebUI auth is enabled; `/api/chat/events` and `/api/chat/*` remain session-bound through the same bearer token
   - developer enables `CHAT_ALLOW_DIRECT_FALLBACK=true`, frontend still starts with proxy and only falls back explicitly after proxy failure
 - Base:
   - auth disabled (`GATEWAY_PASSWORD` and `GATEWAY_TOKEN` both empty) means API routes are public and proxy tickets do not carry meaningful session binding
@@ -191,7 +234,8 @@
   - client assumes `openclaw_token` is JWT
   - client expects `/api/health.authMode` to tell password vs token
   - client reuses an old proxy ticket after reconnect
-  - backend silently treats `/api/gateway-auth` failure as permission to direct-connect
+  - backend or frontend silently treats `/api/gateway-auth` failure as permission to direct-connect
+  - docs claim `/api/gateway-auth` is the only supported Chat bootstrap source for the modern WebUI
 
 ### 6. Tests Required
 - Login precedence
@@ -203,6 +247,8 @@
   - expired session becomes 401 and is removed from `SESSIONS`
 - Auth gating
   - `/api/health` remains public when auth enabled
+  - `/api/chat/events` requires Bearer when auth enabled
+  - `/api/chat/sessions|history|send|abort|session` require Bearer when auth enabled
   - `/api/gateway-auth` requires Bearer when auth enabled
   - `/api/chat/ws` rejects upgrade when the session bound to the ticket has expired
 - Transport bootstrap

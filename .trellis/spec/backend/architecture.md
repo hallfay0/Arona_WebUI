@@ -48,7 +48,13 @@ Session-token auth stored in a `SESSIONS` Map.
 | `/api/login` | POST | No | Issue session token |
 | `/api/health` | GET | No | Health check |
 | `/api/system-load` | GET | No | CPU/memory via `node:os` |
-| `/api/gateway-auth` | GET | No | Return browser gateway WS bootstrap config |
+| `/api/chat/events` | GET | Yes | Chat SSE bridge: relay `chat` / `sessions.changed` / `session.message` |
+| `/api/chat/sessions` | GET | Yes | List chat sessions for browser Chat |
+| `/api/chat/history` | GET | Yes | Load one session transcript slice |
+| `/api/chat/send` | POST | Yes | Send one chat turn |
+| `/api/chat/abort` | POST | Yes | Abort one running chat turn |
+| `/api/chat/session` | POST | Yes | Patch/create a browser chat session |
+| `/api/gateway-auth` | GET | No | Legacy browser WS bootstrap config |
 | `/api/overview` | GET | Yes | Gateway overview stats |
 | `/api/models` | GET | Yes | List models |
 | `/api/models/save` | POST | Yes | Save model config |
@@ -91,7 +97,7 @@ Env vars (see `.env.example`):
 | `GATEWAY_PASSWORD` | — | Gateway auth + WebUI password |
 | `GATEWAY_TOKEN` | — | Alternative to password |
 | `GATEWAY_ORIGIN` | `https://openclaw.lingshichat.top` | Origin header for gateway |
-| `GATEWAY_PUBLIC_WS_URL` | — | Force browser-visible WS URL for `/api/gateway-auth` |
+| `GATEWAY_PUBLIC_WS_URL` | — | Force browser-visible WS URL for legacy `/api/gateway-auth` |
 | `SESSION_TTL_MS` | `86400000` | Browser session TTL |
 | `SESSION_CLEANUP_INTERVAL_MS` | `300000` | Expired session cleanup interval |
 | `GATEWAY_POOL_IDLE_MS` | `30000` | Close pooled gateway session after this idle time |
@@ -103,7 +109,8 @@ Notes:
 - `.env.local` only fills keys that are missing from `process.env`; it never overwrites existing env.
 - **`.env.local` 包含完整的本地开发凭证**（WEBUI 登录 + 网关鉴权），可用于直接请求服务器 API 调试，无需手动操作浏览器。
 - Production server also reads `/root/.openclaw/openclaw.json` as fallback.
-- Browser Chat bootstrap uses `GATEWAY_PUBLIC_WS_URL` first, then reverse-proxy headers, then `GATEWAY_URL`.
+- Modern browser Chat uses `/api/chat/events` + `/api/chat/*`.
+- Only legacy WS bootstrap uses `GATEWAY_PUBLIC_WS_URL`, then reverse-proxy headers, then `GATEWAY_URL`.
 
 ---
 

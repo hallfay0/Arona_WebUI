@@ -49,7 +49,7 @@ Rendered into `index.html` sections by `app.js`:
 | 扩展中心 (Extensions) | `#view-extensions` | `GET /api/skills`, `GET/POST /api/store/skills/*`, `GET/POST /api/store/plugins/*`, `GET/POST /api/store/mcp/*`, `GET/POST/DELETE /api/store/sources` |
 | 任务计划 (Cron) | `#view-cron` | `GET /api/cron/list`, `GET /api/cron/runs`, `POST /api/cron/add\|update\|remove\|run` |
 | 实时日志 (Logs) | `#view-logs` | `GET /api/logs` (polled) |
-| Playground (Chat) | `#view-chat` | `GET /api/gateway-auth` + Gateway WS RPC (`sessions.list`, `sessions.patch`, `chat.history`, `chat.send`) |
+| Playground (Chat) | `#view-chat` | `GET /api/chat/events` + `GET /api/chat/sessions` + `GET /api/chat/history` + `POST /api/chat/send` + `POST /api/chat/abort` + `POST /api/chat/session` |
 | 人格与提示词 (Persona) | `#view-persona` | `GET /api/agents`, `POST /api/agents/*`, `GET /api/agents/files`, `GET/POST /api/agents/file` |
 
 - Retained hidden surface: `#view-nodes` still exists in `public/index.html`, and its loader continues to use `GET /api/nodes`, `GET /api/nodes/describe`, and `POST /api/nodes/invoke`, but it is not currently exposed in the main sidebar.
@@ -63,7 +63,7 @@ Rendered into `index.html` sections by `app.js`:
 - **API calls**: `api()` helper attaches `Authorization: Bearer <token>`, redirects to `/login.html` on 401
 - **Auth token**: opaque Bearer session token stored in `localStorage['openclaw_token']`
 - **Theming**: CSS custom properties toggled by `theme.js`
-- **Chat transport**: browser bootstraps from `/api/gateway-auth`, then `GatewayClient` talks to gateway WS directly
+- **Chat transport**: browser default uses `public/chat-transport.js` 的 HTTP/SSE bridge（`/api/chat/events` + `/api/chat/*`）；`legacy-ws` 仅保留为兼容路径
 - **Extension sources**: `state.extSources` 保存可用仓库源，`state.extActiveSourceByTab` 为 `skill|plugin|mcp` 分别记录当前源；同一 source 不再全局套用全部 tab
 
 Current Models view scope:

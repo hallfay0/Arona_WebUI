@@ -233,6 +233,18 @@ const CHAT_PROXY_TICKET_CLEANUP_INTERVAL_MS = parsePositiveInt(
   process.env.CHAT_PROXY_TICKET_CLEANUP_INTERVAL_MS || "30000",
   30_000
 );
+const CHAT_EVENTS_HEARTBEAT_MS = parsePositiveInt(
+  process.env.CHAT_EVENTS_HEARTBEAT_MS || "20000",
+  20_000
+);
+const CHAT_EVENTS_BRIDGE_RECONNECT_BASE_MS = parsePositiveInt(
+  process.env.CHAT_EVENTS_BRIDGE_RECONNECT_BASE_MS || "1000",
+  1_000
+);
+const CHAT_EVENTS_BRIDGE_RECONNECT_MAX_MS = parsePositiveInt(
+  process.env.CHAT_EVENTS_BRIDGE_RECONNECT_MAX_MS || "10000",
+  10_000
+);
 const CHAT_TRANSPORT_MODE = String(process.env.CHAT_TRANSPORT_MODE || "proxy").trim().toLowerCase() === "direct"
   ? "direct"
   : "proxy";
@@ -814,11 +826,15 @@ class GatewaySession {
     this.connectReject = null;
     this.connectPromise = null;
     this.closed = false;
+    this.eventListeners = new Set();
+    this.stateListeners = new Set();
   }
 
   async connect() {
     if (this.connected) return;
     if (this.connectPromise) return this.connectPromise;
+
+    this.notifyState("connecting");
 
     this.connectPromise = new Promise((resolve, reject) => {
       this.connectResolve = resolve;
@@ -833,6 +849,7 @@ class GatewaySession {
         this.failConnect(new Error(message));
         this.rejectPending(new Error(message));
         this.connected = false;
+        this.notifyState("disconnected", { reason: message, code });
       });
     });
 
@@ -892,10 +909,16 @@ class GatewaySession {
       return;
     }
 
+    if (message?.type === "event") {
+      this.emitEvent(message);
+      return;
+    }
+
     if (message?.type !== "res") return;
 
     if (!this.connected && message.ok && message.payload?.type === "hello-ok") {
       this.connected = true;
+      this.notifyState("connected", { payload: message.payload });
       if (this.connectResolve) this.connectResolve(message.payload);
       this.connectResolve = null;
       this.connectReject = null;
@@ -937,10 +960,47 @@ class GatewaySession {
     this.pending.clear();
   }
 
+  onEvent(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.eventListeners.add(listener);
+    return () => {
+      this.eventListeners.delete(listener);
+    };
+  }
+
+  onStateChange(listener) {
+    if (typeof listener !== "function") return () => {};
+    this.stateListeners.add(listener);
+    return () => {
+      this.stateListeners.delete(listener);
+    };
+  }
+
+  emitEvent(message) {
+    for (const listener of this.eventListeners) {
+      try {
+        listener(message);
+      } catch {
+        // Ignore event listener failures so the gateway session stays alive.
+      }
+    }
+  }
+
+  notifyState(status, metadata = {}) {
+    for (const listener of this.stateListeners) {
+      try {
+        listener({ status, ...metadata });
+      } catch {
+        // Ignore state listener failures so the gateway session stays alive.
+      }
+    }
+  }
+
   close() {
     this.closed = true;
     this.rejectPending(new Error("gateway session closed"));
     if (this.ws && this.ws.readyState <= WebSocket.OPEN) this.ws.close();
+    this.notifyState("disconnected", { reason: "gateway session closed" });
   }
 }
 
@@ -1128,6 +1188,7 @@ async function getPooledGatewaySession() {
 function cleanupIdleGatewaySession() {
   if (!gatewayPool.session) return;
   if (gatewayPool.activeLeases > 0) return;
+  if (typeof chatEventsBridge !== "undefined" && chatEventsBridge?.hasActiveSubscribers?.()) return;
   const idleFor = Date.now() - gatewayPool.lastUsedAt;
   if (idleFor >= GATEWAY_POOL_IDLE_MS) {
     closePooledGatewaySession();
@@ -1150,6 +1211,347 @@ async function withGateway(fn) {
     gatewayPool.lastUsedAt = Date.now();
   }
 }
+
+function createHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function writeSseComment(res, comment = "") {
+  if (!res || res.writableEnded) return false;
+  try {
+    res.write(`: ${String(comment || "").replace(/\r?\n/g, " ")}\n\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeSseEvent(res, eventName, payload) {
+  if (!res || res.writableEnded) return false;
+  const lines = [];
+  if (eventName) lines.push(`event: ${eventName}`);
+  const json = JSON.stringify(payload ?? null);
+  for (const line of String(json).split(/\r?\n/)) {
+    lines.push(`data: ${line}`);
+  }
+  lines.push("");
+  lines.push("");
+  try {
+    res.write(lines.join("\n"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readBooleanQueryParam(query, key, fallback = false) {
+  const value = query.get(key);
+  if (value === null) return fallback;
+  return parseBoolean(value, fallback);
+}
+
+function readIntegerQueryParam(query, key, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const raw = query.get(key);
+  if (raw === null || raw === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    throw createHttpError(400, `${key} must be an integer`);
+  }
+  if (parsed < min || parsed > max) {
+    throw createHttpError(400, `${key} must be between ${min} and ${max}`);
+  }
+  return parsed;
+}
+
+function isUnsupportedGatewayMethodError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("unknown method")
+    || message.includes("not found")
+    || message.includes("unsupported")
+    || message.includes("invalid request");
+}
+
+class ChatEventsBridge {
+  constructor(config) {
+    this.config = config;
+    this.clients = new Map();
+    this.session = null;
+    this.subscribedSession = null;
+    this.connecting = null;
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.status = "disconnected";
+    this.statusReason = "";
+    this.statusMode = "";
+    this.subscriptionSupported = true;
+    this._currentSessionCleanup = null;
+    this.heartbeatTimer = setInterval(() => {
+      this.writeHeartbeat();
+    }, CHAT_EVENTS_HEARTBEAT_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  hasActiveSubscribers() {
+    return this.clients.size > 0;
+  }
+
+  buildStatusFrame(extra = {}) {
+    const status = String(extra.status || this.status || "disconnected");
+    const reason = Object.prototype.hasOwnProperty.call(extra, "reason")
+      ? String(extra.reason || "")
+      : this.statusReason;
+    const attempt = Number.isFinite(extra.attempt) ? Number(extra.attempt) : this.reconnectAttempt;
+    const mode = Object.prototype.hasOwnProperty.call(extra, "mode")
+      ? String(extra.mode || "")
+      : this.statusMode;
+    const subscriptionSupported = Object.prototype.hasOwnProperty.call(extra, "subscriptionSupported")
+      ? extra.subscriptionSupported !== false
+      : this.subscriptionSupported;
+    const payload = {
+      status,
+      reason: reason || undefined,
+      attempt: attempt || undefined,
+      transport: "http-sse",
+      ...(mode ? { mode } : {}),
+      subscriptionSupported,
+      ...extra
+    };
+    return {
+      event: "transport.status",
+      payload
+    };
+  }
+
+  setStatus(status, metadata = {}) {
+    const nextStatus = String(status || "disconnected");
+    const nextReason = String(metadata.reason || "");
+    const nextAttempt = Number.isFinite(metadata.attempt) ? Number(metadata.attempt) : this.reconnectAttempt;
+    const nextMode = Object.prototype.hasOwnProperty.call(metadata, "mode")
+      ? String(metadata.mode || "")
+      : this.statusMode;
+    const changed = this.status !== nextStatus
+      || this.statusReason !== nextReason
+      || this.reconnectAttempt !== nextAttempt
+      || this.statusMode !== nextMode;
+    this.status = nextStatus;
+    this.statusReason = nextReason;
+    this.reconnectAttempt = nextAttempt;
+    this.statusMode = nextMode;
+    if (!changed) return;
+    this.broadcastFrame(this.buildStatusFrame());
+  }
+
+  addClient(req, res) {
+    const clientId = crypto.randomUUID();
+    const record = {
+      id: clientId,
+      req,
+      res,
+      connectedAt: Date.now()
+    };
+    this.clients.set(clientId, record);
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+    res.flushHeaders?.();
+    writeSseComment(res, "chat events stream ready");
+    const initialConnected = isGatewaySessionAlive(this.session);
+    writeSseEvent(res, "transport.status", this.buildStatusFrame({
+      status: initialConnected
+        ? "connected"
+        : (this.status === "reconnecting" ? "reconnecting" : "connecting"),
+      reason: this.status === "reconnecting" ? this.statusReason : "",
+      attempt: this.reconnectAttempt,
+      mode: initialConnected && !this.subscriptionSupported ? "polling" : undefined,
+      subscriptionSupported: this.subscriptionSupported
+    }));
+
+    const cleanup = () => {
+      this.removeClient(clientId);
+    };
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
+
+    this.ensureConnected().catch((error) => {
+      this.scheduleReconnect(error instanceof Error ? error.message : String(error));
+    });
+    return clientId;
+  }
+
+  removeClient(clientId) {
+    this.clients.delete(clientId);
+    if (this.clients.size > 0) return;
+    this.clearReconnectTimer();
+    this.closeSession();
+    this.setStatus("disconnected", { reason: "no active chat event subscribers", attempt: 0 });
+  }
+
+  clearReconnectTimer() {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  closeSession() {
+    if (this._currentSessionCleanup) {
+      try {
+        this._currentSessionCleanup();
+      } catch {
+        // Ignore cleanup failures when rotating bridge sessions.
+      }
+      this._currentSessionCleanup = null;
+    }
+    this.session = null;
+    this.subscribedSession = null;
+  }
+
+  writeHeartbeat() {
+    if (this.clients.size === 0) return;
+    for (const [clientId, client] of this.clients) {
+      const ok = writeSseComment(client.res, `heartbeat ${Date.now()}`);
+      if (!ok) {
+        this.clients.delete(clientId);
+      }
+    }
+  }
+
+  broadcastFrame(frame) {
+    if (!frame?.event) return;
+    for (const [clientId, client] of this.clients) {
+      const ok = writeSseEvent(client.res, frame.event, frame);
+      if (!ok) {
+        this.clients.delete(clientId);
+      }
+    }
+  }
+
+  handleGatewayEvent(session, frame) {
+    if (session !== this.session) return;
+    if (!frame || frame.type !== "event") return;
+    if (!["chat", "sessions.changed", "session.message"].includes(frame.event)) return;
+    this.broadcastFrame({
+      event: frame.event,
+      payload: frame.payload ?? null
+    });
+  }
+
+  handleGatewayState(session, info = {}) {
+    if (session !== this.session) return;
+    if (info.status === "connected") {
+      this.reconnectAttempt = 0;
+      this.setStatus("connected", {
+        reason: "",
+        attempt: 0,
+        mode: this.subscriptionSupported ? undefined : "polling",
+        subscriptionSupported: this.subscriptionSupported
+      });
+      return;
+    }
+    if (info.status !== "disconnected") return;
+    this.closeSession();
+    if (this.clients.size === 0) {
+      this.setStatus("disconnected", {
+        reason: info.reason || "chat event bridge disconnected",
+        attempt: 0
+      });
+      return;
+    }
+    this.scheduleReconnect(info.reason || "chat event bridge disconnected");
+  }
+
+  scheduleReconnect(reason) {
+    if (this.clients.size === 0) {
+      this.setStatus("disconnected", { reason, attempt: 0 });
+      return;
+    }
+    if (this.connecting || this.reconnectTimer) return;
+    const nextAttempt = this.reconnectAttempt + 1;
+    this.reconnectAttempt = nextAttempt;
+    const delay = Math.min(
+      CHAT_EVENTS_BRIDGE_RECONNECT_BASE_MS * (2 ** Math.max(0, nextAttempt - 1)),
+      CHAT_EVENTS_BRIDGE_RECONNECT_MAX_MS
+    );
+    this.setStatus("reconnecting", { reason, attempt: nextAttempt });
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.ensureConnected().catch((error) => {
+        this.scheduleReconnect(error instanceof Error ? error.message : String(error));
+      });
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
+  async ensureConnected() {
+    if (this.clients.size === 0) return null;
+    if (
+      isGatewaySessionAlive(this.session)
+      && (this.subscriptionSupported ? this.subscribedSession === this.session : true)
+    ) {
+      return this.session;
+    }
+    if (this.connecting) return this.connecting;
+
+    this.clearReconnectTimer();
+    this.connecting = (async () => {
+      this.setStatus(this.reconnectAttempt > 0 ? "reconnecting" : "connecting", {
+        reason: this.statusReason,
+        attempt: this.reconnectAttempt
+      });
+      try {
+        const session = await getPooledGatewaySession();
+        if (this.session !== session) {
+          this.closeSession();
+          const offEvent = session.onEvent((frame) => this.handleGatewayEvent(session, frame));
+          const offState = session.onStateChange((info) => this.handleGatewayState(session, info));
+          this._currentSessionCleanup = () => {
+            offEvent();
+            offState();
+          };
+          this.session = session;
+        }
+        if (this.subscriptionSupported) {
+          try {
+            if (this.subscribedSession !== session) {
+              await session.request("sessions.subscribe", {});
+              this.subscribedSession = session;
+            }
+          } catch (error) {
+            if (!isUnsupportedGatewayMethodError(error)) {
+              throw error;
+            }
+            this.subscriptionSupported = false;
+            this.statusReason = "当前 Gateway 不支持 sessions.subscribe，已切换为轮询补偿";
+          }
+        }
+        this.reconnectAttempt = 0;
+        this.setStatus("connected", {
+          reason: "",
+          attempt: 0,
+          mode: this.subscriptionSupported ? undefined : "polling",
+          subscriptionSupported: this.subscriptionSupported
+        });
+        return session;
+      } catch (error) {
+        this.closeSession();
+        closePooledGatewaySession();
+        throw error;
+      } finally {
+        this.connecting = null;
+      }
+    })();
+
+    return this.connecting;
+  }
+}
+
+const chatEventsBridge = new ChatEventsBridge(gatewayConfig);
 
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
@@ -1601,6 +2003,50 @@ async function handleApi(req, res, pathname, query) {
           source: "endpoint"
         }
       });
+    }
+
+    if (req.method === "GET" && pathname === "/api/chat/events") {
+      chatEventsBridge.addClient(req, res);
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/chat/sessions") {
+      const limit = readIntegerQueryParam(query, "limit", 60, { min: 1, max: 500 });
+      const includeLastMessage = readBooleanQueryParam(query, "includeLastMessage", true);
+      const data = await withGateway((gateway) =>
+        gateway.request("sessions.list", { limit, includeLastMessage })
+      );
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "GET" && pathname === "/api/chat/history") {
+      const sessionKey = String(query.get("sessionKey") || "").trim();
+      if (!sessionKey) {
+        throw createHttpError(400, "sessionKey is required");
+      }
+      const limit = readIntegerQueryParam(query, "limit", 10, { min: 1, max: 1000 });
+      const data = await withGateway((gateway) =>
+        gateway.request("chat.history", { sessionKey, limit })
+      );
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/chat/send") {
+      const body = await parseBody(req);
+      const data = await withGateway((gateway) => gateway.request("chat.send", body || {}));
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/chat/abort") {
+      const body = await parseBody(req);
+      const data = await withGateway((gateway) => gateway.request("chat.abort", body || {}));
+      return jsonResponse(res, 200, data);
+    }
+
+    if (req.method === "POST" && pathname === "/api/chat/session") {
+      const body = await parseBody(req);
+      const data = await withGateway((gateway) => gateway.request("sessions.patch", body || {}));
+      return jsonResponse(res, 200, data);
     }
 
     if (req.method === "GET" && pathname === "/api/overview") {

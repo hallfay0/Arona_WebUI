@@ -17,6 +17,7 @@ public/
 ├── index.html              # SPA 主壳页，含所有 view section
 ├── login.html              # 独立登录页（自包含样式和脚本）
 ├── app.js                  # 核心 SPA 逻辑（~4600 行单体文件）
+├── chat-transport.js       # Chat transport 抽象（http-sse / http-poll / legacy-ws）
 ├── gateway-client.js       # WebSocket 网关客户端（GatewayClient 类）
 ├── auth-check.js           # 页面加载前的登录守卫（检查 localStorage token）
 ├── theme.js                # 暗色/亮色主题切换
@@ -43,7 +44,7 @@ src/
 ## Module Organization
 
 - **单体 JS 架构**：所有 SPA 逻辑集中在 `app.js` 中，按功能区域以注释分隔
-- **独立模块仅在有明确边界时拆分**：`gateway-client.js`（WebSocket 通信）、`auth-check.js`（认证守卫）、`theme.js`（主题）
+- **独立模块仅在有明确边界时拆分**：`chat-transport.js`（Chat transport 抽象）、`gateway-client.js`（legacy Gateway WS 通信）、`auth-check.js`（认证守卫）、`theme.js`（主题）
 - **视图以函数组织**：每个导航视图对应一组 `load*` / `render*` 函数（如 `loadOverview()`、`loadModels()`、`loadSkills()`）
 - **新功能应在 `app.js` 中按区域添加**，除非是完全独立的基础设施级功能才考虑拆分新文件
 
@@ -66,5 +67,5 @@ src/
 ## Examples
 
 - 视图组织：`public/app.js` 中 `viewLoaders` 映射表（约第 151 行）定义了所有视图入口
-- 独立模块拆分示例：`public/gateway-client.js` 导出 `GatewayClient` 类和 `fetchGatewayAuthConfig` 函数
+- 独立模块拆分示例：`public/chat-transport.js` 统一封装 `HttpSseChatTransport` / `HttpPollingChatTransport` / `LegacyGatewayChatTransport`
 - 认证守卫示例：`public/auth-check.js` 在 `index.html` 最顶部 `<script>` 引入，页面加载前检查 token
